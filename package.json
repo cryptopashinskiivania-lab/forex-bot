@@ -1,0 +1,38 @@
+{
+  "name": "forex-news-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon",
+    "build": "tsc",
+    "start": "ts-node src/bot.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.13.2",
+    "better-sqlite3": "^12.6.2",
+    "cheerio": "^1.1.2",
+    "cloudscraper": "^4.6.0",
+    "dayjs": "^1.11.19",
+    "dotenv": "^17.2.3",
+    "grammy": "^1.39.3",
+    "groq-sdk": "^0.37.0",
+    "node-cron": "^4.2.1",
+    "rss-parser": "^3.13.0"
+  },
+  "devDependencies": {
+    "@types/axios": "^0.9.36",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cheerio": "^0.22.35",
+    "@types/node": "^25.0.10",
+    "@types/node-cron": "^3.0.11",
+    "nodemon": "^3.1.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
