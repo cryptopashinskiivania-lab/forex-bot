@@ -2,9 +2,18 @@ import { Bot, InlineKeyboard } from 'grammy';
 import { env } from './config/env';
 import { database } from './db/database';
 import { AnalysisService } from './services/AnalysisService';
-import { CalendarService } from './services/CalendarService';
+import { CalendarService, CalendarEvent } from './services/CalendarService';
+import { MyfxbookService } from './services/MyfxbookService';
 import { SchedulerService } from './services/SchedulerService';
 import { initializeQueue } from './services/MessageQueue';
+import { parseISO, format } from 'date-fns';
+import { toZonedTime } from 'date-fns-tz';
+import crypto from 'crypto';
+import { getVolatility } from './data/volatility';
+
+// User states for conversation flow
+type UserState = 'WAITING_FOR_QUESTION' | null;
+const userStates = new Map<number, UserState>();
 
 // Create a bot instance
 const bot = new Bot(env.BOT_TOKEN);
@@ -17,13 +26,161 @@ initializeQueue(bot);
 // Initialize services
 const analysisService = new AnalysisService();
 const calendarService = new CalendarService();
+const myfxbookService = new MyfxbookService();
 const schedulerService = new SchedulerService();
+
+// Helper function for deduplication
+function md5(str: string): string {
+  return crypto.createHash('md5').update(str, 'utf8').digest('hex');
+}
+
+function deduplicationKey(event: CalendarEvent): string {
+  let timeKey = event.timeISO || event.time;
+  
+  if (event.timeISO) {
+    try {
+      const eventTime = parseISO(event.timeISO);
+      const roundedMinutes = Math.floor(eventTime.getMinutes() / 5) * 5;
+      const roundedTime = new Date(eventTime);
+      roundedTime.setMinutes(roundedMinutes, 0, 0);
+      timeKey = roundedTime.toISOString().substring(0, 16);
+    } catch {
+      // If parsing fails, use original time
+    }
+  }
+  
+  return md5(`${timeKey}_${event.currency}`);
+}
+
+function isEmpty(s: string): boolean {
+  const t = (s || '').trim();
+  return !t || t === '—' || t === '-';
+}
+
+/**
+ * Format time to 24-hour format (HH:mm)
+ * If timeISO is available, use it; otherwise try to parse the time string
+ */
+function formatTime24(event: CalendarEvent): string {
+  // If we have ISO time, format it directly
+  if (event.timeISO) {
+    try {
+      const eventTime = parseISO(event.timeISO);
+      const kyivTime = toZonedTime(eventTime, 'Europe/Kyiv');
+      return format(kyivTime, 'HH:mm');
+    } catch {
+      // Fall through to string parsing
+    }
+  }
+  
+  // Try to parse the time string and convert to 24-hour format
+  const timeStr = event.time.trim();
+  
+  // If it's already in 24-hour format (HH:mm), return as is
+  if (/^\d{1,2}:\d{2}$/.test(timeStr)) {
+    // Normalize to HH:mm format
+    const [hours, minutes] = timeStr.split(':');
+    return `${hours.padStart(2, '0')}:${minutes}`;
+  }
+  
+  // Try to parse AM/PM format
+  const amPmMatch = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)/i);
+  if (amPmMatch) {
+    let hours = parseInt(amPmMatch[1], 10);
+    const minutes = amPmMatch[2];
+    const ampm = amPmMatch[3].toUpperCase();
+    
+    if (ampm === 'PM' && hours !== 12) {
+      hours += 12;
+    } else if (ampm === 'AM' && hours === 12) {
+      hours = 0;
+    }
+    
+    return `${hours.toString().padStart(2, '0')}:${minutes}`;
+  }
+  
+  // If we can't parse it, return original (for special cases like "All Day", "Tentative")
+  return timeStr;
+}
+
+/**
+ * Aggregate Core news sources (ForexFactory + Myfxbook) with deduplication
+ */
+async function aggregateCoreEvents(
+  forTomorrow: boolean = false
+): Promise<CalendarEvent[]> {
+  try {
+    const [forexFactoryEvents, myfxbookEvents] = await Promise.all([
+      forTomorrow
+        ? calendarService.getEventsForTomorrow().catch(err => {
+            console.error('[Bot] Error fetching ForexFactory events:', err);
+            return [];
+          })
+        : calendarService.getEventsForToday().catch(err => {
+            console.error('[Bot] Error fetching ForexFactory events:', err);
+            return [];
+          }),
+      forTomorrow
+        ? myfxbookService.getEventsForTomorrow().catch(err => {
+            console.error('[Bot] Error fetching Myfxbook events:', err);
+            return [];
+          })
+        : myfxbookService.getEventsForToday().catch(err => {
+            console.error('[Bot] Error fetching Myfxbook events:', err);
+            return [];
+          }),
+    ]);
+
+    // Combine events
+    const allEvents = [...forexFactoryEvents, ...myfxbookEvents];
+    
+    // Deduplicate: if same time (within 5 min) + same currency, keep only one
+    const deduplicationMap = new Map<string, CalendarEvent>();
+    const seenKeys = new Set<string>();
+    
+    for (const event of allEvents) {
+      const key = deduplicationKey(event);
+      
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        deduplicationMap.set(key, event);
+      } else {
+        const existing = deduplicationMap.get(key);
+        if (existing) {
+          const existingHasData = !isEmpty(existing.actual) || !isEmpty(existing.forecast);
+          const currentHasData = !isEmpty(event.actual) || !isEmpty(event.forecast);
+          
+          if ((currentHasData && !existingHasData) ||
+              (event.impact === 'High' && existing.impact !== 'High') ||
+              (event.source === 'ForexFactory' && existing.source !== 'ForexFactory')) {
+            deduplicationMap.set(key, event);
+          }
+        }
+      }
+    }
+    
+    return Array.from(deduplicationMap.values());
+  } catch (error) {
+    console.error('[Bot] Error aggregating Core events:', error);
+    // Fallback to ForexFactory only if aggregation fails
+    return forTomorrow
+      ? calendarService.getEventsForTomorrow().catch(() => [])
+      : calendarService.getEventsForToday().catch(() => []);
+  }
+}
+
+// Helper function to build main menu keyboard
+function buildMainMenuKeyboard(): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  keyboard.row({ text: '❓ Задать вопрос AI', callback_data: 'ask_question' });
+  return keyboard;
+}
 
 // Set up persistent menu commands (non-fatal on rate limit)
 bot.api.setMyCommands([
   { command: 'daily', description: '📊 Сводка за сегодня' },
   { command: 'tomorrow', description: '📅 Календарь на завтра' },
-  { command: 'settings', description: '⚙️ Настройки активов' },
+  { command: 'settings', description: '⚙️ Настройки' },
   { command: 'ask', description: '❓ Вопрос эксперту' },
   { command: 'id', description: '🆔 Мой ID' },
   { command: 'help', description: 'ℹ️ Помощь' },
@@ -40,7 +197,10 @@ bot.use(async (ctx, next) => {
 // Handle /start command
 bot.command('start', (ctx) => {
   console.log('Start command received');
-  ctx.reply('✅ Система онлайн\n\nИспользуйте команды из меню для получения информации о событиях календаря.');
+  const keyboard = buildMainMenuKeyboard();
+  ctx.reply('✅ Система онлайн\n\nИспользуйте команды из меню для получения информации о событиях календаря.', {
+    reply_markup: keyboard
+  });
 });
 
 // Handle /test command
@@ -66,32 +226,59 @@ bot.command('test', async (ctx) => {
   }
 });
 
-// Handle /daily command – fetch and display today's events with detailed AI analysis
+// Handle /daily command – fetch and display today's events with optional AI analysis
 bot.command('daily', async (ctx) => {
   try {
     await ctx.reply('📊 Загружаю события за сегодня...');
-    const events = await calendarService.getEventsForToday();
+    const events = await aggregateCoreEvents(false);
 
     if (events.length === 0) {
       await ctx.reply('📅 Сегодня нет событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
       return;
     }
 
-    // Format events list for quick reference
+    // Format events list for quick reference with volatility
     const lines = events.map((e, i) => {
       const n = i + 1;
       const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-      return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${e.time}`;
+      const time24 = formatTime24(e);
+      const volatility = getVolatility(e.title, e.currency);
+      const volatilityText = volatility ? ` 📉 ~${volatility}` : '';
+      return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}${volatilityText}`;
     });
     const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
 
-    // Send raw list first as quick reference
-    await ctx.reply(eventsText);
+    // Create keyboard with AI Forecast button
+    const keyboard = new InlineKeyboard();
+    keyboard.row({ text: '🤖 AI Forecast', callback_data: 'daily_ai_forecast' });
+
+    // Send list with button for optional AI analysis
+    await ctx.reply(eventsText, { reply_markup: keyboard });
+  } catch (error) {
+    console.error('Error in daily command:', error);
+    await ctx.reply(
+      `❌ Ошибка при загрузке календаря: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
+    );
+  }
+});
+
+// Handle AI Forecast button callback
+bot.callbackQuery('daily_ai_forecast', async (ctx) => {
+  try {
+    await ctx.answerCallbackQuery({ text: '🧠 Анализирую события...', show_alert: false });
+    
+    const events = await aggregateCoreEvents(false);
+    
+    if (events.length === 0) {
+      await ctx.reply('📅 Нет событий для анализа.');
+      return;
+    }
 
     // Prepare detailed events text for AI analysis (with all available data)
     const eventsForAnalysis = events.map(e => {
+      const time24 = formatTime24(e);
       const parts = [
-        `${e.time} - [${e.currency}] ${e.title} (${e.impact})`
+        `${time24} - [${e.currency}] ${e.title} (${e.impact})`
       ];
       if (e.forecast && e.forecast !== '—') {
         parts.push(`Прогноз: ${e.forecast}`);
@@ -107,18 +294,15 @@ bot.command('daily', async (ctx) => {
 
     // Get detailed AI analysis
     try {
-      await ctx.reply('🧠 Анализирую события...');
       const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
       await ctx.reply(`📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
     } catch (analysisError) {
       console.error('Error generating daily analysis:', analysisError);
-      await ctx.reply('⚠️ Не удалось сгенерировать анализ. Список событий выше.');
+      await ctx.reply('⚠️ Не удалось сгенерировать анализ. Попробуйте позже.');
     }
   } catch (error) {
-    console.error('Error in daily command:', error);
-    await ctx.reply(
-      `❌ Ошибка при загрузке календаря: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
-    );
+    console.error('Error in daily AI forecast callback:', error);
+    await ctx.reply('❌ Ошибка при генерации анализа.');
   }
 });
 
@@ -126,7 +310,7 @@ bot.command('daily', async (ctx) => {
 bot.command('calendar', async (ctx) => {
   try {
     await ctx.reply('Fetching today’s calendar…');
-    const events = await calendarService.getEventsForToday();
+    const events = await aggregateCoreEvents(false);
 
     if (events.length === 0) {
       await ctx.reply('Сегодня нет событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
@@ -135,7 +319,8 @@ bot.command('calendar', async (ctx) => {
 
     const lines = events.map((e, i) => {
       const n = i + 1;
-      return `${n}. [${e.currency}] ${e.impact}\n   ${e.title}\n   🕐 ${e.time}  •  F: ${e.forecast}  •  P: ${e.previous}`;
+      const time24 = formatTime24(e);
+      return `${n}. [${e.currency}] ${e.impact}\n   ${e.title}\n   🕐 ${time24}  •  F: ${e.forecast}  •  P: ${e.previous}`;
     });
     const text = `📅 ForexFactory – Сегодня (Высокое/Среднее влияние, USD GBP EUR JPY NZD)\n\n${lines.join('\n\n')}`;
 
@@ -152,7 +337,7 @@ bot.command('calendar', async (ctx) => {
 bot.command('tomorrow', async (ctx) => {
   try {
     await ctx.reply('📅 Загружаю календарь на завтра...');
-    const events = await calendarService.getEventsForTomorrow();
+    const events = await aggregateCoreEvents(true);
 
     if (events.length === 0) {
       await ctx.reply('📅 Завтра нет запланированных событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
@@ -162,7 +347,8 @@ bot.command('tomorrow', async (ctx) => {
     const lines = events.map((e, i) => {
       const n = i + 1;
       const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-      return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${e.time}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
+      const time24 = formatTime24(e);
+      return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
     });
     const text = `📅 Календарь на завтра:\n\n${lines.join('\n\n')}`;
 
@@ -180,26 +366,51 @@ bot.command('id', (ctx) => {
   ctx.reply(`🆔 Ваш Chat ID: \`${ctx.chat.id}\``, { parse_mode: 'Markdown' });
 });
 
-// Handle /ask command
+// Handle /ask command (backward compatibility)
 bot.command('ask', async (ctx) => {
+  if (!ctx.chat) {
+    return;
+  }
   const text = ctx.message?.text?.replace('/ask', '').trim();
   
   if (!text) {
-    await ctx.reply('Напишите вопрос после команды. Пример: `/ask Что такое Non-Farm Payrolls?`', { parse_mode: 'Markdown' });
+    // Enter question mode
+    userStates.set(ctx.chat.id, 'WAITING_FOR_QUESTION');
+    await ctx.reply('Слушаю, задавай вопрос...');
     return;
   }
   
+  // Process question immediately if provided
+  await processQuestion(ctx, text);
+});
+
+// Handle "Задать вопрос AI" button
+bot.callbackQuery('ask_question', async (ctx) => {
+  if (!ctx.chat) {
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить чат', show_alert: false });
+    return;
+  }
+  userStates.set(ctx.chat.id, 'WAITING_FOR_QUESTION');
+  await ctx.answerCallbackQuery();
+  await ctx.reply('Слушаю, задавай вопрос...');
+});
+
+// Helper function to process questions
+async function processQuestion(ctx: any, question: string) {
   try {
     await ctx.reply('🧠 Анализирую ваш вопрос...');
     
     // Optionally get current market context (today's events) to provide better answers
     let context: string | undefined;
     try {
-      const events = await calendarService.getEventsForToday();
+      const events = await aggregateCoreEvents(false);
       if (events.length > 0) {
         const eventsForContext = events
           .slice(0, 5) // Limit to first 5 events for context
-          .map(e => `${e.time} - [${e.currency}] ${e.title}${e.forecast && e.forecast !== '—' ? ` (Прогноз: ${e.forecast})` : ''}`)
+          .map(e => {
+            const time24 = formatTime24(e);
+            return `${time24} - [${e.currency}] ${e.title}${e.forecast && e.forecast !== '—' ? ` (Прогноз: ${e.forecast})` : ''}`;
+          })
           .join('\n');
         context = `События на сегодня:\n${eventsForContext}`;
       }
@@ -208,13 +419,13 @@ bot.command('ask', async (ctx) => {
       console.log('Could not fetch context for question:', contextError);
     }
     
-    const answer = await analysisService.answerQuestion(text, context);
+    const answer = await analysisService.answerQuestion(question, context);
     await ctx.reply(`💡 Ответ:\n\n${answer}`);
   } catch (error) {
-    console.error('Error in ask command:', error);
+    console.error('Error in processQuestion:', error);
     await ctx.reply(`❌ Ошибка при обработке вопроса: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`);
   }
-});
+}
 
 // Asset flags mapping
 const ASSET_FLAGS: Record<string, string> = {
@@ -252,6 +463,11 @@ function buildSettingsKeyboard(): InlineKeyboard {
   const rssStatus = isRssEnabled ? '✅' : '❌';
   keyboard.row({ text: `📡 Внешние источники: ${rssStatus}`, callback_data: 'settings_toggle_rss' });
   
+  // Add Quiet Hours toggle button
+  const isQuietHoursEnabled = database.isQuietHoursEnabled();
+  const quietHoursStatus = isQuietHoursEnabled ? '✅' : '❌';
+  keyboard.row({ text: `🌙 Тихий режим (23:00-08:00): ${quietHoursStatus}`, callback_data: 'settings_toggle_quiet_hours' });
+  
   // Add "Close" button at the bottom
   keyboard.row({ text: '✅ Готово', callback_data: 'settings_close' });
   
@@ -261,14 +477,21 @@ function buildSettingsKeyboard(): InlineKeyboard {
 // Handle /settings command
 bot.command('settings', async (ctx) => {
   try {
+    // Reset state if user was in question mode
+    if (ctx.chat) {
+      userStates.delete(ctx.chat.id);
+    }
+    
     const monitoredAssets = database.getMonitoredAssets();
+    const isQuietHoursEnabled = database.isQuietHoursEnabled();
     const keyboard = buildSettingsKeyboard();
     
-    const message = `⚙️ **Настройки отслеживаемых активов**
+    const message = `⚙️ **Настройки**
 
-Текущие активные активы: ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
 
-Нажмите на кнопку, чтобы включить/выключить отслеживание актива:`;
+Нажмите на кнопку, чтобы изменить настройку:`;
     
     await ctx.reply(message, { 
       parse_mode: 'Markdown',
@@ -297,13 +520,15 @@ bot.callbackQuery(/^toggle_(.+)$/, async (ctx) => {
     
     // Update the message with new keyboard
     const monitoredAssets = database.getMonitoredAssets();
+    const isQuietHoursEnabled = database.isQuietHoursEnabled();
     const keyboard = buildSettingsKeyboard();
     
-    const message = `⚙️ **Настройки отслеживаемых активов**
+    const message = `⚙️ **Настройки**
 
-Текущие активные активы: ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
 
-Нажмите на кнопку, чтобы включить/выключить отслеживание актива:`;
+Нажмите на кнопку, чтобы изменить настройку:`;
     
     await ctx.editMessageText(message, {
       parse_mode: 'Markdown',
@@ -329,13 +554,15 @@ bot.callbackQuery('settings_toggle_rss', async (ctx) => {
     
     // Update the message with new keyboard
     const monitoredAssets = database.getMonitoredAssets();
+    const isQuietHoursEnabled = database.isQuietHoursEnabled();
     const keyboard = buildSettingsKeyboard();
     
-    const message = `⚙️ **Настройки отслеживаемых активов**
+    const message = `⚙️ **Настройки**
 
-Текущие активные активы: ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
 
-Нажмите на кнопку, чтобы включить/выключить отслеживание актива:`;
+Нажмите на кнопку, чтобы изменить настройку:`;
     
     await ctx.editMessageText(message, {
       parse_mode: 'Markdown',
@@ -348,6 +575,39 @@ bot.callbackQuery('settings_toggle_rss', async (ctx) => {
     });
   } catch (error) {
     console.error('Error toggling RSS:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при обновлении', show_alert: false });
+  }
+});
+
+// Handle Quiet Hours toggle button
+bot.callbackQuery('settings_toggle_quiet_hours', async (ctx) => {
+  try {
+    // Toggle Quiet Hours setting
+    const isNowEnabled = database.toggleQuietHours();
+    const status = isNowEnabled ? 'включен' : 'выключен';
+    
+    // Update the message with new keyboard
+    const monitoredAssets = database.getMonitoredAssets();
+    const keyboard = buildSettingsKeyboard();
+    
+    const message = `⚙️ **Настройки**
+
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isNowEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+
+Нажмите на кнопку, чтобы изменить настройку:`;
+    
+    await ctx.editMessageText(message, {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+    
+    await ctx.answerCallbackQuery({ 
+      text: `🌙 Тихий режим ${status}`, 
+      show_alert: false 
+    });
+  } catch (error) {
+    console.error('Error toggling Quiet Hours:', error);
     await ctx.answerCallbackQuery({ text: '❌ Ошибка при обновлении', show_alert: false });
   }
 });
@@ -378,6 +638,34 @@ bot.command('help', (ctx) => {
 Бот автоматически отправляет уведомления о важных событиях с анализом влияния на рынок.`;
   
   ctx.reply(helpText, { parse_mode: 'Markdown' });
+});
+
+// Handle text messages when user is in WAITING_FOR_QUESTION state
+// IMPORTANT: This handler must be registered AFTER all command handlers
+// to ensure commands are processed first
+bot.on('message:text', async (ctx) => {
+  if (!ctx.chat) {
+    return; // Skip if chat is undefined
+  }
+  const chatId = ctx.chat.id;
+  const state = userStates.get(chatId);
+  
+  // If it's a command, reset state and let command handlers process it
+  if (ctx.message.text?.startsWith('/')) {
+    if (state === 'WAITING_FOR_QUESTION') {
+      userStates.delete(chatId); // Reset state when command is sent
+    }
+    return; // Let command handlers process the command
+  }
+  
+  // Only process if user is in WAITING_FOR_QUESTION state
+  if (state === 'WAITING_FOR_QUESTION') {
+    const question = ctx.message.text?.trim();
+    if (question) {
+      userStates.delete(chatId); // Reset state
+      await processQuestion(ctx, question);
+    }
+  }
 });
 
 // Error handler

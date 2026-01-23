@@ -83,5 +83,21 @@ export const database = {
     const newState = !currentState;
     db.prepare('INSERT OR REPLACE INTO user_settings (key, value) VALUES (?, ?)').run(rssKey, newState.toString());
     return newState;
+  },
+  isQuietHoursEnabled: (): boolean => {
+    const quietHoursKey = 'QUIET_HOURS_ENABLED';
+    const row = db.prepare('SELECT value FROM user_settings WHERE key = ?').get(quietHoursKey) as { value: string } | undefined;
+    if (!row || !row.value) {
+      // Default to true if not set
+      return true;
+    }
+    return row.value === 'true';
+  },
+  toggleQuietHours: (): boolean => {
+    const quietHoursKey = 'QUIET_HOURS_ENABLED';
+    const currentState = database.isQuietHoursEnabled();
+    const newState = !currentState;
+    db.prepare('INSERT OR REPLACE INTO user_settings (key, value) VALUES (?, ?)').run(quietHoursKey, newState.toString());
+    return newState;
   }
 };
