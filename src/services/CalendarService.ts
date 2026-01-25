@@ -4,6 +4,7 @@ import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
 import customParseFormat from 'dayjs/plugin/customParseFormat';
+import { fromZonedTime } from 'date-fns-tz';
 import { database } from '../db/database';
 
 dayjs.extend(utc);
@@ -74,12 +75,28 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
     
     for (const fmt of formats) {
       try {
+        // Parse time as America/New_York timezone
         const parsed = dayjs.tz(combined, fmt, FF_TZ);
         if (parsed.isValid()) {
-          const isoString = parsed.tz(getTimezone()).toISOString();
+          // Convert from America/New_York to UTC using date-fns-tz
+          // Create a date string in the format that zonedTimeToUtc expects
+          // Format: YYYY-MM-DD HH:mm:ss
+          const year = parsed.year();
+          const month = String(parsed.month() + 1).padStart(2, '0');
+          const day = String(parsed.date()).padStart(2, '0');
+          const hours = String(parsed.hour()).padStart(2, '0');
+          const minutes = String(parsed.minute()).padStart(2, '0');
+          const seconds = String(parsed.second()).padStart(2, '0');
+          const dateString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+          
+          // Convert from America/New_York timezone to UTC
+          const utcDate = fromZonedTime(dateString, FF_TZ);
+          
+          // Convert to ISO string (which is in UTC)
+          const isoString = utcDate.toISOString();
+          
           // Validate the ISO string is reasonable (not 1970 or far future)
-          const parsedDate = new Date(isoString);
-          if (parsedDate.getFullYear() >= 2000 && parsedDate.getFullYear() <= 2100) {
+          if (utcDate.getFullYear() >= 2000 && utcDate.getFullYear() <= 2100) {
             return isoString;
           }
         }
