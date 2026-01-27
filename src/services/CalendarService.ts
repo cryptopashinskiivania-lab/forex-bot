@@ -1,4 +1,4 @@
-import cloudscraper from 'cloudscraper';
+import { chromium, Browser, Page } from 'playwright';
 import * as cheerio from 'cheerio';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
@@ -122,9 +122,78 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
 }
 
 export class CalendarService {
+  private browser: Browser | null = null;
+  private browserLock: Promise<Browser> | null = null;
+  
   // Cache for calendar events (5 minutes TTL)
   private cache = new Map<string, { data: CalendarEvent[], expires: number }>();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+  /**
+   * Initialize browser instance with anti-detection settings
+   */
+  private async getBrowser(): Promise<Browser> {
+    // If browser is already being launched, wait for it
+    if (this.browserLock) {
+      console.log('[CalendarService] Waiting for browser to launch...');
+      return this.browserLock;
+    }
+    
+    if (!this.browser || !this.browser.isConnected()) {
+      console.log('[CalendarService] Launching Chromium browser...');
+      
+      // Set lock while launching
+      this.browserLock = chromium.launch({
+        headless: true,
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--disable-dev-shm-usage',
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-web-security',
+          '--disable-features=IsolateOrigins,site-per-process',
+        ],
+      });
+      
+      try {
+        this.browser = await this.browserLock;
+        console.log('[CalendarService] Browser launched successfully');
+      } finally {
+        this.browserLock = null;
+      }
+    }
+    return this.browser;
+  }
+
+  /**
+   * Fetch HTML using Playwright to bypass Cloudflare
+   */
+  private async fetchHTML(url: string): Promise<string> {
+    const browser = await this.getBrowser();
+    const page: Page = await browser.newPage({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+    });
+
+    try {
+      console.log(`[CalendarService] Navigating to ${url}...`);
+      await page.goto(url, { 
+        waitUntil: 'domcontentloaded',
+        timeout: 30000 
+      });
+      
+      // Wait for the calendar table to load
+      console.log('[CalendarService] Waiting for calendar data...');
+      await page.waitForSelector('table.calendar__table', { timeout: 10000 });
+      
+      const html = await page.content();
+      console.log('[CalendarService] Successfully fetched HTML');
+      
+      return html;
+    } finally {
+      await page.close();
+    }
+  }
 
   private async fetchEvents(url: string): Promise<CalendarEvent[]> {
     // Check cache first
@@ -135,17 +204,7 @@ export class CalendarService {
     }
 
     console.log(`[CalendarService] Cache miss or expired for ${url}, fetching fresh data...`);
-    const html = (await cloudscraper({
-      uri: url,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Cookie': 'fftimezone=America%2FNew_York',
-      },
-    })) as string;
+    const html = await this.fetchHTML(url);
 
     const $ = cheerio.load(html);
     const events: CalendarEvent[] = [];
@@ -235,5 +294,16 @@ export class CalendarService {
 
   async getEventsForTomorrow(): Promise<CalendarEvent[]> {
     return this.fetchEvents(CALENDAR_URL_TOMORROW);
+  }
+
+  /**
+   * Close the browser instance (cleanup)
+   */
+  async close(): Promise<void> {
+    if (this.browser) {
+      console.log('[CalendarService] Closing browser...');
+      await this.browser.close();
+      this.browser = null;
+    }
   }
 }

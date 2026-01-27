@@ -545,7 +545,8 @@ export class SchedulerService {
     this.cronTasks = [];
     console.log('[Scheduler] All cron tasks stopped');
     
-    // Close Myfxbook browser (ForexFactory uses cloudscraper, no browser)
+    // Close both browsers (ForexFactory and Myfxbook now use Playwright)
+    await this.calendarService.close();
     await this.myfxbookService.close();
     console.log('[Scheduler] Services cleaned up');
   }
