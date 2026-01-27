@@ -61,6 +61,8 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
   
   // Try to parse the time string
   try {
+    // Get base date components in NY timezone to know which day we're parsing for
+    const baseDateNY = dayjs().tz(FF_TZ);
     const dateStr = baseDate.format('YYYY-MM-DD');
     const combined = `${dateStr} ${t}`;
     
@@ -75,21 +77,25 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
     
     for (const fmt of formats) {
       try {
-        // Parse time as America/New_York timezone
-        const parsed = dayjs.tz(combined, fmt, FF_TZ);
+        // Parse time WITHOUT timezone (as "naive" time)
+        // This gives us the time components exactly as they appear on ForexFactory
+        const parsed = dayjs(combined, fmt);
         if (parsed.isValid()) {
-          // Convert from America/New_York to UTC using date-fns-tz
-          // Create a date string in the format that zonedTimeToUtc expects
-          // Format: YYYY-MM-DD HH:mm:ss
+          // Extract components from the parsed time
+          // These represent the time AS SHOWN on ForexFactory (which is in America/New_York)
           const year = parsed.year();
           const month = String(parsed.month() + 1).padStart(2, '0');
           const day = String(parsed.date()).padStart(2, '0');
           const hours = String(parsed.hour()).padStart(2, '0');
           const minutes = String(parsed.minute()).padStart(2, '0');
-          const seconds = String(parsed.second()).padStart(2, '0');
+          const seconds = '00';
+          
+          // This time string represents America/New_York local time
           const dateString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
           
-          // Convert from America/New_York timezone to UTC
+          // CRITICAL: Convert from America/New_York local time to UTC
+          // fromZonedTime interprets the date string as being in FF_TZ timezone
+          // and returns the corresponding UTC Date object
           const utcDate = fromZonedTime(dateString, FF_TZ);
           
           // Convert to ISO string (which is in UTC)
@@ -125,6 +131,7 @@ export class CalendarService {
         Accept:
           'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
+        'Cookie': 'fftimezone=America%2FNew_York',
       },
     })) as string;
 
