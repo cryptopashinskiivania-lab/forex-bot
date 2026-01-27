@@ -122,12 +122,24 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
 }
 
 export class CalendarService {
+  // Cache for calendar events (5 minutes TTL)
+  private cache = new Map<string, { data: CalendarEvent[], expires: number }>();
+  private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes in milliseconds
+
   private async fetchEvents(url: string): Promise<CalendarEvent[]> {
+    // Check cache first
+    const cached = this.cache.get(url);
+    if (cached && cached.expires > Date.now()) {
+      console.log(`[CalendarService] Using cached data for ${url} (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
+      return cached.data;
+    }
+
+    console.log(`[CalendarService] Cache miss or expired for ${url}, fetching fresh data...`);
     const html = (await cloudscraper({
       uri: url,
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         Accept:
           'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
@@ -187,7 +199,7 @@ export class CalendarService {
       const noPrevious = isEmpty(previous);
       const allEmpty = noActual && noForecast && noPrevious;
       const isSpeechMinutesStatement =
-        /Speech|Minutes|Statement/i.test(title);
+        /Speech|Minutes|Statement|Press Conference|Policy Report/i.test(title);
       if (allEmpty && !isSpeechMinutesStatement) return;
 
       const timeISO = parseTimeToISO(time, baseDate);
@@ -202,9 +214,17 @@ export class CalendarService {
         forecast: forecast || '—',
         previous: previous || '—',
         actual: actual || '—',
+        source: 'ForexFactory',
         isResult,
       });
     });
+
+    // Store in cache
+    this.cache.set(url, {
+      data: events,
+      expires: Date.now() + this.CACHE_TTL
+    });
+    console.log(`[CalendarService] Cached ${events.length} events for ${url}`);
 
     return events;
   }

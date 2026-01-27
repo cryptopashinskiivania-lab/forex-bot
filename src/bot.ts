@@ -131,35 +131,31 @@ async function aggregateCoreEvents(
           }),
     ]);
 
-    // Combine events
-    const allEvents = [...forexFactoryEvents, ...myfxbookEvents];
+    // NEW LOGIC: ForexFactory has priority, Myfxbook adds only unique events
     
-    // Deduplicate: if same time (within 5 min) + same currency, keep only one
-    const deduplicationMap = new Map<string, CalendarEvent>();
-    const seenKeys = new Set<string>();
+    // Step 1: Add ALL ForexFactory events first
+    const resultEvents: CalendarEvent[] = [...forexFactoryEvents];
+    const forexFactoryKeys = new Set(forexFactoryEvents.map(e => deduplicationKey(e)));
     
-    for (const event of allEvents) {
-      const key = deduplicationKey(event);
+    console.log(`[Bot] ForexFactory events: ${forexFactoryEvents.length}`);
+    console.log(`[Bot] ForexFactory keys:`, Array.from(forexFactoryKeys));
+    
+    // Step 2: Add Myfxbook events ONLY if they don't exist in ForexFactory
+    for (const mbEvent of myfxbookEvents) {
+      const mbKey = deduplicationKey(mbEvent);
       
-      if (!seenKeys.has(key)) {
-        seenKeys.add(key);
-        deduplicationMap.set(key, event);
+      if (!forexFactoryKeys.has(mbKey)) {
+        // This event is unique to Myfxbook - add it
+        resultEvents.push(mbEvent);
+        console.log(`[Bot] Added unique Myfxbook event: ${mbEvent.title} (${mbKey})`);
       } else {
-        const existing = deduplicationMap.get(key);
-        if (existing) {
-          const existingHasData = !isEmpty(existing.actual) || !isEmpty(existing.forecast);
-          const currentHasData = !isEmpty(event.actual) || !isEmpty(event.forecast);
-          
-          if ((currentHasData && !existingHasData) ||
-              (event.impact === 'High' && existing.impact !== 'High') ||
-              (event.source === 'ForexFactory' && existing.source !== 'ForexFactory')) {
-            deduplicationMap.set(key, event);
-          }
-        }
+        // This event already exists in ForexFactory - skip it
+        console.log(`[Bot] Skipped duplicate Myfxbook event: ${mbEvent.title} (${mbKey})`);
       }
     }
     
-    return Array.from(deduplicationMap.values());
+    console.log(`[Bot] Total events after deduplication: ${resultEvents.length}`);
+    return resultEvents;
   } catch (error) {
     console.error('[Bot] Error aggregating Core events:', error);
     // Fallback to ForexFactory only if aggregation fails
@@ -228,29 +224,60 @@ bot.command('test', async (ctx) => {
 
 // Handle /daily command – fetch and display today's events with optional AI analysis
 bot.command('daily', async (ctx) => {
+  console.log('[Bot] /daily command received');
   try {
+    console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📊 Загружаю события за сегодня...');
+    console.log('[Bot] Fetching events...');
     const events = await aggregateCoreEvents(false);
+    console.log(`[Bot] Got ${events.length} events`);
 
     if (events.length === 0) {
       await ctx.reply('📅 Сегодня нет событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
       return;
     }
 
-    // Format events list for quick reference with volatility
-    const lines = events.map((e, i) => {
-      const n = i + 1;
-      const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-      const time24 = formatTime24(e);
-      const volatility = getVolatility(e.title, e.currency);
-      const volatilityText = volatility ? ` 📉 ~${volatility}` : '';
-      return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}${volatilityText}`;
-    });
-    const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
+    // Separate events by source
+    const forexFactoryEvents = events.filter(e => e.source === 'ForexFactory');
+    const myfxbookEvents = events.filter(e => e.source === 'Myfxbook');
 
-    // Create keyboard with AI Forecast button
+    let eventsText = '📅 События за сегодня:\n\n';
+    let eventNumber = 0;
+
+    // ForexFactory events
+    if (forexFactoryEvents.length > 0) {
+      eventsText += '━━━ 📰 ForexFactory ━━━\n\n';
+      const ffLines = forexFactoryEvents.map((e) => {
+        eventNumber++;
+        const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
+        const time24 = formatTime24(e);
+        const volatility = getVolatility(e.title, e.currency);
+        const volatilityText = volatility ? ` 📉 ~${volatility}` : '';
+        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}${volatilityText}`;
+      });
+      eventsText += ffLines.join('\n\n') + '\n\n';
+    }
+
+    // Myfxbook events
+    if (myfxbookEvents.length > 0) {
+      eventsText += '━━━ 📊 Myfxbook ━━━\n\n';
+      const mbLines = myfxbookEvents.map((e) => {
+        eventNumber++;
+        const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
+        const time24 = formatTime24(e);
+        const volatility = getVolatility(e.title, e.currency);
+        const volatilityText = volatility ? ` 📉 ~${volatility}` : '';
+        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}${volatilityText}`;
+      });
+      eventsText += mbLines.join('\n\n');
+    }
+
+    // Create keyboard with AI Forecast and AI Results buttons
     const keyboard = new InlineKeyboard();
-    keyboard.row({ text: '🤖 AI Forecast', callback_data: 'daily_ai_forecast' });
+    keyboard.row(
+      { text: '🔮 AI Forecast', callback_data: 'daily_ai_forecast' },
+      { text: '📊 AI Results', callback_data: 'daily_ai_results' }
+    );
 
     // Send list with button for optional AI analysis
     await ctx.reply(eventsText, { reply_markup: keyboard });
@@ -295,13 +322,99 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     // Get detailed AI analysis
     try {
       const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
-      await ctx.reply(`📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
+      await ctx.reply(analysis, { parse_mode: 'Markdown' });
     } catch (analysisError) {
       console.error('Error generating daily analysis:', analysisError);
       await ctx.reply('⚠️ Не удалось сгенерировать анализ. Попробуйте позже.');
     }
   } catch (error) {
     console.error('Error in daily AI forecast callback:', error);
+    await ctx.reply('❌ Ошибка при генерации анализа.');
+  }
+});
+
+// Handle AI Results button callback
+bot.callbackQuery('daily_ai_results', async (ctx) => {
+  try {
+    const events = await aggregateCoreEvents(false);
+    
+    if (events.length === 0) {
+      await ctx.answerCallbackQuery({ text: '📅 Нет событий для анализа.', show_alert: true });
+      return;
+    }
+
+    // Filter events that have actual data (results are available)
+    const eventsWithResults = events.filter(e => 
+      e.actual && e.actual !== '—' && e.forecast && e.forecast !== '—'
+    );
+
+    if (eventsWithResults.length === 0) {
+      await ctx.answerCallbackQuery({ 
+        text: '⏳ Нет данных для анализа (события еще не вышли)', 
+        show_alert: true 
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: '🧠 Анализирую результаты...', show_alert: false });
+
+    // Prepare events with results for AI analysis
+    const eventsForAnalysis = eventsWithResults.map(e => {
+      const time24 = formatTime24(e);
+      return `${time24} - [${e.currency}] ${e.title} (${e.impact}) | Прогноз: ${e.forecast} | Факт: ${e.actual}`;
+    }).join('\n');
+
+    // Get AI analysis of results
+    try {
+      const analysis = await analysisService.analyzeResults(eventsForAnalysis);
+      await ctx.reply(analysis, { parse_mode: 'Markdown' });
+    } catch (analysisError) {
+      console.error('Error generating results analysis:', analysisError);
+      await ctx.reply('⚠️ Не удалось сгенерировать анализ результатов. Попробуйте позже.');
+    }
+  } catch (error) {
+    console.error('Error in daily AI results callback:', error);
+    await ctx.reply('❌ Ошибка при генерации анализа результатов.');
+  }
+});
+
+// Handle AI Forecast button callback for /tomorrow command
+bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
+  try {
+    await ctx.answerCallbackQuery({ text: '🧠 Анализирую события на завтра...', show_alert: false });
+    
+    const events = await aggregateCoreEvents(true);
+    
+    if (events.length === 0) {
+      await ctx.reply('📅 Нет событий для анализа.');
+      return;
+    }
+
+    // Prepare detailed events text for AI analysis (with all available data)
+    const eventsForAnalysis = events.map(e => {
+      const time24 = formatTime24(e);
+      const parts = [
+        `${time24} - [${e.currency}] ${e.title} (${e.impact})`
+      ];
+      if (e.forecast && e.forecast !== '—') {
+        parts.push(`Прогноз: ${e.forecast}`);
+      }
+      if (e.previous && e.previous !== '—') {
+        parts.push(`Предыдущее: ${e.previous}`);
+      }
+      return parts.join(' | ');
+    }).join('\n');
+
+    // Get detailed AI analysis for tomorrow
+    try {
+      const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
+      await ctx.reply(analysis, { parse_mode: 'Markdown' });
+    } catch (analysisError) {
+      console.error('Error generating tomorrow analysis:', analysisError);
+      await ctx.reply('⚠️ Не удалось сгенерировать анализ. Попробуйте позже.');
+    }
+  } catch (error) {
+    console.error('Error in tomorrow AI forecast callback:', error);
     await ctx.reply('❌ Ошибка при генерации анализа.');
   }
 });
@@ -335,24 +448,55 @@ bot.command('calendar', async (ctx) => {
 
 // Handle /tomorrow command – fetch and display tomorrow's events
 bot.command('tomorrow', async (ctx) => {
+  console.log('[Bot] /tomorrow command received');
   try {
+    console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📅 Загружаю календарь на завтра...');
+    console.log('[Bot] Fetching events...');
     const events = await aggregateCoreEvents(true);
+    console.log(`[Bot] Got ${events.length} events`);
 
     if (events.length === 0) {
       await ctx.reply('📅 Завтра нет запланированных событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
       return;
     }
 
-    const lines = events.map((e, i) => {
-      const n = i + 1;
-      const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-      const time24 = formatTime24(e);
-      return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
-    });
-    const text = `📅 Календарь на завтра:\n\n${lines.join('\n\n')}`;
+    // Separate events by source
+    const forexFactoryEvents = events.filter(e => e.source === 'ForexFactory');
+    const myfxbookEvents = events.filter(e => e.source === 'Myfxbook');
 
-    await ctx.reply(text);
+    let eventsText = '📅 Календарь на завтра:\n\n';
+    let eventNumber = 0;
+
+    // ForexFactory events
+    if (forexFactoryEvents.length > 0) {
+      eventsText += '━━━ 📰 ForexFactory ━━━\n\n';
+      const ffLines = forexFactoryEvents.map((e) => {
+        eventNumber++;
+        const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
+        const time24 = formatTime24(e);
+        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
+      });
+      eventsText += ffLines.join('\n\n') + '\n\n';
+    }
+
+    // Myfxbook events
+    if (myfxbookEvents.length > 0) {
+      eventsText += '━━━ 📊 Myfxbook ━━━\n\n';
+      const mbLines = myfxbookEvents.map((e) => {
+        eventNumber++;
+        const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
+        const time24 = formatTime24(e);
+        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
+      });
+      eventsText += mbLines.join('\n\n');
+    }
+
+    // Create keyboard with AI Forecast button
+    const keyboard = new InlineKeyboard();
+    keyboard.row({ text: '🔮 AI Forecast', callback_data: 'tomorrow_ai_forecast' });
+
+    await ctx.reply(eventsText, { reply_markup: keyboard });
   } catch (error) {
     console.error('Error in tomorrow command:', error);
     await ctx.reply(
@@ -434,13 +578,16 @@ const ASSET_FLAGS: Record<string, string> = {
   GBP: '🇬🇧',
   JPY: '🇯🇵',
   NZD: '🇳🇿',
+  CAD: '🇨🇦',
+  AUD: '🇦🇺',
+  CHF: '🇨🇭',
   XAU: '🏆',
   BTC: '₿',
   OIL: '🛢️',
 };
 
 // Available assets for monitoring
-const AVAILABLE_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'NZD', 'XAU', 'BTC', 'OIL'];
+const AVAILABLE_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'NZD', 'CHF', 'XAU', 'BTC', 'OIL'];
 
 // Helper function to build settings keyboard
 function buildSettingsKeyboard(): InlineKeyboard {
@@ -684,4 +831,27 @@ schedulerService.start(bot);
 bot.start();
 
 console.log('✅ Bot started with SQLite persistence and Timezone support');
+
+// Graceful shutdown handlers
+async function shutdown(signal: string) {
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+  
+  try {
+    // Stop the scheduler (also closes browsers)
+    await schedulerService.stop();
+    console.log('✅ Scheduler stopped');
+    
+    // Stop the bot
+    await bot.stop();
+    console.log('✅ Bot stopped');
+    
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 

@@ -1,4 +1,4 @@
-import cloudscraper from 'cloudscraper';
+import { chromium, Browser, Page } from 'playwright';
 import * as cheerio from 'cheerio';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
@@ -139,18 +139,129 @@ function parseImpact(impactText: string): 'High' | 'Medium' | 'Low' {
 }
 
 export class MyfxbookService {
-  private async fetchEvents(url: string): Promise<CalendarEvent[]> {
+  private browser: Browser | null = null;
+  private browserLock: Promise<Browser> | null = null;
+  // Cache for calendar events (5 minutes TTL)
+  private cache = new Map<string, { data: CalendarEvent[], expires: number }>();
+  private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+  /**
+   * Initialize browser instance with anti-detection settings
+   */
+  private async getBrowser(): Promise<Browser> {
+    // If browser is already being launched, wait for it
+    if (this.browserLock) {
+      console.log('[MyfxbookService] Waiting for browser to launch...');
+      return this.browserLock;
+    }
+    
+    if (!this.browser || !this.browser.isConnected()) {
+      console.log('[MyfxbookService] Launching Chromium browser...');
+      
+      // Set lock while launching
+      this.browserLock = chromium.launch({
+        headless: true,
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--disable-dev-shm-usage',
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-web-security',
+          '--disable-features=IsolateOrigins,site-per-process',
+        ],
+      });
+      
+      try {
+        this.browser = await this.browserLock;
+        console.log('[MyfxbookService] Browser launched successfully');
+      } finally {
+        this.browserLock = null;
+      }
+    }
+    return this.browser;
+  }
+
+  /**
+   * Fetch HTML using Playwright to bypass Cloudflare protection
+   */
+  private async fetchHTML(url: string): Promise<string> {
+    const browser = await this.getBrowser();
+    let page: Page | null = null;
+
     try {
-      const html = (await cloudscraper({
-        uri: url,
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
+      const context = await browser.newContext({
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        viewport: { width: 1920, height: 1080 },
+        locale: 'en-US',
+        timezoneId: 'GMT',
+        extraHTTPHeaders: {
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         },
-      })) as string;
+      });
+
+      page = await context.newPage();
+
+      console.log(`[MyfxbookService] Navigating to ${url}...`);
+      
+      // Navigate to page with reduced timeout
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 15000, // Reduced from 30s to 15s
+      });
+
+      // Wait for calendar data to load with reduced timeout
+      console.log('[MyfxbookService] Waiting for calendar data...');
+      // Myfxbook might load data dynamically, so wait for either table or data elements
+      await Promise.race([
+        page.waitForSelector('table', { timeout: 10000 }), // Reduced from 20s to 10s
+        page.waitForSelector('.calendar-row', { timeout: 10000 }),
+        page.waitForTimeout(3000), // Reduced fallback from 5s to 3s
+      ]).catch(() => {
+        console.warn('[MyfxbookService] Timeout waiting for calendar elements, continuing anyway...');
+      });
+
+      // Reduced additional wait from 2s to 1s
+      await page.waitForTimeout(1000);
+
+      // Get page content
+      const html = await page.content();
+      console.log('[MyfxbookService] Successfully fetched HTML');
+
+      // Close page and context
+      await page.close();
+      await context.close();
+
+      return html;
+    } catch (error) {
+      console.error('[MyfxbookService] Error fetching HTML:', error);
+      
+      // Cleanup on error
+      if (page) {
+        try {
+          await page.close();
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+      }
+      
+      throw new Error(`Failed to fetch Myfxbook calendar: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  private async fetchEvents(url: string): Promise<CalendarEvent[]> {
+    // Check cache first
+    const cached = this.cache.get(url);
+    if (cached && cached.expires > Date.now()) {
+      console.log(`[MyfxbookService] Using cached data for ${url} (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
+      return cached.data;
+    }
+
+    console.log(`[MyfxbookService] Cache miss or expired for ${url}, fetching fresh data...`);
+    
+    try {
+      const html = await this.fetchHTML(url);
 
       const $ = cheerio.load(html);
       const events: CalendarEvent[] = [];
@@ -161,41 +272,47 @@ export class MyfxbookService {
         ? dayjs().tz(MYFXBOOK_TZ).add(1, 'day')
         : dayjs().tz(MYFXBOOK_TZ);
 
-      // Try to find event rows - Myfxbook uses different structure
-      // Look for table rows or divs containing event data
-      $('table tr, .calendar-row, [data-event]').each((_, rowEl) => {
+      // Myfxbook table structure:
+      // Col 0: Date/Time
+      // Col 1: Time left
+      // Col 2: (empty)
+      // Col 3: Currency
+      // Col 4: Event name
+      // Col 5: Impact
+      // Col 6: Previous
+      // Col 7: Consensus (Forecast)
+      // Col 8: Actual
+      
+      $('table tr').each((_, rowEl) => {
         try {
           const $row = $(rowEl);
+          const $cells = $row.find('td');
           
-          // Try to extract currency (usually in first column or data attribute)
-          const currency = $row.find('td:first-child, .currency, [data-currency]').first().text().trim() || 
-                          $row.attr('data-currency') || '';
-          
-          // Skip header rows
-          if (!currency || currency === 'Currency' || currency.length > 3 || currency.includes('Date')) {
+          // Skip rows with less than 9 columns
+          if ($cells.length < 9) {
             return;
           }
-
-          // Extract event title
-          const title = $row.find('.event-title, a[href*="economic-calendar"], td:nth-child(2) a').first().text().trim() ||
-                      $row.find('td').eq(1).text().trim() ||
-                      '';
           
-          if (!title) return;
-
-          // Extract time
-          const timeText = $row.find('.time, .event-time, td:nth-child(2)').first().text().trim() ||
-                          $row.find('td').eq(0).text().trim() || '';
+          // Extract data from correct columns
+          const timeText = $cells.eq(0).text().trim() || '';
+          const currency = $cells.eq(3).text().trim() || '';
+          const title = $cells.eq(4).text().trim() || '';
+          const impactText = $cells.eq(5).text().trim() || '';
+          const previous = $cells.eq(6).text().trim() || '—';
+          const forecast = $cells.eq(7).text().trim() || '—';
+          const actual = $cells.eq(8).text().trim() || '—';
           
-          // Extract impact
-          const impactText = $row.find('.impact, .event-impact, [data-impact]').first().text().trim() ||
-                            $row.attr('data-impact') || 'Low';
+          // Skip invalid rows
+          if (!currency || !title || currency.length > 3) {
+            return;
+          }
+          
+          // Skip header rows
+          if (currency === 'Currency' || title.includes('Date') || title.includes('Event')) {
+            return;
+          }
+          
           const impact = parseImpact(impactText);
-
-          // Extract previous, consensus (forecast), actual
-          const previous = $row.find('.previous, td:nth-child(3)').first().text().trim() || '—';
-          const forecast = $row.find('.consensus, .forecast, td:nth-child(4)').first().text().trim() || '—';
-          const actual = $row.find('.actual, td:nth-child(5)').first().text().trim() || '—';
 
           // Get monitored assets from database
           const monitoredAssets = database.getMonitoredAssets();
@@ -211,7 +328,7 @@ export class MyfxbookService {
           const noPrevious = isEmpty(previous);
           const allEmpty = noActual && noForecast && noPrevious;
           const isSpeechMinutesStatement =
-            /Speech|Minutes|Statement/i.test(title);
+            /Speech|Minutes|Statement|Press Conference|Policy Report/i.test(title);
           if (allEmpty && !isSpeechMinutesStatement) return;
 
           // Parse time
@@ -249,6 +366,14 @@ export class MyfxbookService {
       }
 
       console.log(`[MyfxbookService] Found ${events.length} events from ${url}`);
+      
+      // Store in cache
+      this.cache.set(url, {
+        data: events,
+        expires: Date.now() + this.CACHE_TTL
+      });
+      console.log(`[MyfxbookService] Cached ${events.length} events for ${url}`);
+      
       return events;
     } catch (error) {
       console.error('[MyfxbookService] Error fetching events:', error);
@@ -257,10 +382,60 @@ export class MyfxbookService {
   }
 
   async getEventsForToday(): Promise<CalendarEvent[]> {
-    return this.fetchEvents(CALENDAR_URL_TODAY);
+    const events = await this.fetchEvents(CALENDAR_URL_TODAY);
+    
+    // Filter to only include today's events
+    const tz = getTimezone();
+    const nowLocal = dayjs.tz(new Date(), tz);
+    const todayStart = nowLocal.startOf('day');
+    const todayEnd = nowLocal.endOf('day');
+    
+    return events.filter(event => {
+      if (!event.timeISO) return false;
+      
+      const eventDate = dayjs(event.timeISO).tz(tz);
+      const isToday = eventDate.isAfter(todayStart) && eventDate.isBefore(todayEnd);
+      
+      if (!isToday) {
+        console.log(`[MyfxbookService] Filtered out event (not today): ${event.title} at ${eventDate.format('MMM DD HH:mm')}`);
+      }
+      
+      return isToday;
+    });
   }
 
   async getEventsForTomorrow(): Promise<CalendarEvent[]> {
-    return this.fetchEvents(CALENDAR_URL_TOMORROW);
+    const events = await this.fetchEvents(CALENDAR_URL_TOMORROW);
+    
+    // Filter to only include tomorrow's events
+    const tz = getTimezone();
+    const nowLocal = dayjs.tz(new Date(), tz);
+    const tomorrowStart = nowLocal.add(1, 'day').startOf('day');
+    const tomorrowEnd = nowLocal.add(1, 'day').endOf('day');
+    
+    return events.filter(event => {
+      if (!event.timeISO) return false;
+      
+      const eventDate = dayjs(event.timeISO).tz(tz);
+      const isTomorrow = eventDate.isAfter(tomorrowStart) && eventDate.isBefore(tomorrowEnd);
+      
+      if (!isTomorrow) {
+        console.log(`[MyfxbookService] Filtered out event (not tomorrow): ${event.title} at ${eventDate.format('MMM DD HH:mm')}`);
+      }
+      
+      return isTomorrow;
+    });
+  }
+
+  /**
+   * Close the browser instance
+   * Call this when shutting down the service
+   */
+  async close(): Promise<void> {
+    if (this.browser) {
+      console.log('[MyfxbookService] Closing browser...');
+      await this.browser.close();
+      this.browser = null;
+    }
   }
 }

@@ -8,9 +8,10 @@ import { format, parseISO } from 'date-fns';
 
 async function main() {
   const service = new CalendarService();
+  
   console.log('Fetching https://www.forexfactory.com/calendar?day=today ...\n');
   const events = await service.getEventsForToday();
-  console.log(`Found ${events.length} events (USD/GBP/EUR/JPY/NZD, High/Medium impact):\n`);
+  console.log(`Found ${events.length} events (USD/GBP/EUR/JPY/NZD/CAD/AUD/CHF, High/Medium impact):\n`);
   events.forEach((e, i) => {
     console.log(`${i + 1}. [${e.currency}] ${e.impact} | ${e.title}`);
     console.log(`   Time from ForexFactory (NY): ${e.time}`);

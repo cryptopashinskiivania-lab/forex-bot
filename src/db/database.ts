@@ -17,7 +17,7 @@ db.exec(`
 `);
 
 // Default monitored assets
-const DEFAULT_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'NZD'];
+const DEFAULT_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'NZD', 'CHF'];
 
 // Initialize default assets if not set
 const assetsKey = 'monitored_assets';
