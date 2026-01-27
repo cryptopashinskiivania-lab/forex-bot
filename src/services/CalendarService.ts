@@ -212,7 +212,15 @@ export class CalendarService {
       ? dayjs().tz(FF_TZ).add(1, 'day')
       : dayjs().tz(FF_TZ);
 
-    $('table.calendar__table tr').each((_, rowEl) => {
+    const allRows = $('table.calendar__table tr');
+    console.log(`[CalendarService] Found ${allRows.length} total rows in calendar table`);
+    
+    let rowsProcessed = 0;
+    let eventsFound = 0;
+    let eventsFiltered = 0;
+
+    allRows.each((_, rowEl) => {
+      rowsProcessed++;
       const $row = $(rowEl);
       const $cells = $row.find('td');
 
@@ -230,6 +238,8 @@ export class CalendarService {
       const actual = $row.find('.calendar__actual').text().trim() || '—';
 
       if (!title || currency === 'Currency' || currency === 'All') return;
+
+      eventsFound++;
 
       let impact: 'High' | 'Medium' | 'Low' = 'Low';
       const $impactSpan = $row.find('.calendar__impact span');
@@ -251,7 +261,13 @@ export class CalendarService {
       const allowed =
         ALLOWED_CURRENCIES.has(currency) &&
         (impact === 'High' || impact === 'Medium');
-      if (!allowed) return;
+      if (!allowed) {
+        eventsFiltered++;
+        if (eventsFiltered <= 5) { // Log first 5 filtered events
+          console.log(`[CalendarService] Filtered: "${title}" [${currency}] ${impact} - reason: ${!ALLOWED_CURRENCIES.has(currency) ? 'currency not monitored' : 'low impact'}`);
+        }
+        return;
+      }
 
       const noActual = isEmpty(actual);
       const noForecast = isEmpty(forecast);
@@ -277,6 +293,12 @@ export class CalendarService {
         isResult,
       });
     });
+
+    console.log(`[CalendarService] Parsing complete:`);
+    console.log(`  - Rows processed: ${rowsProcessed}`);
+    console.log(`  - Events found: ${eventsFound}`);
+    console.log(`  - Events filtered: ${eventsFiltered}`);
+    console.log(`  - Events passed: ${events.length}`);
 
     // Store in cache
     this.cache.set(url, {
