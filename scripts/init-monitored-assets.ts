@@ -6,17 +6,17 @@ import { database } from '../src/db/database';
 function initMonitoredAssets() {
   console.log('=== Initializing Monitored Assets ===\n');
   
-  // Default currencies based on user's preferences
+  // Default currencies - only major pairs enabled by default
   const currencies = [
     { currency: 'USD', enabled: true },  // US Dollar - most important!
     { currency: 'EUR', enabled: true },  // Euro
     { currency: 'GBP', enabled: true },  // British Pound
     { currency: 'JPY', enabled: true },  // Japanese Yen
-    { currency: 'AUD', enabled: true },  // Australian Dollar
-    { currency: 'CAD', enabled: true },  // Canadian Dollar
-    { currency: 'CHF', enabled: true },  // Swiss Franc
-    { currency: 'NZD', enabled: true },  // New Zealand Dollar
-    { currency: 'CNY', enabled: false }, // Chinese Yuan (optional)
+    { currency: 'AUD', enabled: false }, // Australian Dollar (disabled by default)
+    { currency: 'CAD', enabled: false }, // Canadian Dollar (disabled by default)
+    { currency: 'CHF', enabled: false }, // Swiss Franc (disabled by default)
+    { currency: 'NZD', enabled: false }, // New Zealand Dollar (disabled by default)
+    { currency: 'CNY', enabled: false }, // Chinese Yuan (disabled by default)
   ];
   
   console.log('Current monitored assets:');
