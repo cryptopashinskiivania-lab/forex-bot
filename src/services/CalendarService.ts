@@ -99,6 +99,9 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
           // Convert to ISO string (which is in UTC)
           const isoString = utcDate.toISOString();
           
+          // DEBUG: Log the parsing details
+          console.log(`[CalendarService] Time parsing: "${t}" -> Local: ${dateString} (${FF_TZ}) -> UTC: ${isoString}`);
+          
           // Validate the ISO string is reasonable (not 1970 or far future)
           if (utcDate.getFullYear() >= 2000 && utcDate.getFullYear() <= 2100) {
             return isoString;
@@ -176,6 +179,7 @@ export class CalendarService {
     });
 
     try {
+      console.log(`[CalendarService] Playwright timezone set to: Europe/Kyiv, FF_TZ: ${FF_TZ}`);
       console.log(`[CalendarService] Navigating to ${url}...`);
       await page.goto(url, { 
         waitUntil: 'domcontentloaded',
@@ -255,17 +259,13 @@ export class CalendarService {
         impact = 'Medium';
       }
 
-      // Get monitored assets from database
-      const monitoredAssets = database.getMonitoredAssets();
-      const ALLOWED_CURRENCIES = new Set(monitoredAssets);
-      
-      const allowed =
-        ALLOWED_CURRENCIES.has(currency) &&
-        (impact === 'High' || impact === 'Medium');
+      // Filter only by impact (High or Medium)
+      // Currency filtering is now done per-user in SchedulerService
+      const allowed = (impact === 'High' || impact === 'Medium');
       if (!allowed) {
         eventsFiltered++;
         if (eventsFiltered <= 5) { // Log first 5 filtered events
-          console.log(`[CalendarService] Filtered: "${title}" [${currency}] ${impact} - reason: ${!ALLOWED_CURRENCIES.has(currency) ? 'currency not monitored' : 'low impact'}`);
+          console.log(`[CalendarService] Filtered: "${title}" [${currency}] ${impact} - reason: low impact`);
         }
         return;
       }
