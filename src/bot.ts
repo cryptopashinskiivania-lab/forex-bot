@@ -322,10 +322,23 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
   try {
     await ctx.answerCallbackQuery({ text: '🧠 Анализирую события...', show_alert: false });
     
-    const events = await aggregateCoreEvents(false);
+    if (!ctx.from) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const allEvents = await aggregateCoreEvents(false);
+    
+    // Filter events by user's monitored assets
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
     
     if (events.length === 0) {
-      await ctx.reply('📅 Нет событий для анализа.');
+      const assetsText = monitoredAssets.length > 0 
+        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
+        : 'Нет активов';
+      await ctx.reply(`📅 Нет событий для анализа по вашим активам (${assetsText}).\n\nИзмените активы через /settings`);
       return;
     }
 
@@ -364,10 +377,26 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
 // Handle AI Results button callback
 bot.callbackQuery('daily_ai_results', async (ctx) => {
   try {
-    const events = await aggregateCoreEvents(false);
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: true });
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const allEvents = await aggregateCoreEvents(false);
+    
+    // Filter events by user's monitored assets
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
     
     if (events.length === 0) {
-      await ctx.answerCallbackQuery({ text: '📅 Нет событий для анализа.', show_alert: true });
+      const assetsText = monitoredAssets.length > 0 
+        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
+        : 'Нет активов';
+      await ctx.answerCallbackQuery({ 
+        text: `Нет событий для ваших активов (${assetsText})`, 
+        show_alert: true 
+      });
       return;
     }
 
@@ -411,10 +440,23 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
   try {
     await ctx.answerCallbackQuery({ text: '🧠 Анализирую события на завтра...', show_alert: false });
     
-    const events = await aggregateCoreEvents(true);
+    if (!ctx.from) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const allEvents = await aggregateCoreEvents(true);
+    
+    // Filter events by user's monitored assets
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
     
     if (events.length === 0) {
-      await ctx.reply('📅 Нет событий для анализа.');
+      const assetsText = monitoredAssets.length > 0 
+        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
+        : 'Нет активов';
+      await ctx.reply(`📅 Нет событий для анализа по вашим активам (${assetsText}).\n\nИзмените активы через /settings`);
       return;
     }
 
