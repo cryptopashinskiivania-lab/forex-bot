@@ -211,9 +211,10 @@ function formatTime24(event: CalendarEvent): string {
 
 /**
  * Check if current time in Kyiv timezone is within quiet hours (23:00 - 08:00)
+ * Now checks per-user setting
  */
-function isQuietHours(): boolean {
-  if (!database.isQuietHoursEnabled()) {
+function isQuietHours(userId: number): boolean {
+  if (!database.isQuietHoursEnabled(userId)) {
     return false;
   }
   
@@ -227,11 +228,12 @@ function isQuietHours(): boolean {
 
 /**
  * Check if we should send notification for an event (15 minutes before event time)
+ * Now checks per-user quiet hours
  */
-function shouldSendReminder(event: CalendarEvent): boolean {
+function shouldSendReminder(event: CalendarEvent, userId: number): boolean {
   if (!event.timeISO) {
     // For events without valid time, send immediately (if not quiet hours)
-    return !isQuietHours();
+    return !isQuietHours(userId);
   }
   
   try {
@@ -245,7 +247,7 @@ function shouldSendReminder(event: CalendarEvent): boolean {
     // This gives us a 2-minute window to catch the reminder
     const shouldSend = timeDiffMinutes >= 14 && timeDiffMinutes <= 16;
     
-    return shouldSend && !isQuietHours();
+    return shouldSend && !isQuietHours(userId);
   } catch (error) {
     console.error('[Scheduler] Error checking reminder time:', error);
     return false;
@@ -314,16 +316,8 @@ export class SchedulerService {
   }
 
   start(bot: Bot): void {
-    const adminChatId = env.ADMIN_CHAT_ID || process.env.ADMIN_CHAT_ID;
-
-    if (!adminChatId) {
-      console.warn('[Scheduler] No Admin Chat ID set, notifications disabled');
-      console.warn('[Scheduler] Set ADMIN_CHAT_ID in .env to enable automatic notifications');
-      return;
-    }
-
     console.log('Starting SchedulerService with Kyiv timezone support...');
-    console.log(`[Scheduler] Quiet hours: ${database.isQuietHoursEnabled() ? 'enabled (23:00-08:00 Kyiv)' : 'disabled'}`);
+    console.log('[Scheduler] Multi-user mode: notifications will be sent to all registered users based on their settings');
 
     // Schedule daily news at 08:00 Kyiv time
     // Convert 08:00 Kyiv to UTC cron expression
@@ -339,49 +333,81 @@ export class SchedulerService {
       if (hour === 8 && minute === 0) {
         console.log('[Scheduler] Running daily news at 08:00 Kyiv time...');
         try {
+          // Get all registered users
+          const users = database.getUsers();
+          
+          if (users.length === 0) {
+            console.log('[Scheduler] No registered users found');
+            return;
+          }
+          
           // Aggregate Core sources (ForexFactory + Myfxbook)
           const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService);
           
           if (events.length === 0) {
-            await bot.api.sendMessage(adminChatId, '📅 Сегодня нет событий с высоким/средним влиянием.');
+            // Send to all users
+            await Promise.allSettled(
+              users.map(user => 
+                bot.api.sendMessage(user.user_id, '📅 Сегодня нет событий с высоким/средним влиянием.')
+                  .catch(err => console.error(`[Scheduler] Error sending to user ${user.user_id}:`, err))
+              )
+            );
             return;
           }
 
-          // Format events list
-          const lines = events.map((e, i) => {
-            const n = i + 1;
-            const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-            const time24 = formatTime24(e);
-            return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
-          });
-          const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
-          
-          await bot.api.sendMessage(adminChatId, eventsText);
-          
-          // Get AI analysis
-          try {
-            const eventsForAnalysis = events.map(e => {
-              const time24 = formatTime24(e);
-              const parts = [
-                `${time24} - [${e.currency}] ${e.title} (${e.impact})`
-              ];
-              if (e.forecast && e.forecast !== '—') {
-                parts.push(`Прогноз: ${e.forecast}`);
+          // Send daily digest to each user based on their monitored assets
+          await Promise.allSettled(
+            users.map(async (user) => {
+              try {
+                const monitoredAssets = database.getMonitoredAssets(user.user_id);
+                
+                // Filter events by user's monitored assets
+                const userEvents = events.filter(e => monitoredAssets.includes(e.currency));
+                
+                if (userEvents.length === 0) {
+                  return; // Skip users with no relevant events
+                }
+                
+                // Format events list
+                const lines = userEvents.map((e, i) => {
+                  const n = i + 1;
+                  const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
+                  const time24 = formatTime24(e);
+                  return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
+                });
+                const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
+                
+                await bot.api.sendMessage(user.user_id, eventsText);
+                
+                // Get AI analysis
+                try {
+                  const eventsForAnalysis = userEvents.map(e => {
+                    const time24 = formatTime24(e);
+                    const parts = [
+                      `${time24} - [${e.currency}] ${e.title} (${e.impact})`
+                    ];
+                    if (e.forecast && e.forecast !== '—') {
+                      parts.push(`Прогноз: ${e.forecast}`);
+                    }
+                    if (e.previous && e.previous !== '—') {
+                      parts.push(`Предыдущее: ${e.previous}`);
+                    }
+                    if (e.actual && e.actual !== '—') {
+                      parts.push(`Факт: ${e.actual}`);
+                    }
+                    return parts.join(' | ');
+                  }).join('\n');
+                  
+                  const analysis = await this.analysisService.analyzeDailySchedule(eventsForAnalysis);
+                  await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
+                } catch (analysisError) {
+                  console.error(`[Scheduler] Error generating daily analysis for user ${user.user_id}:`, analysisError);
+                }
+              } catch (error) {
+                console.error(`[Scheduler] Error sending daily news to user ${user.user_id}:`, error);
               }
-              if (e.previous && e.previous !== '—') {
-                parts.push(`Предыдущее: ${e.previous}`);
-              }
-              if (e.actual && e.actual !== '—') {
-                parts.push(`Факт: ${e.actual}`);
-              }
-              return parts.join(' | ');
-            }).join('\n');
-            
-            const analysis = await this.analysisService.analyzeDailySchedule(eventsForAnalysis);
-            await bot.api.sendMessage(adminChatId, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
-          } catch (analysisError) {
-            console.error('[Scheduler] Error generating daily analysis:', analysisError);
-          }
+            })
+          );
         } catch (error) {
           console.error('[Scheduler] Error in daily news:', error);
         }
@@ -394,134 +420,182 @@ export class SchedulerService {
       console.log('[Scheduler] Running scheduled check (every 3 minutes)...');
 
       try {
-        // Check if RSS is enabled before fetching (External sources)
-        const isRssEnabled = database.isRssEnabled();
+        // Get all registered users
+        const users = database.getUsers();
+        
+        if (users.length === 0) {
+          console.log('[Scheduler] No registered users found');
+          return;
+        }
         
         // Core sources (ForexFactory + Myfxbook) - always fetch
-        // External sources (RSS) - only if enabled
-        const [events, rssItems] = await Promise.all([
-          aggregateCoreEvents(this.calendarService, this.myfxbookService),
-          isRssEnabled ? this.rssService.getLatestNews() : Promise.resolve([]),
-        ]);
+        const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService);
 
-        const toProcess: Array<
-          | { type: 'calendar'; event: CalendarEvent; id: string; time: string; isReminder?: boolean }
-          | { type: 'rss'; item: RssNewsItem; id: string; time: string }
-        > = [];
-
-        for (const event of events) {
-          // Use timeISO if available (parsed time), otherwise use raw time string
-          const time = event.timeISO || event.time;
-          const id = itemId(event.title, time);
-          
-          // Check for reminder (15 minutes before event)
-          if (event.timeISO && shouldSendReminder(event)) {
-            const reminderId = `reminder_${id}`;
-            if (!database.hasSent(reminderId)) {
-              toProcess.push({ type: 'calendar', event, id: reminderId, time, isReminder: true });
-            }
-          }
-          
-          // Check for result (if actual is available and not sent yet)
-          // Results are important, so send them even during quiet hours
-          if (event.isResult && !database.hasSent(id)) {
-            toProcess.push({ type: 'calendar', event, id, time, isReminder: false });
-          }
-          
-          // For events without valid timeISO (All Day, Tentative), process them immediately
-          // if they are high/medium impact and not in quiet hours
-          if (!event.timeISO && !database.hasSent(id) && !isQuietHours()) {
-            toProcess.push({ type: 'calendar', event, id, time, isReminder: false });
-          }
-        }
-
-        for (const item of rssItems) {
-          const time = item.pubDate?.toISOString() ?? item.title;
-          const id = itemId(item.title, time);
-          if (database.hasSent(id)) continue;
-          
-          // Only process RSS if not in quiet hours
-          if (!isQuietHours()) {
-            toProcess.push({ type: 'rss', item, id, time });
-          }
-        }
-
-        console.log(`[Scheduler] ${toProcess.length} new items to process`);
-
-        // Process all items in parallel for faster execution
+        // Process calendar events for each user
         await Promise.allSettled(
-          toProcess.map(async (entry) => {
+          users.map(async (user) => {
             try {
-              if (entry.type === 'calendar') {
-                const { event, id, isReminder } = entry;
+              const userId = user.user_id;
+              const monitoredAssets = database.getMonitoredAssets(userId);
+              const isRssEnabled = database.isRssEnabled(userId);
+              
+              // Filter events by user's monitored assets
+              const userEvents = events.filter(e => monitoredAssets.includes(e.currency));
+              
+              // Process calendar events
+              for (const event of userEvents) {
+                const time = event.timeISO || event.time;
+                const id = itemId(event.title, time);
                 
-                // Check quiet hours for reminders (results are always sent)
-                if (isReminder && isQuietHours()) {
-                  console.log(`[Scheduler] Skipping reminder during quiet hours: ${event.title}`);
-                  return;
-                }
-                
-                const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
-                const emoji = scoreEmoji(result.score);
-                const header = isReminder ? '⏰ НАПОМИНАНИЕ (за 15 мин)' : this.getHeader(false, event.isResult);
-                const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
-                const msg = this.formatMessage(
-                  header,
-                  flag,
-                  event.currency,
-                  event.title,
-                  event.source || 'ForexFactory',
-                  result.score,
-                  emoji,
-                  event.actual,
-                  event.forecast,
-                  result
-                );
-                await bot.api.sendMessage(adminChatId, msg, { parse_mode: undefined });
-                database.markAsSent(id);
-                console.log(`[Scheduler] Calendar notification sent: ${event.title}${isReminder ? ' (reminder)' : ''}`);
-              } else {
-                const { item, id } = entry;
-                const text = `Breaking News: ${item.title}. Summary: ${item.summary}`;
-                const result = await this.analysisService.analyzeNews(text, item.source);
-                const emoji = scoreEmoji(result.score);
-                const header = this.getHeader(true, false);
-                
-                // Try to extract currency from title/summary for better flag display
-                const monitoredAssets = database.getMonitoredAssets();
-                let detectedCurrency = '';
-                let flag = '📰';
-                
-                for (const asset of monitoredAssets) {
-                  if (item.title.toUpperCase().includes(asset) || item.summary.toUpperCase().includes(asset)) {
-                    detectedCurrency = asset;
-                    flag = CURRENCY_FLAGS[asset] || '📰';
-                    break;
+                // Check for reminder (15 minutes before event)
+                if (event.timeISO && shouldSendReminder(event, userId)) {
+                  const reminderId = `reminder_${userId}_${id}`;
+                  if (!database.hasSent(reminderId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
+                      const emoji = scoreEmoji(result.score);
+                      const header = '⏰ НАПОМИНАНИЕ (за 15 мин)';
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(reminderId);
+                      console.log(`[Scheduler] Reminder sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending reminder to user ${userId}:`, err);
+                    }
                   }
                 }
                 
-                const displayCurrency = detectedCurrency || item.source;
-                const msg = this.formatMessage(
-                  header,
-                  flag,
-                  displayCurrency,
-                  item.title,
-                  item.source,
-                  result.score,
-                  emoji,
-                  '',
-                  '',
-                  result
-                );
-                let full = msg;
-                if (item.link) full += `\n\n🔗 ${item.link}`;
-                await bot.api.sendMessage(adminChatId, full, { parse_mode: undefined });
-                database.markAsSent(id);
-                console.log(`[Scheduler] RSS notification sent: ${item.title}`);
+                // Check for result (if actual is available and not sent yet)
+                // Results are important, so send them even during quiet hours
+                if (event.isResult) {
+                  const resultId = `result_${userId}_${id}`;
+                  if (!database.hasSent(resultId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(false, event.isResult);
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(resultId);
+                      console.log(`[Scheduler] Result sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending result to user ${userId}:`, err);
+                    }
+                  }
+                }
+                
+                // For events without valid timeISO (All Day, Tentative), process them immediately
+                // if they are high/medium impact and not in quiet hours
+                if (!event.timeISO && !isQuietHours(userId)) {
+                  const eventId = `event_${userId}_${id}`;
+                  if (!database.hasSent(eventId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(false, false);
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(eventId);
+                      console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending event to user ${userId}:`, err);
+                    }
+                  }
+                }
               }
-            } catch (err) {
-              console.error(`[Scheduler] Error processing item:`, err);
+              
+              // Process RSS if enabled for this user
+              if (isRssEnabled && !isQuietHours(userId)) {
+                const rssItems = await this.rssService.getLatestNews().catch(() => []);
+                
+                for (const item of rssItems) {
+                  const time = item.pubDate?.toISOString() ?? item.title;
+                  const rssId = `rss_${userId}_${itemId(item.title, time)}`;
+                  
+                  if (!database.hasSent(rssId)) {
+                    try {
+                      const text = `Breaking News: ${item.title}. Summary: ${item.summary}`;
+                      const result = await this.analysisService.analyzeNews(text, item.source);
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(true, false);
+                      
+                      // Try to extract currency from title/summary for better flag display
+                      let detectedCurrency = '';
+                      let flag = '📰';
+                      
+                      for (const asset of monitoredAssets) {
+                        if (item.title.toUpperCase().includes(asset) || item.summary.toUpperCase().includes(asset)) {
+                          detectedCurrency = asset;
+                          flag = CURRENCY_FLAGS[asset] || '📰';
+                          break;
+                        }
+                      }
+                      
+                      const displayCurrency = detectedCurrency || item.source;
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        displayCurrency,
+                        item.title,
+                        item.source,
+                        result.score,
+                        emoji,
+                        '',
+                        '',
+                        result
+                      );
+                      let full = msg;
+                      if (item.link) full += `\n\n🔗 ${item.link}`;
+                      await bot.api.sendMessage(userId, full, { parse_mode: undefined });
+                      database.markAsSent(rssId);
+                      console.log(`[Scheduler] RSS sent to user ${userId}: ${item.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending RSS to user ${userId}:`, err);
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              console.error(`[Scheduler] Error processing notifications for user ${user.user_id}:`, error);
             }
           })
         );

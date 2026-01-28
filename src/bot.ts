@@ -184,6 +184,19 @@ bot.api.setMyCommands([
   console.warn('[Bot] setMyCommands failed (e.g. rate limit):', err instanceof Error ? err.message : err);
 });
 
+// Auto-register users middleware
+bot.use(async (ctx, next) => {
+  if (ctx.from) {
+    database.registerUser(
+      ctx.from.id,
+      ctx.from.username,
+      ctx.from.first_name,
+      ctx.from.last_name
+    );
+  }
+  await next();
+});
+
 // Debug middleware: Log all incoming updates
 bot.use(async (ctx, next) => {
   console.log('Received update:', ctx.update);
@@ -226,14 +239,29 @@ bot.command('test', async (ctx) => {
 bot.command('daily', async (ctx) => {
   console.log('[Bot] /daily command received');
   try {
+    if (!ctx.from) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📊 Загружаю события за сегодня...');
     console.log('[Bot] Fetching events...');
-    const events = await aggregateCoreEvents(false);
-    console.log(`[Bot] Got ${events.length} events`);
+    const allEvents = await aggregateCoreEvents(false);
+    console.log(`[Bot] Got ${allEvents.length} total events`);
+    
+    // Filter events by user's monitored assets
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    console.log(`[Bot] Filtered to ${events.length} events for user ${userId} (monitoring: ${monitoredAssets.join(', ')})`);
 
     if (events.length === 0) {
-      await ctx.reply('📅 Сегодня нет событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
+      const assetsText = monitoredAssets.length > 0 
+        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
+        : 'Нет активов';
+      await ctx.reply(`📅 Сегодня нет событий для ваших активов (${assetsText}).\n\nИзмените активы через /settings`);
       return;
     }
 
@@ -450,14 +478,29 @@ bot.command('calendar', async (ctx) => {
 bot.command('tomorrow', async (ctx) => {
   console.log('[Bot] /tomorrow command received');
   try {
+    if (!ctx.from) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📅 Загружаю календарь на завтра...');
     console.log('[Bot] Fetching events...');
-    const events = await aggregateCoreEvents(true);
-    console.log(`[Bot] Got ${events.length} events`);
+    const allEvents = await aggregateCoreEvents(true);
+    console.log(`[Bot] Got ${allEvents.length} total events`);
+    
+    // Filter events by user's monitored assets
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    console.log(`[Bot] Filtered to ${events.length} events for user ${userId} (monitoring: ${monitoredAssets.join(', ')})`);
 
     if (events.length === 0) {
-      await ctx.reply('📅 Завтра нет запланированных событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
+      const assetsText = monitoredAssets.length > 0 
+        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
+        : 'Нет активов';
+      await ctx.reply(`📅 Завтра нет событий для ваших активов (${assetsText}).\n\nИзмените активы через /settings`);
       return;
     }
 
@@ -590,8 +633,8 @@ const ASSET_FLAGS: Record<string, string> = {
 const AVAILABLE_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'NZD', 'CHF', 'XAU', 'BTC', 'OIL'];
 
 // Helper function to build settings keyboard
-function buildSettingsKeyboard(): InlineKeyboard {
-  const monitoredAssets = database.getMonitoredAssets();
+function buildSettingsKeyboard(userId: number): InlineKeyboard {
+  const monitoredAssets = database.getMonitoredAssets(userId);
   const keyboard = new InlineKeyboard();
   
   // Add buttons in rows of 3
@@ -606,12 +649,12 @@ function buildSettingsKeyboard(): InlineKeyboard {
   }
   
   // Add RSS toggle button
-  const isRssEnabled = database.isRssEnabled();
+  const isRssEnabled = database.isRssEnabled(userId);
   const rssStatus = isRssEnabled ? '✅' : '❌';
   keyboard.row({ text: `📡 Внешние источники: ${rssStatus}`, callback_data: 'settings_toggle_rss' });
   
   // Add Quiet Hours toggle button
-  const isQuietHoursEnabled = database.isQuietHoursEnabled();
+  const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
   const quietHoursStatus = isQuietHoursEnabled ? '✅' : '❌';
   keyboard.row({ text: `🌙 Тихий режим (23:00-08:00): ${quietHoursStatus}`, callback_data: 'settings_toggle_quiet_hours' });
   
@@ -629,9 +672,15 @@ bot.command('settings', async (ctx) => {
       userStates.delete(ctx.chat.id);
     }
     
-    const monitoredAssets = database.getMonitoredAssets();
-    const isQuietHoursEnabled = database.isQuietHoursEnabled();
-    const keyboard = buildSettingsKeyboard();
+    if (!ctx.from) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const keyboard = buildSettingsKeyboard(userId);
     
     const message = `⚙️ **Настройки**
 
@@ -653,6 +702,12 @@ bot.command('settings', async (ctx) => {
 // Handle callback queries (button clicks)
 bot.callbackQuery(/^toggle_(.+)$/, async (ctx) => {
   try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    
+    const userId = ctx.from.id;
     const asset = ctx.match[1];
     
     if (!AVAILABLE_ASSETS.includes(asset)) {
@@ -661,14 +716,14 @@ bot.callbackQuery(/^toggle_(.+)$/, async (ctx) => {
     }
     
     // Toggle the asset
-    const isNowEnabled = database.toggleAsset(asset);
+    const isNowEnabled = database.toggleAsset(userId, asset);
     const status = isNowEnabled ? 'включен' : 'выключен';
     const flag = ASSET_FLAGS[asset] || '';
     
     // Update the message with new keyboard
-    const monitoredAssets = database.getMonitoredAssets();
-    const isQuietHoursEnabled = database.isQuietHoursEnabled();
-    const keyboard = buildSettingsKeyboard();
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const keyboard = buildSettingsKeyboard(userId);
     
     const message = `⚙️ **Настройки**
 
@@ -695,14 +750,21 @@ bot.callbackQuery(/^toggle_(.+)$/, async (ctx) => {
 // Handle RSS toggle button
 bot.callbackQuery('settings_toggle_rss', async (ctx) => {
   try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    
     // Toggle RSS setting
-    const isNowEnabled = database.toggleRss();
+    const isNowEnabled = database.toggleRss(userId);
     const status = isNowEnabled ? 'включены' : 'выключены';
     
     // Update the message with new keyboard
-    const monitoredAssets = database.getMonitoredAssets();
-    const isQuietHoursEnabled = database.isQuietHoursEnabled();
-    const keyboard = buildSettingsKeyboard();
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const keyboard = buildSettingsKeyboard(userId);
     
     const message = `⚙️ **Настройки**
 
@@ -729,13 +791,20 @@ bot.callbackQuery('settings_toggle_rss', async (ctx) => {
 // Handle Quiet Hours toggle button
 bot.callbackQuery('settings_toggle_quiet_hours', async (ctx) => {
   try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    
     // Toggle Quiet Hours setting
-    const isNowEnabled = database.toggleQuietHours();
+    const isNowEnabled = database.toggleQuietHours(userId);
     const status = isNowEnabled ? 'включен' : 'выключен';
     
     // Update the message with new keyboard
-    const monitoredAssets = database.getMonitoredAssets();
-    const keyboard = buildSettingsKeyboard();
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const keyboard = buildSettingsKeyboard(userId);
     
     const message = `⚙️ **Настройки**
 

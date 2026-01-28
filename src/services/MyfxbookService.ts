@@ -314,13 +314,9 @@ export class MyfxbookService {
           
           const impact = parseImpact(impactText);
 
-          // Get monitored assets from database
-          const monitoredAssets = database.getMonitoredAssets();
-          const ALLOWED_CURRENCIES = new Set(monitoredAssets);
-          
-          const allowed =
-            ALLOWED_CURRENCIES.has(currency) &&
-            (impact === 'High' || impact === 'Medium');
+          // Filter only by impact (High or Medium)
+          // Currency filtering is now done per-user in SchedulerService
+          const allowed = (impact === 'High' || impact === 'Medium');
           if (!allowed) return;
 
           const noActual = isEmpty(actual);

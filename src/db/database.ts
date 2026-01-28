@@ -10,36 +10,72 @@ db.exec(`
     created_at INTEGER
   );
   
+  CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    registered_at INTEGER NOT NULL
+  );
+  
   CREATE TABLE IF NOT EXISTS user_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
+    user_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT,
+    PRIMARY KEY (user_id, key),
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
   )
 `);
 
 // Default monitored assets (major currencies only)
 const DEFAULT_ASSETS = ['USD', 'EUR', 'GBP', 'JPY'];
 
-// Initialize default assets if not set
-const assetsKey = 'monitored_assets';
-const existingAssets = db.prepare('SELECT value FROM user_settings WHERE key = ?').get(assetsKey);
-if (!existingAssets) {
-  db.prepare('INSERT INTO user_settings (key, value) VALUES (?, ?)').run(assetsKey, JSON.stringify(DEFAULT_ASSETS));
+export interface User {
+  user_id: number;
+  username?: string;
+  first_name?: string;
+  last_name?: string;
+  registered_at: number;
 }
 
 export const database = {
+  // User management
+  registerUser: (userId: number, username?: string, firstName?: string, lastName?: string): void => {
+    db.prepare(`
+      INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, registered_at) 
+      VALUES (?, ?, ?, ?, ?)
+    `).run(userId, username || null, firstName || null, lastName || null, Date.now());
+  },
+  
+  getUsers: (): User[] => {
+    return db.prepare('SELECT * FROM users').all() as User[];
+  },
+  
+  getUserById: (userId: number): User | undefined => {
+    return db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId) as User | undefined;
+  },
+  
+  // News tracking (global)
   hasSent: (id: string): boolean => {
     const row = db.prepare('SELECT id FROM sent_news WHERE id = ?').get(id);
     return !!row;
   },
+  
   markAsSent: (id: string) => {
     db.prepare('INSERT OR IGNORE INTO sent_news (id, created_at) VALUES (?, ?)').run(id, Date.now());
   },
+  
   cleanup: () => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     db.prepare('DELETE FROM sent_news WHERE created_at < ?').run(oneDayAgo);
   },
-  getMonitoredAssets: (): string[] => {
-    const row = db.prepare('SELECT value FROM user_settings WHERE key = ?').get(assetsKey) as { value: string } | undefined;
+  
+  // User settings (per user)
+  getMonitoredAssets: (userId: number): string[] => {
+    const assetsKey = 'monitored_assets';
+    const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
+      .get(userId, assetsKey) as { value: string } | undefined;
+    
     if (!row || !row.value) {
       return DEFAULT_ASSETS;
     }
@@ -50,8 +86,9 @@ export const database = {
       return DEFAULT_ASSETS;
     }
   },
-  toggleAsset: (asset: string): boolean => {
-    const currentAssets = database.getMonitoredAssets();
+  
+  toggleAsset: (userId: number, asset: string): boolean => {
+    const currentAssets = database.getMonitoredAssets(userId);
     const isEnabled = currentAssets.includes(asset);
     
     let newAssets: string[];
@@ -61,43 +98,54 @@ export const database = {
       newAssets = [...currentAssets, asset];
     }
     
-    database.setAssets(newAssets);
+    database.setAssets(userId, newAssets);
     return !isEnabled;
   },
-  setAssets: (assets: string[]) => {
+  
+  setAssets: (userId: number, assets: string[]) => {
+    const assetsKey = 'monitored_assets';
     const value = JSON.stringify(assets);
-    db.prepare('INSERT OR REPLACE INTO user_settings (key, value) VALUES (?, ?)').run(assetsKey, value);
+    db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
+      .run(userId, assetsKey, value);
   },
-  isRssEnabled: (): boolean => {
+  
+  isRssEnabled: (userId: number): boolean => {
     const rssKey = 'RSS_ENABLED';
-    const row = db.prepare('SELECT value FROM user_settings WHERE key = ?').get(rssKey) as { value: string } | undefined;
+    const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
+      .get(userId, rssKey) as { value: string } | undefined;
+    
     if (!row || !row.value) {
-      // Default to true if not set
-      return true;
+      return true; // Default to true if not set
     }
     return row.value === 'true';
   },
-  toggleRss: (): boolean => {
+  
+  toggleRss: (userId: number): boolean => {
     const rssKey = 'RSS_ENABLED';
-    const currentState = database.isRssEnabled();
+    const currentState = database.isRssEnabled(userId);
     const newState = !currentState;
-    db.prepare('INSERT OR REPLACE INTO user_settings (key, value) VALUES (?, ?)').run(rssKey, newState.toString());
+    db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
+      .run(userId, rssKey, newState.toString());
     return newState;
   },
-  isQuietHoursEnabled: (): boolean => {
+  
+  isQuietHoursEnabled: (userId: number): boolean => {
     const quietHoursKey = 'QUIET_HOURS_ENABLED';
-    const row = db.prepare('SELECT value FROM user_settings WHERE key = ?').get(quietHoursKey) as { value: string } | undefined;
+    const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
+      .get(userId, quietHoursKey) as { value: string } | undefined;
+    
     if (!row || !row.value) {
-      // Default to true if not set
-      return true;
+      return true; // Default to true if not set
     }
     return row.value === 'true';
   },
-  toggleQuietHours: (): boolean => {
+  
+  toggleQuietHours: (userId: number): boolean => {
     const quietHoursKey = 'QUIET_HOURS_ENABLED';
-    const currentState = database.isQuietHoursEnabled();
+    const currentState = database.isQuietHoursEnabled(userId);
     const newState = !currentState;
-    db.prepare('INSERT OR REPLACE INTO user_settings (key, value) VALUES (?, ?)').run(quietHoursKey, newState.toString());
+    db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
+      .run(userId, quietHoursKey, newState.toString());
     return newState;
   }
 };
