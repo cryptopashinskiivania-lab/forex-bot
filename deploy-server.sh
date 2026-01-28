@@ -1,6 +1,6 @@
 #!/bin/bash
 # Деплой forex-bot на сервер (Ubuntu/Debian)
-# Запуск: ssh root@161.97.89.186, затем bash deploy-server.sh
+# Запуск: Подключитесь к серверу через SSH, затем выполните: bash deploy-server.sh
 
 set -e
 
@@ -16,7 +16,7 @@ echo "=== 3. Клонируем бот ==="
 if [ -d "forex-bot" ]; then
   echo "Папка forex-bot уже есть. Пропускаем clone. (удали её вручную, если нужен свежий clone)"
 else
-  git clone https://github.com/cryptopashinskiivania-lab/forex-bot.git
+  git clone YOUR_REPO_URL_HERE
 fi
 cd forex-bot
 

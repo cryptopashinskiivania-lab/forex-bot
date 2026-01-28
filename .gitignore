@@ -3,9 +3,19 @@ node_modules/
 
 # Environment variables
 .env
+.env.*
+!.env.example
 
 # SQLite DB
 bot.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Backups
+*.backup
+*.bak
 
 # Build output
 dist/
