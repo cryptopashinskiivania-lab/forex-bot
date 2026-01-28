@@ -29,7 +29,7 @@
 **Ключевые настройки**:
 - User-Agent: Chrome 131.0.0.0
 - Viewport: 1920x1080
-- Timezone: America/New_York
+- Timezone: Europe/Kyiv (ForexFactory shows times in user's selected timezone)
 - Args: `--disable-blink-features=AutomationControlled`
 
 #### MyfxbookService.ts (Myfxbook)
@@ -87,15 +87,14 @@ $ npx ts-node scripts/test-calendar-scrape.ts
 [CalendarService] Waiting for calendar table...
 [CalendarService] Successfully fetched HTML
 
-Found 2 events (USD/GBP/EUR/JPY/NZD, High/Medium impact):
+Found 3 events (USD/GBP/EUR/JPY/NZD, High/Medium impact):
 
-1. [USD] Medium | CB Consumer Confidence
-   Time from ForexFactory (NY): 10:00am
-   UTC time (saved to DB): 2026-01-27T15:00:00.000Z
-   NY time (for verification): 10:00
-   Kyiv time (shown to user): 17:00
+1. [USD] High | Federal Funds Rate
+   Time from ForexFactory (Kyiv): 9:00pm
+   UTC time (saved to DB): 2026-01-28T19:00:00.000Z
+   Kyiv time (shown to user): 21:00
 
-✅ Times are now correctly parsed from America/New_York timezone
+✅ Times are correctly parsed from Europe/Kyiv timezone (ForexFactory user setting)
 ✅ UTC times are saved to database
 ✅ Kyiv times are displayed to users
 [CalendarService] Closing browser...

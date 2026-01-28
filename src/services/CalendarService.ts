@@ -12,7 +12,7 @@ dayjs.extend(timezone);
 dayjs.extend(customParseFormat);
 
 const DEFAULT_TZ = 'Europe/Kyiv';
-const FF_TZ = 'America/New_York';
+const FF_TZ = 'Europe/Kyiv'; // ForexFactory will show times in this timezone
 
 export interface CalendarEvent {
   title: string;
@@ -61,8 +61,6 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
   
   // Try to parse the time string
   try {
-    // Get base date components in NY timezone to know which day we're parsing for
-    const baseDateNY = dayjs().tz(FF_TZ);
     const dateStr = baseDate.format('YYYY-MM-DD');
     const combined = `${dateStr} ${t}`;
     
@@ -82,7 +80,7 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
         const parsed = dayjs(combined, fmt);
         if (parsed.isValid()) {
           // Extract components from the parsed time
-          // These represent the time AS SHOWN on ForexFactory (which is in America/New_York)
+          // These represent the time AS SHOWN on ForexFactory (which is in Europe/Kyiv timezone)
           const year = parsed.year();
           const month = String(parsed.month() + 1).padStart(2, '0');
           const day = String(parsed.date()).padStart(2, '0');
@@ -90,10 +88,10 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
           const minutes = String(parsed.minute()).padStart(2, '0');
           const seconds = '00';
           
-          // This time string represents America/New_York local time
+          // This time string represents Europe/Kyiv local time (as set in Playwright timezoneId)
           const dateString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
           
-          // CRITICAL: Convert from America/New_York local time to UTC
+          // CRITICAL: Convert from Europe/Kyiv local time to UTC
           // fromZonedTime interprets the date string as being in FF_TZ timezone
           // and returns the corresponding UTC Date object
           const utcDate = fromZonedTime(dateString, FF_TZ);
@@ -173,6 +171,8 @@ export class CalendarService {
     const page: Page = await browser.newPage({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
+      timezoneId: 'Europe/Kyiv', // Set timezone to match user's ForexFactory settings
+      locale: 'en-US',
     });
 
     try {
@@ -208,6 +208,7 @@ export class CalendarService {
 
     const $ = cheerio.load(html);
     const events: CalendarEvent[] = [];
+    // Base date in Kyiv timezone (ForexFactory will show times in this timezone)
     const baseDate = url.includes('tomorrow')
       ? dayjs().tz(FF_TZ).add(1, 'day')
       : dayjs().tz(FF_TZ);

@@ -14,15 +14,13 @@ async function main() {
   console.log(`Found ${events.length} events (USD/GBP/EUR/JPY/NZD/CAD/AUD/CHF, High/Medium impact):\n`);
   events.forEach((e, i) => {
     console.log(`${i + 1}. [${e.currency}] ${e.impact} | ${e.title}`);
-    console.log(`   Time from ForexFactory (NY): ${e.time}`);
+    console.log(`   Time from ForexFactory (Kyiv): ${e.time}`);
     
     if (e.timeISO) {
       const utcDate = parseISO(e.timeISO);
-      const nyTime = toZonedTime(utcDate, 'America/New_York');
       const kyivTime = toZonedTime(utcDate, 'Europe/Kyiv');
       
       console.log(`   UTC time (saved to DB): ${e.timeISO}`);
-      console.log(`   NY time (for verification): ${format(nyTime, 'HH:mm')}`);
       console.log(`   Kyiv time (shown to user): ${format(kyivTime, 'HH:mm')}`);
     } else {
       console.log(`   ⚠️  No valid time parsed (All Day/Tentative)`);
@@ -32,7 +30,7 @@ async function main() {
   });
   
   console.log('\n=== Summary ===');
-  console.log('✅ Times are now correctly parsed from America/New_York timezone');
+  console.log('✅ Times are correctly parsed from Europe/Kyiv timezone (ForexFactory user setting)');
   console.log('✅ UTC times are saved to database');
   console.log('✅ Kyiv times are displayed to users');
 }
