@@ -277,6 +277,16 @@ export class SchedulerService {
                 
                 if (skipped.length > 0) {
                   console.log(`[Scheduler] Daily digest: ${skipped.length} events skipped for user ${user.user_id}`);
+                  // Log skipped issues to database for quality monitoring
+                  skipped.forEach(issue => {
+                    database.logDataIssue(
+                      issue.eventId,
+                      issue.source,
+                      issue.type,
+                      issue.message,
+                      issue.details
+                    );
+                  });
                 }
                 
                 if (userEvents.length === 0) {

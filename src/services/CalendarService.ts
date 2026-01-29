@@ -6,13 +6,15 @@ import timezone from 'dayjs/plugin/timezone';
 import customParseFormat from 'dayjs/plugin/customParseFormat';
 import { fromZonedTime } from 'date-fns-tz';
 import { database } from '../db/database';
+import { DataQualityService } from './DataQualityService';
+import { sendCriticalDataAlert } from '../utils/adminAlerts';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
 dayjs.extend(customParseFormat);
 
 const DEFAULT_TZ = 'Europe/Kyiv';
-const FF_TZ = 'Europe/Kyiv'; // ForexFactory will show times in this timezone
+const FF_TZ = 'America/New_York'; // ForexFactory shows times in EST/EDT timezone
 
 export interface CalendarEvent {
   title: string;
@@ -80,7 +82,7 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
         const parsed = dayjs(combined, fmt);
         if (parsed.isValid()) {
           // Extract components from the parsed time
-          // These represent the time AS SHOWN on ForexFactory (which is in Europe/Kyiv timezone)
+          // These represent the time AS SHOWN on ForexFactory (which is in America/New_York timezone)
           const year = parsed.year();
           const month = String(parsed.month() + 1).padStart(2, '0');
           const day = String(parsed.date()).padStart(2, '0');
@@ -88,10 +90,10 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
           const minutes = String(parsed.minute()).padStart(2, '0');
           const seconds = '00';
           
-          // This time string represents Europe/Kyiv local time (as set in Playwright timezoneId)
+          // This time string represents America/New_York local time (as set in Playwright timezoneId)
           const dateString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
           
-          // CRITICAL: Convert from Europe/Kyiv local time to UTC
+          // CRITICAL: Convert from America/New_York local time to UTC
           // fromZonedTime interprets the date string as being in FF_TZ timezone
           // and returns the corresponding UTC Date object
           const utcDate = fromZonedTime(dateString, FF_TZ);
@@ -125,10 +127,15 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
 export class CalendarService {
   private browser: Browser | null = null;
   private browserLock: Promise<Browser> | null = null;
+  private dataQualityService: DataQualityService;
   
   // Cache for calendar events (5 minutes TTL)
   private cache = new Map<string, { data: CalendarEvent[], expires: number }>();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+  constructor() {
+    this.dataQualityService = new DataQualityService();
+  }
 
   /**
    * Initialize browser instance with anti-detection settings
@@ -174,12 +181,12 @@ export class CalendarService {
     const page: Page = await browser.newPage({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
-      timezoneId: 'Europe/Kyiv', // Set timezone to match user's ForexFactory settings
+      timezoneId: 'America/New_York', // Set timezone to match ForexFactory (EST/EDT)
       locale: 'en-US',
     });
 
     try {
-      console.log(`[CalendarService] Playwright timezone set to: Europe/Kyiv, FF_TZ: ${FF_TZ}`);
+      console.log(`[CalendarService] Playwright timezone set to: America/New_York, FF_TZ: ${FF_TZ}`);
       console.log(`[CalendarService] Navigating to ${url}...`);
       await page.goto(url, { 
         waitUntil: 'domcontentloaded',
@@ -212,7 +219,7 @@ export class CalendarService {
 
     const $ = cheerio.load(html);
     const events: CalendarEvent[] = [];
-    // Base date in Kyiv timezone (ForexFactory will show times in this timezone)
+    // Base date in America/New_York timezone (ForexFactory shows times in EST/EDT)
     const baseDate = url.includes('tomorrow')
       ? dayjs().tz(FF_TZ).add(1, 'day')
       : dayjs().tz(FF_TZ);
@@ -301,14 +308,49 @@ export class CalendarService {
     console.log(`  - Events filtered: ${eventsFiltered}`);
     console.log(`  - Events passed: ${events.length}`);
 
-    // Store in cache
+    // IMPORTANT: Apply data quality checks before caching/returning
+    console.log(`[CalendarService] Applying data quality checks...`);
+    const { valid, issues } = this.dataQualityService.checkRawAndNormalize(events);
+    
+    // Log issues if any
+    if (issues.length > 0) {
+      console.log(`[CalendarService] Data quality issues found: ${issues.length}`);
+      // Save issues to database for analysis
+      issues.forEach(issue => {
+        database.logDataIssue(
+          issue.eventId,
+          issue.source,
+          issue.type,
+          issue.message,
+          issue.details
+        );
+      });
+      // Also log the first few to console
+      issues.slice(0, 5).forEach(issue => {
+        console.log(`  - ${issue.type}: ${issue.message}`);
+      });
+      
+      // IMPORTANT: Send alert to admin if critical issues detected
+      const criticalIssues = issues.filter(i => 
+        i.type === 'MISSING_REQUIRED_FIELD' ||
+        i.type === 'TIME_INCONSISTENCY' ||
+        i.type === 'INVALID_RANGE'
+      );
+      if (criticalIssues.length > 0) {
+        const urlType = url.includes('tomorrow') ? 'Tomorrow' : 'Today';
+        sendCriticalDataAlert(criticalIssues, `ForexFactory Calendar (${urlType})`)
+          .catch(err => console.error('[CalendarService] Failed to send alert:', err));
+      }
+    }
+
+    // Store validated events in cache
     this.cache.set(url, {
-      data: events,
+      data: valid,
       expires: Date.now() + this.CACHE_TTL
     });
-    console.log(`[CalendarService] Cached ${events.length} events for ${url}`);
+    console.log(`[CalendarService] Cached ${valid.length} validated events for ${url}`);
 
-    return events;
+    return valid;
   }
 
   async getEventsForToday(): Promise<CalendarEvent[]> {

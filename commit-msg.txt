@@ -1,0 +1,15 @@
+refactor: unify aggregateCoreEvents into shared module
+
+Consolidated duplicate aggregateCoreEvents functions from bot.ts and SchedulerService.ts into a single shared module with smart deduplication logic.
+
+Key changes:
+- Created src/utils/eventAggregation.ts with unified aggregation logic
+- Implemented smart deduplication with priority-based selection:
+  * Prefers events with actual/forecast data
+  * Prefers High impact over Medium/Low
+  * Prefers ForexFactory as more reliable source (when quality is equal)
+- Updated all 9 call sites across bot.ts and SchedulerService.ts
+- Added detailed logging for deduplication process
+- Removed 142 lines of duplicate code
+
+Resolves #3 from DATA_QUALITY_AUDIT_REPORT.md

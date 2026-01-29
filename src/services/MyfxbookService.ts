@@ -7,6 +7,8 @@ import customParseFormat from 'dayjs/plugin/customParseFormat';
 import { fromZonedTime } from 'date-fns-tz';
 import { CalendarEvent } from './CalendarService';
 import { database } from '../db/database';
+import { DataQualityService } from './DataQualityService';
+import { sendCriticalDataAlert } from '../utils/adminAlerts';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -141,9 +143,14 @@ function parseImpact(impactText: string): 'High' | 'Medium' | 'Low' {
 export class MyfxbookService {
   private browser: Browser | null = null;
   private browserLock: Promise<Browser> | null = null;
+  private dataQualityService: DataQualityService;
   // Cache for calendar events (5 minutes TTL)
   private cache = new Map<string, { data: CalendarEvent[], expires: number }>();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+  constructor() {
+    this.dataQualityService = new DataQualityService();
+  }
 
   /**
    * Initialize browser instance with anti-detection settings
@@ -363,14 +370,49 @@ export class MyfxbookService {
 
       console.log(`[MyfxbookService] Found ${events.length} events from ${url}`);
       
-      // Store in cache
+      // IMPORTANT: Apply data quality checks before caching/returning
+      console.log(`[MyfxbookService] Applying data quality checks...`);
+      const { valid, issues } = this.dataQualityService.checkRawAndNormalize(events);
+      
+      // Log issues if any
+      if (issues.length > 0) {
+        console.log(`[MyfxbookService] Data quality issues found: ${issues.length}`);
+        // Save issues to database for analysis
+        issues.forEach(issue => {
+          database.logDataIssue(
+            issue.eventId,
+            issue.source,
+            issue.type,
+            issue.message,
+            issue.details
+          );
+        });
+        // Also log the first few to console
+        issues.slice(0, 5).forEach(issue => {
+          console.log(`  - ${issue.type}: ${issue.message}`);
+        });
+        
+        // IMPORTANT: Send alert to admin if critical issues detected
+        const criticalIssues = issues.filter(i => 
+          i.type === 'MISSING_REQUIRED_FIELD' ||
+          i.type === 'TIME_INCONSISTENCY' ||
+          i.type === 'INVALID_RANGE'
+        );
+        if (criticalIssues.length > 0) {
+          const urlType = url.includes('tomorrow') ? 'Tomorrow' : 'Today';
+          sendCriticalDataAlert(criticalIssues, `Myfxbook Calendar (${urlType})`)
+            .catch(err => console.error('[MyfxbookService] Failed to send alert:', err));
+        }
+      }
+      
+      // Store validated events in cache
       this.cache.set(url, {
-        data: events,
+        data: valid,
         expires: Date.now() + this.CACHE_TTL
       });
-      console.log(`[MyfxbookService] Cached ${events.length} events for ${url}`);
+      console.log(`[MyfxbookService] Cached ${valid.length} validated events for ${url}`);
       
-      return events;
+      return valid;
     } catch (error) {
       console.error('[MyfxbookService] Error fetching events:', error);
       return [];

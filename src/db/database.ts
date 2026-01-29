@@ -24,6 +24,16 @@ db.exec(`
     value TEXT,
     PRIMARY KEY (user_id, key),
     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+  );
+  
+  CREATE TABLE IF NOT EXISTS data_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT,
+    source TEXT NOT NULL,
+    type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    details TEXT,
+    created_at INTEGER NOT NULL
   )
 `);
 
@@ -68,6 +78,52 @@ export const database = {
   cleanup: () => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     db.prepare('DELETE FROM sent_news WHERE created_at < ?').run(oneDayAgo);
+    
+    // Also cleanup old data issues (keep only last 7 days)
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    db.prepare('DELETE FROM data_issues WHERE created_at < ?').run(sevenDaysAgo);
+  },
+  
+  // Data quality issue tracking
+  logDataIssue: (
+    eventId: string | undefined,
+    source: string,
+    type: string,
+    message: string,
+    details?: Record<string, unknown>
+  ) => {
+    db.prepare(`
+      INSERT INTO data_issues (event_id, source, type, message, details, created_at) 
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      eventId || null,
+      source,
+      type,
+      message,
+      details ? JSON.stringify(details) : null,
+      Date.now()
+    );
+  },
+  
+  getRecentDataIssues: (limit: number = 100): Array<{
+    id: number;
+    event_id: string | null;
+    source: string;
+    type: string;
+    message: string;
+    details: string | null;
+    created_at: number;
+  }> => {
+    return db.prepare('SELECT * FROM data_issues ORDER BY created_at DESC LIMIT ?')
+      .all(limit) as Array<{
+        id: number;
+        event_id: string | null;
+        source: string;
+        type: string;
+        message: string;
+        details: string | null;
+        created_at: number;
+      }>;
   },
   
   // User settings (per user)

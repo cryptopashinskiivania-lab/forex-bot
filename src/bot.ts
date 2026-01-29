@@ -7,6 +7,7 @@ import { MyfxbookService } from './services/MyfxbookService';
 import { SchedulerService } from './services/SchedulerService';
 import { DataQualityService } from './services/DataQualityService';
 import { initializeQueue } from './services/MessageQueue';
+import { initializeAdminAlerts } from './utils/adminAlerts';
 import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { getVolatility } from './data/volatility';
@@ -23,6 +24,9 @@ database.cleanup();
 
 // Initialize message queue (must be done before scheduler starts)
 initializeQueue(bot);
+
+// Initialize admin alerts for data quality monitoring
+initializeAdminAlerts(bot);
 
 // Initialize services
 const analysisService = new AnalysisService();
@@ -254,6 +258,16 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     
     if (skipped.length > 0) {
       console.log(`[Bot] AI Forecast: ${skipped.length} events skipped due to quality issues`);
+      // Log skipped issues to database for quality monitoring
+      skipped.forEach(issue => {
+        database.logDataIssue(
+          issue.eventId,
+          issue.source,
+          issue.type,
+          issue.message,
+          issue.details
+        );
+      });
     }
     
     if (events.length === 0) {
@@ -281,6 +295,12 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
       }
       return parts.join(' | ');
     }).join('\n');
+
+    // Additional validation: check if prepared string is not empty
+    if (!eventsForAnalysis.trim()) {
+      await ctx.reply('⚠️ Не удалось подготовить данные для анализа.');
+      return;
+    }
 
     // Get detailed AI analysis
     try {
@@ -319,6 +339,16 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
     
     if (skipped.length > 0) {
       console.log(`[Bot] AI Results: ${skipped.length} events skipped due to quality issues`);
+      // Log skipped issues to database for quality monitoring
+      skipped.forEach(issue => {
+        database.logDataIssue(
+          issue.eventId,
+          issue.source,
+          issue.type,
+          issue.message,
+          issue.details
+        );
+      });
     }
     
     if (eventsWithResults.length === 0) {
@@ -336,6 +366,12 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
       const time24 = formatTime24(e);
       return `${time24} - [${e.currency}] ${e.title} (${e.impact}) | Прогноз: ${e.forecast} | Факт: ${e.actual}`;
     }).join('\n');
+
+    // Additional validation: check if prepared string is not empty
+    if (!eventsForAnalysis.trim()) {
+      await ctx.reply('⚠️ Не удалось подготовить данные для анализа результатов.');
+      return;
+    }
 
     // Get AI analysis of results
     try {
@@ -376,6 +412,16 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
     
     if (skipped.length > 0) {
       console.log(`[Bot] Tomorrow AI Forecast: ${skipped.length} events skipped due to quality issues`);
+      // Log skipped issues to database for quality monitoring
+      skipped.forEach(issue => {
+        database.logDataIssue(
+          issue.eventId,
+          issue.source,
+          issue.type,
+          issue.message,
+          issue.details
+        );
+      });
     }
     
     if (events.length === 0) {
@@ -400,6 +446,12 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
       }
       return parts.join(' | ');
     }).join('\n');
+
+    // Additional validation: check if prepared string is not empty
+    if (!eventsForAnalysis.trim()) {
+      await ctx.reply('⚠️ Не удалось подготовить данные для анализа.');
+      return;
+    }
 
     // Get detailed AI analysis for tomorrow
     try {

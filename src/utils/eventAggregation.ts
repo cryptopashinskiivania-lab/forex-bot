@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { parseISO } from 'date-fns';
 import { CalendarService, CalendarEvent } from '../services/CalendarService';
 import { MyfxbookService } from '../services/MyfxbookService';
+import { DataQualityService } from '../services/DataQualityService';
 import { database } from '../db/database';
 
 /**
@@ -144,6 +145,26 @@ export async function aggregateCoreEvents(
     
     const deduplicatedEvents = Array.from(deduplicationMap.values());
     console.log(`[EventAggregation] ${userInfo}Total after deduplication: ${deduplicatedEvents.length} events`);
+    
+    // Check for cross-source conflicts (if both sources are active)
+    if (forexFactoryEvents.length > 0 && myfxbookEvents.length > 0) {
+      const dataQualityService = new DataQualityService();
+      const conflicts = dataQualityService.checkCrossSourceConflicts(allEvents);
+      
+      if (conflicts.length > 0) {
+        console.log(`[EventAggregation] Found ${conflicts.length} cross-source conflicts`);
+        // Log conflicts to database
+        conflicts.forEach(conflict => {
+          database.logDataIssue(
+            undefined,
+            conflict.source,
+            conflict.type,
+            conflict.message,
+            conflict.details
+          );
+        });
+      }
+    }
     
     return deduplicatedEvents;
   } catch (error) {
