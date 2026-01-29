@@ -147,5 +147,28 @@ export const database = {
     db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
       .run(userId, quietHoursKey, newState.toString());
     return newState;
+  },
+  
+  // News source settings
+  getNewsSource: (userId: number): 'ForexFactory' | 'Myfxbook' | 'Both' => {
+    const sourceKey = 'news_source';
+    const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
+      .get(userId, sourceKey) as { value: string } | undefined;
+    
+    if (!row || !row.value) {
+      return 'Both'; // Default to both sources
+    }
+    
+    const value = row.value as 'ForexFactory' | 'Myfxbook' | 'Both';
+    if (value === 'ForexFactory' || value === 'Myfxbook' || value === 'Both') {
+      return value;
+    }
+    return 'Both';
+  },
+  
+  setNewsSource: (userId: number, source: 'ForexFactory' | 'Myfxbook' | 'Both'): void => {
+    const sourceKey = 'news_source';
+    db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
+      .run(userId, sourceKey, source);
   }
 };

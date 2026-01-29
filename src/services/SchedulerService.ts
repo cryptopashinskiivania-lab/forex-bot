@@ -62,25 +62,38 @@ function deduplicationKey(event: CalendarEvent): string {
 
 /**
  * Aggregate Core news sources (ForexFactory + Myfxbook) with deduplication
+ * Now supports per-user source selection
  */
 async function aggregateCoreEvents(
   calendarService: CalendarService,
-  myfxbookService: MyfxbookService
+  myfxbookService: MyfxbookService,
+  userId: number
 ): Promise<CalendarEvent[]> {
   try {
-    // Fetch from both Core sources in parallel
+    // Get user's news source preference
+    const newsSource = database.getNewsSource(userId);
+    
+    // Determine which sources to fetch
+    const fetchForexFactory = newsSource === 'ForexFactory' || newsSource === 'Both';
+    const fetchMyfxbook = newsSource === 'Myfxbook' || newsSource === 'Both';
+    
+    // Fetch from selected sources in parallel
     const [forexFactoryEvents, myfxbookEvents] = await Promise.all([
-      calendarService.getEventsForToday().catch(err => {
-        console.error('[Scheduler] Error fetching ForexFactory events:', err);
-        return [];
-      }),
-      myfxbookService.getEventsForToday().catch(err => {
-        console.error('[Scheduler] Error fetching Myfxbook events:', err);
-        return [];
-      }),
+      fetchForexFactory
+        ? calendarService.getEventsForToday().catch(err => {
+            console.error('[Scheduler] Error fetching ForexFactory events:', err);
+            return [];
+          })
+        : Promise.resolve([]),
+      fetchMyfxbook
+        ? myfxbookService.getEventsForToday().catch(err => {
+            console.error('[Scheduler] Error fetching Myfxbook events:', err);
+            return [];
+          })
+        : Promise.resolve([]),
     ]);
 
-    console.log(`[Scheduler] ForexFactory: ${forexFactoryEvents.length} events, Myfxbook: ${myfxbookEvents.length} events`);
+    console.log(`[Scheduler] User ${userId} | Source: ${newsSource} | ForexFactory: ${forexFactoryEvents.length}, Myfxbook: ${myfxbookEvents.length}`);
 
     // Combine events
     const allEvents = [...forexFactoryEvents, ...myfxbookEvents];
@@ -340,32 +353,23 @@ export class SchedulerService {
             console.log('[Scheduler] No registered users found');
             return;
           }
-          
-          // Aggregate Core sources (ForexFactory + Myfxbook)
-          const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService);
-          
-          if (events.length === 0) {
-            // Send to all users
-            await Promise.allSettled(
-              users.map(user => 
-                bot.api.sendMessage(user.user_id, '📅 Сегодня нет событий с высоким/средним влиянием.')
-                  .catch(err => console.error(`[Scheduler] Error sending to user ${user.user_id}:`, err))
-              )
-            );
-            return;
-          }
 
-          // Send daily digest to each user based on their monitored assets
+          // Send daily digest to each user based on their monitored assets and news source
           await Promise.allSettled(
             users.map(async (user) => {
               try {
+                // Get events for this user (based on their news source preference)
+                const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id);
+                
                 const monitoredAssets = database.getMonitoredAssets(user.user_id);
                 
                 // Filter events by user's monitored assets
                 const userEvents = events.filter(e => monitoredAssets.includes(e.currency));
                 
                 if (userEvents.length === 0) {
-                  return; // Skip users with no relevant events
+                  await bot.api.sendMessage(user.user_id, '📅 Сегодня нет событий с высоким/средним влиянием для ваших активов.')
+                    .catch(err => console.error(`[Scheduler] Error sending to user ${user.user_id}:`, err));
+                  return;
                 }
                 
                 // Format events list
@@ -427,17 +431,17 @@ export class SchedulerService {
           console.log('[Scheduler] No registered users found');
           return;
         }
-        
-        // Core sources (ForexFactory + Myfxbook) - always fetch
-        const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService);
 
-        // Process calendar events for each user
+        // Process calendar events for each user (with their news source preference)
         await Promise.allSettled(
           users.map(async (user) => {
             try {
               const userId = user.user_id;
               const monitoredAssets = database.getMonitoredAssets(userId);
               const isRssEnabled = database.isRssEnabled(userId);
+              
+              // Get events for this user (based on their news source preference)
+              const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, userId);
               
               // Filter events by user's monitored assets
               const userEvents = events.filter(e => monitoredAssets.includes(e.currency));

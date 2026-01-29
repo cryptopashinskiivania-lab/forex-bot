@@ -105,30 +105,43 @@ function formatTime24(event: CalendarEvent): string {
 
 /**
  * Aggregate Core news sources (ForexFactory + Myfxbook) with deduplication
+ * Now supports per-user source selection
  */
 async function aggregateCoreEvents(
-  forTomorrow: boolean = false
+  forTomorrow: boolean = false,
+  userId?: number
 ): Promise<CalendarEvent[]> {
   try {
+    // Get user's news source preference (default to 'Both' if no userId provided)
+    const newsSource = userId ? database.getNewsSource(userId) : 'Both';
+    
+    // Determine which sources to fetch
+    const fetchForexFactory = newsSource === 'ForexFactory' || newsSource === 'Both';
+    const fetchMyfxbook = newsSource === 'Myfxbook' || newsSource === 'Both';
+    
     const [forexFactoryEvents, myfxbookEvents] = await Promise.all([
-      forTomorrow
-        ? calendarService.getEventsForTomorrow().catch(err => {
-            console.error('[Bot] Error fetching ForexFactory events:', err);
-            return [];
-          })
-        : calendarService.getEventsForToday().catch(err => {
-            console.error('[Bot] Error fetching ForexFactory events:', err);
-            return [];
-          }),
-      forTomorrow
-        ? myfxbookService.getEventsForTomorrow().catch(err => {
-            console.error('[Bot] Error fetching Myfxbook events:', err);
-            return [];
-          })
-        : myfxbookService.getEventsForToday().catch(err => {
-            console.error('[Bot] Error fetching Myfxbook events:', err);
-            return [];
-          }),
+      fetchForexFactory
+        ? (forTomorrow
+            ? calendarService.getEventsForTomorrow().catch(err => {
+                console.error('[Bot] Error fetching ForexFactory events:', err);
+                return [];
+              })
+            : calendarService.getEventsForToday().catch(err => {
+                console.error('[Bot] Error fetching ForexFactory events:', err);
+                return [];
+              }))
+        : Promise.resolve([]),
+      fetchMyfxbook
+        ? (forTomorrow
+            ? myfxbookService.getEventsForTomorrow().catch(err => {
+                console.error('[Bot] Error fetching Myfxbook events:', err);
+                return [];
+              })
+            : myfxbookService.getEventsForToday().catch(err => {
+                console.error('[Bot] Error fetching Myfxbook events:', err);
+                return [];
+              }))
+        : Promise.resolve([]),
     ]);
 
     // NEW LOGIC: ForexFactory has priority, Myfxbook adds only unique events
@@ -137,7 +150,8 @@ async function aggregateCoreEvents(
     const resultEvents: CalendarEvent[] = [...forexFactoryEvents];
     const forexFactoryKeys = new Set(forexFactoryEvents.map(e => deduplicationKey(e)));
     
-    console.log(`[Bot] ForexFactory events: ${forexFactoryEvents.length}`);
+    const userInfo = userId ? `User ${userId} | Source: ${newsSource} | ` : '';
+    console.log(`[Bot] ${userInfo}ForexFactory events: ${forexFactoryEvents.length}, Myfxbook events: ${myfxbookEvents.length}`);
     console.log(`[Bot] ForexFactory keys:`, Array.from(forexFactoryKeys));
     
     // Step 2: Add Myfxbook events ONLY if they don't exist in ForexFactory
@@ -249,7 +263,7 @@ bot.command('daily', async (ctx) => {
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📊 Загружаю события за сегодня...');
     console.log('[Bot] Fetching events...');
-    const allEvents = await aggregateCoreEvents(false);
+    const allEvents = await aggregateCoreEvents(false, userId);
     console.log(`[Bot] Got ${allEvents.length} total events`);
     
     // Filter events by user's monitored assets
@@ -328,7 +342,7 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(false);
+    const allEvents = await aggregateCoreEvents(false, userId);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
@@ -383,7 +397,7 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(false);
+    const allEvents = await aggregateCoreEvents(false, userId);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
@@ -446,7 +460,7 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(true);
+    const allEvents = await aggregateCoreEvents(true, userId);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
@@ -493,7 +507,8 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
 bot.command('calendar', async (ctx) => {
   try {
     await ctx.reply('Fetching today’s calendar…');
-    const events = await aggregateCoreEvents(false);
+    const userId = ctx.from?.id;
+    const events = await aggregateCoreEvents(false, userId);
 
     if (events.length === 0) {
       await ctx.reply('Сегодня нет событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
@@ -530,7 +545,7 @@ bot.command('tomorrow', async (ctx) => {
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📅 Загружаю календарь на завтра...');
     console.log('[Bot] Fetching events...');
-    const allEvents = await aggregateCoreEvents(true);
+    const allEvents = await aggregateCoreEvents(true, userId);
     console.log(`[Bot] Got ${allEvents.length} total events`);
     
     // Filter events by user's monitored assets
@@ -632,7 +647,8 @@ async function processQuestion(ctx: any, question: string) {
     // Optionally get current market context (today's events) to provide better answers
     let context: string | undefined;
     try {
-      const events = await aggregateCoreEvents(false);
+      const userId = ctx.from?.id;
+      const events = await aggregateCoreEvents(false, userId);
       if (events.length > 0) {
         const eventsForContext = events
           .slice(0, 5) // Limit to first 5 events for context
@@ -700,6 +716,13 @@ function buildSettingsKeyboard(userId: number): InlineKeyboard {
   const quietHoursStatus = isQuietHoursEnabled ? '✅' : '❌';
   keyboard.row({ text: `🌙 Тихий режим (23:00-08:00): ${quietHoursStatus}`, callback_data: 'settings_toggle_quiet_hours' });
   
+  // Add News Source selection button
+  const newsSource = database.getNewsSource(userId);
+  const sourceText = newsSource === 'ForexFactory' ? '📰 ForexFactory' : 
+                     newsSource === 'Myfxbook' ? '📊 Myfxbook' : 
+                     '🔄 Оба источника';
+  keyboard.row({ text: `📡 Источник новостей: ${sourceText}`, callback_data: 'settings_news_source' });
+  
   // Add "Close" button at the bottom
   keyboard.row({ text: '✅ Готово', callback_data: 'settings_close' });
   
@@ -722,12 +745,17 @@ bot.command('settings', async (ctx) => {
     const userId = ctx.from.id;
     const monitoredAssets = database.getMonitoredAssets(userId);
     const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const newsSource = database.getNewsSource(userId);
+    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
+                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
+                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
     
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
 **Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -765,12 +793,17 @@ bot.callbackQuery(/^toggle_(.+)$/, async (ctx) => {
     // Update the message with new keyboard
     const monitoredAssets = database.getMonitoredAssets(userId);
     const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const newsSource = database.getNewsSource(userId);
+    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
+                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
+                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
     
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
 **Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -806,12 +839,17 @@ bot.callbackQuery('settings_toggle_rss', async (ctx) => {
     // Update the message with new keyboard
     const monitoredAssets = database.getMonitoredAssets(userId);
     const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const newsSource = database.getNewsSource(userId);
+    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
+                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
+                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
     
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
 **Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -846,12 +884,17 @@ bot.callbackQuery('settings_toggle_quiet_hours', async (ctx) => {
     
     // Update the message with new keyboard
     const monitoredAssets = database.getMonitoredAssets(userId);
+    const newsSource = database.getNewsSource(userId);
+    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
+                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
+                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
     
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
 **Тихий режим:** ${isNowEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -867,6 +910,124 @@ bot.callbackQuery('settings_toggle_quiet_hours', async (ctx) => {
   } catch (error) {
     console.error('Error toggling Quiet Hours:', error);
     await ctx.answerCallbackQuery({ text: '❌ Ошибка при обновлении', show_alert: false });
+  }
+});
+
+// Handle News Source selection button
+bot.callbackQuery('settings_news_source', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const currentSource = database.getNewsSource(userId);
+    
+    // Create inline keyboard with source options
+    const keyboard = new InlineKeyboard();
+    keyboard.row({ text: currentSource === 'ForexFactory' ? '✅ 📰 ForexFactory' : '📰 ForexFactory', callback_data: 'source_forexfactory' });
+    keyboard.row({ text: currentSource === 'Myfxbook' ? '✅ 📊 Myfxbook' : '📊 Myfxbook', callback_data: 'source_myfxbook' });
+    keyboard.row({ text: currentSource === 'Both' ? '✅ 🔄 Оба источника' : '🔄 Оба источника', callback_data: 'source_both' });
+    keyboard.row({ text: '◀️ Назад', callback_data: 'settings_back' });
+    
+    await ctx.editMessageText('📡 **Выберите источник новостей:**\n\n🔵 **ForexFactory** - основной источник, наиболее надежный\n🟢 **Myfxbook** - дополнительный источник\n🔄 **Оба источника** - максимальное покрытие событий (рекомендуется)', {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+    
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error showing news source menu:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при открытии меню', show_alert: false });
+  }
+});
+
+// Handle news source selection callbacks
+bot.callbackQuery(/^source_(forexfactory|myfxbook|both)$/, async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const source = ctx.match[1];
+    
+    let sourceValue: 'ForexFactory' | 'Myfxbook' | 'Both';
+    let sourceName: string;
+    
+    if (source === 'forexfactory') {
+      sourceValue = 'ForexFactory';
+      sourceName = 'ForexFactory';
+    } else if (source === 'myfxbook') {
+      sourceValue = 'Myfxbook';
+      sourceName = 'Myfxbook';
+    } else {
+      sourceValue = 'Both';
+      sourceName = 'Оба источника';
+    }
+    
+    database.setNewsSource(userId, sourceValue);
+    await ctx.answerCallbackQuery({ text: `Источник: ${sourceName}`, show_alert: false });
+    
+    // Return to settings menu
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const keyboard = buildSettingsKeyboard(userId);
+    
+    const message = `⚙️ **Настройки**
+
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
+
+Нажмите на кнопку, чтобы изменить настройку:`;
+    
+    await ctx.editMessageText(message, {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+  } catch (error) {
+    console.error('Error handling source selection:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при обновлении', show_alert: false });
+  }
+});
+
+// Handle back button from news source menu
+bot.callbackQuery('settings_back', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const newsSource = database.getNewsSource(userId);
+    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
+                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
+                       'Оба источника';
+    const keyboard = buildSettingsKeyboard(userId);
+    
+    const message = `⚙️ **Настройки**
+
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
+
+Нажмите на кнопку, чтобы изменить настройку:`;
+    
+    await ctx.editMessageText(message, {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+    
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error returning to settings:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при возврате', show_alert: false });
   }
 });
 
