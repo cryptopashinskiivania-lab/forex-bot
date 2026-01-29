@@ -7,9 +7,11 @@ import { CalendarService, CalendarEvent } from './CalendarService';
 import { MyfxbookService } from './MyfxbookService';
 import { AnalysisService, AnalysisResult } from './AnalysisService';
 import { RssService, RssNewsItem } from './RssService';
+import { DataQualityService } from './DataQualityService';
 import { env } from '../config/env';
 import { database } from '../db/database';
 import { getVolatility } from '../data/volatility';
+import { aggregateCoreEvents } from '../utils/eventAggregation';
 
 const KYIV_TIMEZONE = 'Europe/Kyiv';
 
@@ -33,107 +35,6 @@ function md5(str: string): string {
 
 function itemId(title: string, time: string): string {
   return md5(title + time);
-}
-
-/**
- * Generate deduplication key based on time and currency
- * Used to detect duplicate events from different sources
- */
-function deduplicationKey(event: CalendarEvent): string {
-  // Use time (rounded to nearest 5 minutes) + currency for deduplication
-  // This allows us to catch events that are the same but from different sources
-  let timeKey = event.timeISO || event.time;
-  
-  if (event.timeISO) {
-    try {
-      const eventTime = parseISO(event.timeISO);
-      // Round to nearest 5 minutes
-      const roundedMinutes = Math.floor(eventTime.getMinutes() / 5) * 5;
-      const roundedTime = new Date(eventTime);
-      roundedTime.setMinutes(roundedMinutes, 0, 0);
-      timeKey = roundedTime.toISOString().substring(0, 16); // YYYY-MM-DDTHH:mm
-    } catch {
-      // If parsing fails, use original time
-    }
-  }
-  
-  return md5(`${timeKey}_${event.currency}`);
-}
-
-/**
- * Aggregate Core news sources (ForexFactory + Myfxbook) with deduplication
- * Now supports per-user source selection
- */
-async function aggregateCoreEvents(
-  calendarService: CalendarService,
-  myfxbookService: MyfxbookService,
-  userId: number
-): Promise<CalendarEvent[]> {
-  try {
-    // Get user's news source preference
-    const newsSource = database.getNewsSource(userId);
-    
-    // Determine which sources to fetch
-    const fetchForexFactory = newsSource === 'ForexFactory' || newsSource === 'Both';
-    const fetchMyfxbook = newsSource === 'Myfxbook' || newsSource === 'Both';
-    
-    // Fetch from selected sources in parallel
-    const [forexFactoryEvents, myfxbookEvents] = await Promise.all([
-      fetchForexFactory
-        ? calendarService.getEventsForToday().catch(err => {
-            console.error('[Scheduler] Error fetching ForexFactory events:', err);
-            return [];
-          })
-        : Promise.resolve([]),
-      fetchMyfxbook
-        ? myfxbookService.getEventsForToday().catch(err => {
-            console.error('[Scheduler] Error fetching Myfxbook events:', err);
-            return [];
-          })
-        : Promise.resolve([]),
-    ]);
-
-    console.log(`[Scheduler] User ${userId} | Source: ${newsSource} | ForexFactory: ${forexFactoryEvents.length}, Myfxbook: ${myfxbookEvents.length}`);
-
-    // Combine events
-    const allEvents = [...forexFactoryEvents, ...myfxbookEvents];
-    
-    // Deduplicate: if same time (within 5 min) + same currency, keep only one
-    const deduplicationMap = new Map<string, CalendarEvent>();
-    const seenKeys = new Set<string>();
-    
-    for (const event of allEvents) {
-      const key = deduplicationKey(event);
-      
-      if (!seenKeys.has(key)) {
-        seenKeys.add(key);
-        deduplicationMap.set(key, event);
-      } else {
-        // If we already have this event, prefer the one with more data (actual/forecast)
-        const existing = deduplicationMap.get(key);
-        if (existing) {
-          const existingHasData = !isEmpty(existing.actual) || !isEmpty(existing.forecast);
-          const currentHasData = !isEmpty(event.actual) || !isEmpty(event.forecast);
-          
-          // Prefer event with actual data, or higher impact, or ForexFactory (more reliable)
-          if ((currentHasData && !existingHasData) ||
-              (event.impact === 'High' && existing.impact !== 'High') ||
-              (event.source === 'ForexFactory' && existing.source !== 'ForexFactory')) {
-            deduplicationMap.set(key, event);
-          }
-        }
-      }
-    }
-    
-    const deduplicatedEvents = Array.from(deduplicationMap.values());
-    console.log(`[Scheduler] After deduplication: ${deduplicatedEvents.length} unique events`);
-    
-    return deduplicatedEvents;
-  } catch (error) {
-    console.error('[Scheduler] Error aggregating Core events:', error);
-    // Fallback to ForexFactory only if aggregation fails
-    return calendarService.getEventsForToday().catch(() => []);
-  }
 }
 
 function getSentimentEmoji(sentiment: 'Pos' | 'Neg' | 'Neutral'): string {
@@ -272,6 +173,7 @@ export class SchedulerService {
   private myfxbookService: MyfxbookService;
   private analysisService: AnalysisService;
   private rssService: RssService;
+  private dataQualityService: DataQualityService;
   private cronTasks: cron.ScheduledTask[] = [];
 
   constructor() {
@@ -279,6 +181,7 @@ export class SchedulerService {
     this.myfxbookService = new MyfxbookService();
     this.analysisService = new AnalysisService();
     this.rssService = new RssService();
+    this.dataQualityService = new DataQualityService();
   }
 
   private getHeader(
@@ -359,12 +262,22 @@ export class SchedulerService {
             users.map(async (user) => {
               try {
                 // Get events for this user (based on their news source preference)
-                const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id);
+                const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id, false);
                 
                 const monitoredAssets = database.getMonitoredAssets(user.user_id);
                 
                 // Filter events by user's monitored assets
-                const userEvents = events.filter(e => monitoredAssets.includes(e.currency));
+                const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
+                
+                // IMPORTANT: Apply data quality filter before delivery
+                const { deliver: userEvents, skipped } = this.dataQualityService.filterForDelivery(
+                  userEventsRaw,
+                  { mode: 'general', nowUtc: new Date() }
+                );
+                
+                if (skipped.length > 0) {
+                  console.log(`[Scheduler] Daily digest: ${skipped.length} events skipped for user ${user.user_id}`);
+                }
                 
                 if (userEvents.length === 0) {
                   await bot.api.sendMessage(user.user_id, '📅 Сегодня нет событий с высоким/средним влиянием для ваших активов.')
@@ -441,10 +354,16 @@ export class SchedulerService {
               const isRssEnabled = database.isRssEnabled(userId);
               
               // Get events for this user (based on their news source preference)
-              const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, userId);
+              const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, userId, false);
               
               // Filter events by user's monitored assets
-              const userEvents = events.filter(e => monitoredAssets.includes(e.currency));
+              const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
+              
+              // IMPORTANT: Apply data quality filter before processing
+              const { deliver: userEvents } = this.dataQualityService.filterForDelivery(
+                userEventsRaw,
+                { mode: 'general', nowUtc: new Date() }
+              );
               
               // Process calendar events
               for (const event of userEvents) {
@@ -452,6 +371,8 @@ export class SchedulerService {
                 const id = itemId(event.title, time);
                 
                 // Check for reminder (15 minutes before event)
+                // Note: filterForDelivery already filtered out past events, 
+                // but shouldSendReminder checks the specific 15-minute window
                 if (event.timeISO && shouldSendReminder(event, userId)) {
                   const reminderId = `reminder_${userId}_${id}`;
                   if (!database.hasSent(reminderId)) {

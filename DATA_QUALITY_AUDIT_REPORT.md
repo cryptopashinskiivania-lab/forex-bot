@@ -1,0 +1,735 @@
+# 🔍 DATA QUALITY AUDIT REPORT - Критические проблемы и рекомендации
+
+**Дата:** 29 января 2026  
+**Аудитор:** Senior TypeScript Backend Developer  
+**Цель:** Проверка DataQualityService, парсеров, scheduler и AI-кнопок на баги и логические ошибки
+
+---
+
+## 🚨 КРИТИЧЕСКИЕ БАГИ (требуют немедленного исправления)
+
+### 1. ❌ КРИТИЧНО: Неправильная таймзона ForexFactory
+
+**Файл:** `src/services/CalendarService.ts:16`
+
+**Проблема:**
+```typescript
+const FF_TZ = 'Europe/Kyiv'; // ForexFactory will show times in this timezone
+```
+
+**Реальность:** ForexFactory показывает время в `America/New_York`, а не `Europe/Kyiv`!
+
+**Доказательства:**
+- `scripts/test-all-currencies.ts:14` → `const FF_TZ = 'America/New_York';`
+- `scripts/debug-tomorrow.ts:22` → `timezoneId: 'America/New_York'`
+- По спецификации проекта: **"источник America/New_York → хранение в UTC → отображение Europe/Kyiv"**
+
+**Последствия:**
+- ВСЕ события из ForexFactory парсятся с **разницей в 7-10 часов** (в зависимости от DST)
+- События "сегодня" могут попасть в "завтра" и наоборот
+- Напоминания приходят в неправильное время
+- AI Results анализирует события, которые еще не вышли
+
+**Исправление:**
+```typescript
+// src/services/CalendarService.ts
+const FF_TZ = 'America/New_York'; // ForexFactory shows times in EST/EDT
+```
+
+**Также нужно обновить:**
+```typescript
+// Line 188
+console.log(`[CalendarService] Playwright timezone set to: America/New_York, FF_TZ: ${FF_TZ}`);
+
+// Line 178
+timezoneId: 'America/New_York', // Set timezone to match user's ForexFactory settings
+```
+
+**Приоритет:** 🔴 КРИТИЧНО - исправить НЕМЕДЛЕННО
+
+---
+
+### 2. ❌ КРИТИЧНО: AI Forecast НЕ использует DataQualityService
+
+**Файл:** `src/bot.ts:337-391`
+
+**Проблема:**
+```typescript
+bot.callbackQuery('daily_ai_forecast', async (ctx) => {
+  // ...
+  const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
+  
+  // НЕТ filterForDelivery!
+  
+  const eventsForAnalysis = events.map(e => { /* ... */ }).join('\n');
+  const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
+  // ...
+});
+```
+
+**Последствия:**
+- AI Forecast анализирует **прошедшие события** (которые должны быть отфильтрованы)
+- Включает **события без времени** (All Day, Tentative)
+- Не отфильтровывает **события > 30 минут в прошлом**
+- Разный набор данных по сравнению с AI Results
+
+**Исправление:**
+```typescript
+bot.callbackQuery('daily_ai_forecast', async (ctx) => {
+  try {
+    await ctx.answerCallbackQuery({ text: '🧠 Анализирую события...', show_alert: false });
+    
+    if (!ctx.from) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    
+    const userId = ctx.from.id;
+    const allEvents = await aggregateCoreEvents(false, userId);
+    
+    // Filter events by user's monitored assets
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    
+    // IMPORTANT: Apply data quality filter for AI Forecast
+    const { deliver: events, skipped } = dataQualityService.filterForDelivery(
+      eventsRaw,
+      { mode: 'ai_forecast', nowUtc: new Date() }
+    );
+    
+    if (skipped.length > 0) {
+      console.log(`[Bot] AI Forecast: ${skipped.length} events skipped due to quality issues`);
+    }
+    
+    if (events.length === 0) {
+      const assetsText = monitoredAssets.length > 0 
+        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
+        : 'Нет активов';
+      await ctx.reply(`📅 Нет событий для анализа по вашим активам (${assetsText}).\n\nИзмените активы через /settings`);
+      return;
+    }
+
+    // Prepare detailed events text for AI analysis (with all available data)
+    const eventsForAnalysis = events.map(e => {
+      const time24 = formatTime24(e);
+      const parts = [
+        `${time24} - [${e.currency}] ${e.title} (${e.impact})`
+      ];
+      if (e.forecast && e.forecast !== '—') {
+        parts.push(`Прогноз: ${e.forecast}`);
+      }
+      if (e.previous && e.previous !== '—') {
+        parts.push(`Предыдущее: ${e.previous}`);
+      }
+      if (e.actual && e.actual !== '—') {
+        parts.push(`Факт: ${e.actual}`);
+      }
+      return parts.join(' | ');
+    }).join('\n');
+
+    // Get detailed AI analysis
+    try {
+      const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
+      await ctx.reply(analysis, { parse_mode: 'Markdown' });
+    } catch (analysisError) {
+      console.error('Error generating daily analysis:', analysisError);
+      await ctx.reply('⚠️ Не удалось сгенерировать анализ. Попробуйте позже.');
+    }
+  } catch (error) {
+    console.error('Error in daily AI forecast callback:', error);
+    await ctx.reply('❌ Ошибка при генерации анализа.');
+  }
+});
+```
+
+**Приоритет:** 🔴 КРИТИЧНО
+
+---
+
+### 3. ❌ КРИТИЧНО: Дублирование функции aggregateCoreEvents с разной логикой
+
+**Файлы:**
+- `src/bot.ts:112-182` - aggregateCoreEvents (в bot.ts)
+- `src/services/SchedulerService.ts:68-138` - aggregateCoreEvents (в SchedulerService)
+
+**Проблема:**
+Две **РАЗНЫЕ** функции с **ОДИНАКОВЫМ** именем, но **РАЗНОЙ** логикой дедупликации!
+
+**bot.ts:**
+```typescript
+// Приоритет ForexFactory, Myfxbook добавляется только если уникально
+const resultEvents: CalendarEvent[] = [...forexFactoryEvents];
+const forexFactoryKeys = new Set(forexFactoryEvents.map(e => deduplicationKey(e)));
+
+for (const mbEvent of myfxbookEvents) {
+  const mbKey = deduplicationKey(mbEvent);
+  if (!forexFactoryKeys.has(mbKey)) {
+    resultEvents.push(mbEvent);
+  }
+}
+```
+
+**SchedulerService.ts:**
+```typescript
+// Умная дедупликация с выбором лучшего события
+const deduplicationMap = new Map<string, CalendarEvent>();
+for (const event of allEvents) {
+  const key = deduplicationKey(event);
+  if (!seenKeys.has(key)) {
+    deduplicationMap.set(key, event);
+  } else {
+    // Выбирает событие с большим количеством данных
+    const existing = deduplicationMap.get(key);
+    if ((currentHasData && !existingHasData) ||
+        (event.impact === 'High' && existing.impact !== 'High') ||
+        (event.source === 'ForexFactory' && existing.source !== 'ForexFactory')) {
+      deduplicationMap.set(key, event);
+    }
+  }
+}
+```
+
+**Последствия:**
+- **Разные результаты** для /daily и scheduler
+- **Не используется "умная" дедупликация** в bot.ts
+- **Код дублируется**, сложно поддерживать
+
+**Исправление:**
+Вынести aggregateCoreEvents в отдельный shared модуль или использовать одну и ту же функцию.
+
+**Рекомендация:**
+```typescript
+// src/utils/eventAggregation.ts
+export async function aggregateCoreEvents(
+  calendarService: CalendarService,
+  myfxbookService: MyfxbookService,
+  userId: number,
+  forTomorrow: boolean = false
+): Promise<CalendarEvent[]> {
+  // Единая логика дедупликации
+  // Используется и в bot.ts, и в SchedulerService
+}
+
+// bot.ts
+import { aggregateCoreEvents } from './utils/eventAggregation';
+const events = await aggregateCoreEvents(calendarService, myfxbookService, userId, forTomorrow);
+
+// SchedulerService.ts
+import { aggregateCoreEvents } from '../utils/eventAggregation';
+const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, userId);
+```
+
+**Приоритет:** 🔴 КРИТИЧНО
+
+---
+
+## 🟠 ВЫСОКИЙ ПРИОРИТЕТ (важные проблемы)
+
+### 4. ⚠️ checkCrossSourceConflicts никогда не вызывается
+
+**Файл:** `src/services/DataQualityService.ts:210-281`
+
+**Проблема:**
+Метод `checkCrossSourceConflicts()` реализован, но **НИГДЕ НЕ ИСПОЛЬЗУЕТСЯ**.
+
+**Последствия:**
+- Конфликты между ForexFactory и Myfxbook **не обнаруживаются**
+- Нет логирования расхождений по времени между источниками
+- Функция просто мертвый код
+
+**Исправление:**
+Вызывать метод в aggregateCoreEvents:
+
+```typescript
+// После дедупликации
+const deduplicatedEvents = Array.from(deduplicationMap.values());
+
+// Проверить конфликты между источниками
+if (forexFactoryEvents.length > 0 && myfxbookEvents.length > 0) {
+  const dataQualityService = new DataQualityService();
+  const conflicts = dataQualityService.checkCrossSourceConflicts(allEvents);
+  
+  if (conflicts.length > 0) {
+    console.log(`[Aggregation] Found ${conflicts.length} cross-source conflicts`);
+    // Опционально: логировать в БД
+    conflicts.forEach(conflict => {
+      database.logDataIssue(
+        undefined,
+        conflict.source,
+        conflict.type,
+        conflict.message,
+        conflict.details
+      );
+    });
+  }
+}
+```
+
+**Приоритет:** 🟠 ВЫСОКИЙ
+
+---
+
+### 5. ⚠️ timeISO не в списке REQUIRED_FIELDS
+
+**Файл:** `src/services/DataQualityService.ts:30`
+
+**Проблема:**
+```typescript
+REQUIRED_FIELDS: ['title', 'currency', 'source', 'impact'] as const,
+```
+
+`timeISO` **НЕ ВКЛЮЧЕН** в обязательные поля, хотя проверяется отдельно.
+
+**Последствия:**
+- События без времени проходят валидацию `checkRawAndNormalize`
+- Фильтруются только в `filterForDelivery`
+- Непоследовательная логика
+
+**Рекомендация:**
+Добавить отдельную категорию "RECOMMENDED_FIELDS" или улучшить логику:
+
+```typescript
+const VALIDATION_CONFIG = {
+  MAX_DAYS_FROM_NOW: 2,
+  PAST_EVENT_THRESHOLD_MINUTES: 30,
+  VALID_IMPACTS: ['High', 'Medium', 'Low'] as const,
+  REQUIRED_FIELDS: ['title', 'currency', 'source', 'impact'] as const,
+  RECOMMENDED_FIELDS: ['timeISO'] as const, // Желательные, но не критичные
+};
+
+// В checkRawAndNormalize добавить проверку
+if (!event.timeISO) {
+  eventIssues.push({
+    eventId,
+    source: event.source as 'ForexFactory' | 'Myfxbook',
+    type: 'NO_TIME',
+    message: 'Event is missing timeISO (recommended field)',
+    details: { event },
+  });
+  // Не блокировать событие, но логировать
+}
+```
+
+**Приоритет:** 🟠 ВЫСОКИЙ
+
+---
+
+### 6. ⚠️ filterForDelivery для ai_results требует actual, но не forecast
+
+**Файл:** `src/services/DataQualityService.ts:368-380`
+
+**Проблема:**
+```typescript
+if (!shouldSkip && mode === 'ai_results') {
+  // For AI Results: event should have actual data
+  if (isEmpty(event.actual)) {
+    skipped.push({ /* ... */ });
+    shouldSkip = true;
+  }
+}
+```
+
+Проверяется **только `actual`**, но не `forecast`.
+
+**Последствия:**
+- AI Results может получить события **без прогноза**
+- Анализ "Прогноз vs Факт" будет неполным
+- В `bot.ts:431` формируется строка: `Прогноз: ${e.forecast} | Факт: ${e.actual}`
+  - Если `forecast` пустой, будет: `Прогноз: — | Факт: 150`
+
+**Исправление:**
+```typescript
+if (!shouldSkip && mode === 'ai_results') {
+  // For AI Results: event should have BOTH actual AND forecast data
+  if (isEmpty(event.actual) || isEmpty(event.forecast)) {
+    skipped.push({
+      eventId,
+      source: (event.source as 'ForexFactory' | 'Myfxbook') || 'ForexFactory',
+      type: 'MISSING_REQUIRED_FIELD',
+      message: `Event missing actual or forecast data (AI Results requires both)`,
+      details: { 
+        event,
+        hasActual: !isEmpty(event.actual),
+        hasForecast: !isEmpty(event.forecast),
+      },
+    });
+    shouldSkip = true;
+  }
+}
+```
+
+**Приоритет:** 🟠 ВЫСОКИЙ
+
+---
+
+## 🟡 СРЕДНИЙ ПРИОРИТЕТ (улучшения качества)
+
+### 7. 🔧 Некорректная логика titleSimilarity
+
+**Файл:** `src/services/DataQualityService.ts:56-74`
+
+**Проблема:**
+```typescript
+const editDistance = [...longer].reduce((acc, char, i) => {
+  return shorter[i] === char ? acc : acc + 1;
+}, 0);
+```
+
+Алгоритм **не учитывает** разницу в длине строк корректно:
+- `"NFP"` vs `"NFP Report"` → similarity будет низкая
+- Но это **одно и то же событие**!
+
+**Исправление:**
+Использовать настоящий алгоритм Levenshtein или упростить:
+
+```typescript
+function titleSimilarity(title1: string, title2: string): number {
+  const clean = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const t1 = clean(title1);
+  const t2 = clean(title2);
+  
+  if (t1 === t2) return 1.0;
+  
+  // Check if one contains the other (for "NFP" vs "NFP Report")
+  if (t1.includes(t2) || t2.includes(t1)) {
+    const longer = t1.length > t2.length ? t1 : t2;
+    const shorter = t1.length > t2.length ? t2 : t1;
+    return shorter.length / longer.length; // 0.3 for "nfp" vs "nfpreport"
+  }
+  
+  // Simple character overlap
+  const longer = t1.length > t2.length ? t1 : t2;
+  const shorter = t1.length > t2.length ? t2 : t1;
+  
+  if (longer.length === 0) return 1.0;
+  
+  let matches = 0;
+  for (let i = 0; i < shorter.length; i++) {
+    if (longer[i] === shorter[i]) matches++;
+  }
+  
+  return matches / longer.length;
+}
+```
+
+**Приоритет:** 🟡 СРЕДНИЙ
+
+---
+
+### 8. 🔧 Нет валидации на пустые массивы в некоторых местах
+
+**Файл:** `src/bot.ts` (multiple locations)
+
+**Проблема:**
+В некоторых местах нет проверки на пустой массив перед `.map()`:
+
+```typescript
+// bot.ts:362
+const eventsForAnalysis = events.map(e => { /* ... */ }).join('\n');
+// Если events.length === 0, будет пустая строка
+```
+
+**Последствия:**
+- AI получает пустую строку → может выдать некорректный ответ
+- Не критично, но плохая практика
+
+**Исправление:**
+Добавить проверку перед вызовом AI:
+
+```typescript
+if (events.length === 0) {
+  await ctx.reply('📅 Нет событий для анализа.');
+  return;
+}
+
+const eventsForAnalysis = events.map(e => { /* ... */ }).join('\n');
+
+// Дополнительная проверка
+if (!eventsForAnalysis.trim()) {
+  await ctx.reply('⚠️ Не удалось подготовить данные для анализа.');
+  return;
+}
+
+const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
+```
+
+**Приоритет:** 🟡 СРЕДНИЙ
+
+---
+
+### 9. 🔧 Quiet Hours не проверяются в filterForDelivery
+
+**Файл:** `src/services/DataQualityService.ts:290-391`
+
+**Проблема:**
+`filterForDelivery` **не знает** о Quiet Hours (23:00-08:00).
+
+Проверка Quiet Hours находится в:
+- `src/services/SchedulerService.ts:229-240` → `isQuietHours(userId)`
+- `src/services/SchedulerService.ts:246-268` → `shouldSendReminder(event, userId)`
+
+**Последствия:**
+- Логика разбросана по разным местам
+- DataQualityService **не может** фильтровать по Quiet Hours (т.к. не знает userId)
+
+**Рекомендация:**
+Quiet Hours — это **бизнес-логика отправки**, а не **качество данных**.  
+Правильно, что это проверяется в SchedulerService, а не в DataQualityService.
+
+**НО:** можно добавить параметр в filterForDelivery:
+
+```typescript
+filterForDelivery(
+  events: CalendarEvent[],
+  options: {
+    mode?: 'reminder' | 'ai_forecast' | 'ai_results' | 'general';
+    nowUtc?: Date;
+    respectQuietHours?: boolean; // NEW
+    currentHourKyiv?: number;    // NEW (0-23)
+  } = {}
+): FilterResult<CalendarEvent> {
+  // ...
+  if (options.respectQuietHours && options.currentHourKyiv !== undefined) {
+    const isQuietHour = options.currentHourKyiv >= 23 || options.currentHourKyiv < 8;
+    if (isQuietHour) {
+      // Skip non-critical events during quiet hours
+      // (Results are sent even during quiet hours)
+    }
+  }
+}
+```
+
+**Приоритет:** 🟡 СРЕДНИЙ (опциональное улучшение)
+
+---
+
+## 🟢 НИЗКИЙ ПРИОРИТЕТ (мелкие улучшения)
+
+### 10. 📝 Нет логирования skipped в некоторых местах
+
+**Файл:** `src/bot.ts:337-391`
+
+**Проблема:**
+В `daily_ai_forecast` **НЕТ** логирования skipped events (после добавления filterForDelivery).
+
+В `daily_ai_results` есть:
+```typescript
+if (skipped.length > 0) {
+  console.log(`[Bot] AI Results: ${skipped.length} events skipped due to quality issues`);
+}
+```
+
+Но в `daily_ai_forecast` этого нет (т.к. там вообще нет filterForDelivery).
+
+**Исправление:**
+После добавления filterForDelivery в `daily_ai_forecast`, добавить:
+
+```typescript
+if (skipped.length > 0) {
+  console.log(`[Bot] AI Forecast: ${skipped.length} events skipped due to quality issues`);
+}
+```
+
+**Приоритет:** 🟢 НИЗКИЙ
+
+---
+
+### 11. 📝 Логи не пишутся в data_issues для filterForDelivery
+
+**Файл:** `src/services/DataQualityService.ts:290-391`
+
+**Проблема:**
+`filterForDelivery` создает `skipped` issues, но **НЕ СОХРАНЯЕТ** их в БД.
+
+Только `checkRawAndNormalize` пишет в БД (в CalendarService/MyfxbookService).
+
+**Последствия:**
+- Нет полной картины проблем качества данных
+- Невозможно анализировать, какие события отфильтровываются при delivery
+
+**Рекомендация:**
+Добавить в вызывающий код (bot.ts, SchedulerService):
+
+```typescript
+const { deliver, skipped } = dataQualityService.filterForDelivery(
+  eventsRaw,
+  { mode: 'ai_forecast', nowUtc: new Date() }
+);
+
+// Опционально: логировать skipped в БД
+if (skipped.length > 0) {
+  skipped.forEach(issue => {
+    database.logDataIssue(
+      issue.eventId,
+      issue.source,
+      issue.type,
+      issue.message,
+      issue.details
+    );
+  });
+}
+```
+
+**Приоритет:** 🟢 НИЗКИЙ
+
+---
+
+## 📊 СВОДКА ПРОБЛЕМ
+
+### По критичности:
+
+| Приоритет | Количество | Проблемы |
+|-----------|------------|----------|
+| 🔴 КРИТИЧНО | 3 | #1 (Таймзона FF), #2 (AI Forecast без фильтра), #3 (Дублирование aggregateCoreEvents) |
+| 🟠 ВЫСОКИЙ | 3 | #4 (checkCrossSourceConflicts не вызывается), #5 (timeISO не required), #6 (ai_results без forecast) |
+| 🟡 СРЕДНИЙ | 3 | #7 (titleSimilarity), #8 (пустые массивы), #9 (Quiet Hours) |
+| 🟢 НИЗКИЙ | 2 | #10 (логирование skipped), #11 (data_issues для filterForDelivery) |
+
+### По категориям:
+
+| Категория | Проблемы |
+|-----------|----------|
+| **A. Таймзоны и даты** | #1 (КРИТИЧНО: FF таймзона) |
+| **B. Логика DataQualityService** | #4, #5, #6, #7, #11 |
+| **C. /daily, /tomorrow, AI кнопки** | #2 (КРИТИЧНО), #3 (КРИТИЧНО), #8, #10 |
+| **D. Надежность и edge cases** | #9 |
+
+---
+
+## 🎯 ПЛАН ДЕЙСТВИЙ (рекомендованный порядок)
+
+### Этап 1: КРИТИЧЕСКИЕ БАГИ (сделать НЕМЕДЛЕННО)
+
+1. ✅ **Исправить таймзону ForexFactory** (#1) - **ВЫПОЛНЕНО**
+   - ✅ Изменен `FF_TZ` с `'Europe/Kyiv'` на `'America/New_York'`
+   - ✅ Изменена таймзона Playwright с `'Europe/Kyiv'` на `'America/New_York'`
+   - ✅ Обновлены комментарии в коде
+   - ✅ Протестирован парсинг событий (test-tomorrow.ts, test-calendar-scrape.ts)
+   - ✅ События "сегодня" и "завтра" определяются корректно
+   
+   **Результаты тестов:**
+   - Парсинг времени работает правильно: `"1:30am"` → UTC: `2026-01-30T06:30:00.000Z`
+   - Конвертация в UTC корректная
+   - Отображение в Kyiv timezone для пользователя работает
+
+2. ✅ **Добавить filterForDelivery в AI Forecast** (#2) - **ВЫПОЛНЕНО**
+   - ✅ Обновлен `bot.ts:daily_ai_forecast` - добавлен filterForDelivery и логирование skipped events
+   - ✅ `bot.ts:tomorrow_ai_forecast` - уже использовал filterForDelivery
+
+3. ✅ **Объединить aggregateCoreEvents** (#3) - **ВЫПОЛНЕНО**
+   - ✅ Создан shared модуль `src/utils/eventAggregation.ts`
+   - ✅ Реализована умная дедупликация с приоритетами:
+     * События с actual/forecast данными имеют приоритет
+     * High impact имеет приоритет над Medium/Low
+     * ForexFactory имеет приоритет как более надежный источник (при равном качестве данных)
+   - ✅ Удалена дублированная функция из `bot.ts`
+   - ✅ Удалена дублированная функция из `SchedulerService.ts`
+   - ✅ Обновлены все вызовы в `bot.ts` (7 мест)
+   - ✅ Обновлены все вызовы в `SchedulerService.ts` (2 места)
+   - ✅ Добавлено детальное логирование процесса дедупликации
+
+### Этап 2: ВЫСОКИЙ ПРИОРИТЕТ
+
+4. ✅ **Вызывать checkCrossSourceConflicts** (#4)
+5. ✅ **Улучшить валидацию timeISO** (#5)
+6. ✅ **Проверять forecast в ai_results** (#6)
+
+### Этап 3: СРЕДНИЙ и НИЗКИЙ ПРИОРИТЕТ
+
+7. 🔧 Улучшить titleSimilarity (#7)
+8. 🔧 Добавить проверки на пустые массивы (#8)
+9. 🔧 Логирование (#10, #11)
+
+---
+
+## 🧪 ТЕСТИРОВАНИЕ
+
+После исправления **КРИТИЧЕСКИХ БАГОВ**:
+
+1. **Тест таймзоны:**
+   ```bash
+   npx ts-node scripts/test-tomorrow.ts
+   # Проверить, что события парсятся в корректное время UTC
+   ```
+
+2. **Тест AI Forecast:**
+   - Запустить бота
+   - Нажать кнопку AI Forecast в /daily
+   - Проверить, что анализируются только будущие события
+
+3. **Тест дедупликации:**
+   - Включить оба источника (FF + Myfxbook)
+   - Проверить, что дубликаты корректно удаляются
+   - Проверить логи конфликтов
+
+4. **Тест AI Results:**
+   - Проверить, что анализируются только события с actual И forecast
+
+---
+
+## 💡 ДОПОЛНИТЕЛЬНЫЕ РЕКОМЕНДАЦИИ
+
+### 1. Добавить unit-тесты
+
+```typescript
+// tests/DataQualityService.test.ts
+describe('DataQualityService', () => {
+  it('should filter past events', () => {
+    const dqs = new DataQualityService();
+    const pastEvent = { timeISO: '2026-01-28T10:00:00Z', /* ... */ };
+    const { deliver, skipped } = dqs.filterForDelivery([pastEvent], {
+      mode: 'general',
+      nowUtc: new Date('2026-01-29T12:00:00Z')
+    });
+    expect(deliver.length).toBe(0);
+    expect(skipped.length).toBe(1);
+    expect(skipped[0].type).toBe('PAST_TOO_FAR');
+  });
+  
+  // Больше тестов...
+});
+```
+
+### 2. Мониторинг data_issues
+
+Создать dashboard или регулярный отчет:
+
+```typescript
+// scripts/daily-quality-report.ts
+const issues = database.getRecentDataIssues(1000);
+const summary = {
+  total: issues.length,
+  byType: /* ... */,
+  bySource: /* ... */,
+  trend: /* сравнение с предыдущим днем */
+};
+// Отправить в Telegram admin-чат
+```
+
+### 3. Алерты на критические проблемы
+
+```typescript
+// В CalendarService.ts после checkRawAndNormalize
+if (issues.some(i => i.type === 'MISSING_REQUIRED_FIELD')) {
+  // Отправить alert в admin-чат
+  await bot.api.sendMessage(ADMIN_CHAT_ID, `⚠️ Critical data quality issues detected!`);
+}
+```
+
+---
+
+## ✅ ЗАКЛЮЧЕНИЕ
+
+**Найдено:** 11 проблем  
+**Критические:** 3 (требуют немедленного исправления)  
+**Высокий приоритет:** 3  
+**Средний/Низкий:** 5  
+
+**Основная проблема:** Неправильная таймзона ForexFactory приводит к **некорректному парсингу ВСЕХ событий**.
+
+**После исправления критических багов:**
+- ✅ События будут парсится с правильным временем
+- ✅ AI Forecast будет анализировать только релевантные события
+- ✅ Дедупликация будет работать единообразно
+
+**Текущая реализация DataQualityService в целом хороша**, но нуждается в интеграции критических фиксов.

@@ -5,11 +5,12 @@ import { AnalysisService } from './services/AnalysisService';
 import { CalendarService, CalendarEvent } from './services/CalendarService';
 import { MyfxbookService } from './services/MyfxbookService';
 import { SchedulerService } from './services/SchedulerService';
+import { DataQualityService } from './services/DataQualityService';
 import { initializeQueue } from './services/MessageQueue';
 import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
-import crypto from 'crypto';
 import { getVolatility } from './data/volatility';
+import { aggregateCoreEvents } from './utils/eventAggregation';
 
 // User states for conversation flow
 type UserState = 'WAITING_FOR_QUESTION' | null;
@@ -28,34 +29,7 @@ const analysisService = new AnalysisService();
 const calendarService = new CalendarService();
 const myfxbookService = new MyfxbookService();
 const schedulerService = new SchedulerService();
-
-// Helper function for deduplication
-function md5(str: string): string {
-  return crypto.createHash('md5').update(str, 'utf8').digest('hex');
-}
-
-function deduplicationKey(event: CalendarEvent): string {
-  let timeKey = event.timeISO || event.time;
-  
-  if (event.timeISO) {
-    try {
-      const eventTime = parseISO(event.timeISO);
-      const roundedMinutes = Math.floor(eventTime.getMinutes() / 5) * 5;
-      const roundedTime = new Date(eventTime);
-      roundedTime.setMinutes(roundedMinutes, 0, 0);
-      timeKey = roundedTime.toISOString().substring(0, 16);
-    } catch {
-      // If parsing fails, use original time
-    }
-  }
-  
-  return md5(`${timeKey}_${event.currency}`);
-}
-
-function isEmpty(s: string): boolean {
-  const t = (s || '').trim();
-  return !t || t === '—' || t === '-';
-}
+const dataQualityService = new DataQualityService();
 
 /**
  * Format time to 24-hour format (HH:mm)
@@ -101,82 +75,6 @@ function formatTime24(event: CalendarEvent): string {
   
   // If we can't parse it, return original (for special cases like "All Day", "Tentative")
   return timeStr;
-}
-
-/**
- * Aggregate Core news sources (ForexFactory + Myfxbook) with deduplication
- * Now supports per-user source selection
- */
-async function aggregateCoreEvents(
-  forTomorrow: boolean = false,
-  userId?: number
-): Promise<CalendarEvent[]> {
-  try {
-    // Get user's news source preference (default to 'Both' if no userId provided)
-    const newsSource = userId ? database.getNewsSource(userId) : 'Both';
-    
-    // Determine which sources to fetch
-    const fetchForexFactory = newsSource === 'ForexFactory' || newsSource === 'Both';
-    const fetchMyfxbook = newsSource === 'Myfxbook' || newsSource === 'Both';
-    
-    const [forexFactoryEvents, myfxbookEvents] = await Promise.all([
-      fetchForexFactory
-        ? (forTomorrow
-            ? calendarService.getEventsForTomorrow().catch(err => {
-                console.error('[Bot] Error fetching ForexFactory events:', err);
-                return [];
-              })
-            : calendarService.getEventsForToday().catch(err => {
-                console.error('[Bot] Error fetching ForexFactory events:', err);
-                return [];
-              }))
-        : Promise.resolve([]),
-      fetchMyfxbook
-        ? (forTomorrow
-            ? myfxbookService.getEventsForTomorrow().catch(err => {
-                console.error('[Bot] Error fetching Myfxbook events:', err);
-                return [];
-              })
-            : myfxbookService.getEventsForToday().catch(err => {
-                console.error('[Bot] Error fetching Myfxbook events:', err);
-                return [];
-              }))
-        : Promise.resolve([]),
-    ]);
-
-    // NEW LOGIC: ForexFactory has priority, Myfxbook adds only unique events
-    
-    // Step 1: Add ALL ForexFactory events first
-    const resultEvents: CalendarEvent[] = [...forexFactoryEvents];
-    const forexFactoryKeys = new Set(forexFactoryEvents.map(e => deduplicationKey(e)));
-    
-    const userInfo = userId ? `User ${userId} | Source: ${newsSource} | ` : '';
-    console.log(`[Bot] ${userInfo}ForexFactory events: ${forexFactoryEvents.length}, Myfxbook events: ${myfxbookEvents.length}`);
-    console.log(`[Bot] ForexFactory keys:`, Array.from(forexFactoryKeys));
-    
-    // Step 2: Add Myfxbook events ONLY if they don't exist in ForexFactory
-    for (const mbEvent of myfxbookEvents) {
-      const mbKey = deduplicationKey(mbEvent);
-      
-      if (!forexFactoryKeys.has(mbKey)) {
-        // This event is unique to Myfxbook - add it
-        resultEvents.push(mbEvent);
-        console.log(`[Bot] Added unique Myfxbook event: ${mbEvent.title} (${mbKey})`);
-      } else {
-        // This event already exists in ForexFactory - skip it
-        console.log(`[Bot] Skipped duplicate Myfxbook event: ${mbEvent.title} (${mbKey})`);
-      }
-    }
-    
-    console.log(`[Bot] Total events after deduplication: ${resultEvents.length}`);
-    return resultEvents;
-  } catch (error) {
-    console.error('[Bot] Error aggregating Core events:', error);
-    // Fallback to ForexFactory only if aggregation fails
-    return forTomorrow
-      ? calendarService.getEventsForTomorrow().catch(() => [])
-      : calendarService.getEventsForToday().catch(() => []);
-  }
 }
 
 // Helper function to build main menu keyboard
@@ -263,7 +161,7 @@ bot.command('daily', async (ctx) => {
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📊 Загружаю события за сегодня...');
     console.log('[Bot] Fetching events...');
-    const allEvents = await aggregateCoreEvents(false, userId);
+    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
     console.log(`[Bot] Got ${allEvents.length} total events`);
     
     // Filter events by user's monitored assets
@@ -342,11 +240,21 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(false, userId);
+    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
-    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    
+    // IMPORTANT: Apply data quality filter for AI Forecast
+    const { deliver: events, skipped } = dataQualityService.filterForDelivery(
+      eventsRaw,
+      { mode: 'ai_forecast', nowUtc: new Date() }
+    );
+    
+    if (skipped.length > 0) {
+      console.log(`[Bot] AI Forecast: ${skipped.length} events skipped due to quality issues`);
+    }
     
     if (events.length === 0) {
       const assetsText = monitoredAssets.length > 0 
@@ -397,28 +305,22 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(false, userId);
+    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
-    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
     
-    if (events.length === 0) {
-      const assetsText = monitoredAssets.length > 0 
-        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
-        : 'Нет активов';
-      await ctx.answerCallbackQuery({ 
-        text: `Нет событий для ваших активов (${assetsText})`, 
-        show_alert: true 
-      });
-      return;
-    }
-
-    // Filter events that have actual data (results are available)
-    const eventsWithResults = events.filter(e => 
-      e.actual && e.actual !== '—' && e.forecast && e.forecast !== '—'
+    // IMPORTANT: Apply data quality filter for AI Results
+    const { deliver: eventsWithResults, skipped } = dataQualityService.filterForDelivery(
+      eventsRaw,
+      { mode: 'ai_results', nowUtc: new Date() }
     );
-
+    
+    if (skipped.length > 0) {
+      console.log(`[Bot] AI Results: ${skipped.length} events skipped due to quality issues`);
+    }
+    
     if (eventsWithResults.length === 0) {
       await ctx.answerCallbackQuery({ 
         text: '⏳ Нет данных для анализа (события еще не вышли)', 
@@ -460,11 +362,21 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(true, userId);
+    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, true);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
-    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    
+    // IMPORTANT: Apply data quality filter for AI Forecast (tomorrow)
+    const { deliver: events, skipped } = dataQualityService.filterForDelivery(
+      eventsRaw,
+      { mode: 'ai_forecast', nowUtc: new Date() }
+    );
+    
+    if (skipped.length > 0) {
+      console.log(`[Bot] Tomorrow AI Forecast: ${skipped.length} events skipped due to quality issues`);
+    }
     
     if (events.length === 0) {
       const assetsText = monitoredAssets.length > 0 
@@ -508,7 +420,11 @@ bot.command('calendar', async (ctx) => {
   try {
     await ctx.reply('Fetching today’s calendar…');
     const userId = ctx.from?.id;
-    const events = await aggregateCoreEvents(false, userId);
+    if (!userId) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    const events = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
 
     if (events.length === 0) {
       await ctx.reply('Сегодня нет событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
@@ -545,7 +461,7 @@ bot.command('tomorrow', async (ctx) => {
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📅 Загружаю календарь на завтра...');
     console.log('[Bot] Fetching events...');
-    const allEvents = await aggregateCoreEvents(true, userId);
+    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, true);
     console.log(`[Bot] Got ${allEvents.length} total events`);
     
     // Filter events by user's monitored assets
@@ -648,7 +564,11 @@ async function processQuestion(ctx: any, question: string) {
     let context: string | undefined;
     try {
       const userId = ctx.from?.id;
-      const events = await aggregateCoreEvents(false, userId);
+      if (!userId) {
+        // Skip context if no userId
+        return;
+      }
+      const events = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
       if (events.length > 0) {
         const eventsForContext = events
           .slice(0, 5) // Limit to first 5 events for context
@@ -1126,4 +1046,5 @@ async function shutdown(signal: string) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+
 
