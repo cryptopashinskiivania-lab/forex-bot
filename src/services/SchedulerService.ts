@@ -310,7 +310,13 @@ export class SchedulerService {
                 return parts.join(' | ');
               }).join('\n');
               const analysis = await this.analysisService.analyzeDailySchedule(eventsForAnalysis);
-              await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
+              // Try Markdown first, fallback to plain text if Telegram rejects
+              try {
+                await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
+              } catch (mdErr) {
+                console.warn(`[Scheduler] Markdown send failed for user ${user.user_id}, sending plain text`);
+                await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`);
+              }
             } catch (analysisError) {
               console.error(`[Scheduler] Error generating daily analysis for user ${user.user_id}:`, analysisError);
             }

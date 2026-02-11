@@ -170,6 +170,20 @@ function formatTime24(event: CalendarEvent, timezone: string): string {
   return timeStr;
 }
 
+/**
+ * Send a message with Markdown parse_mode, fallback to plain text if Markdown fails.
+ * Telegram rejects messages with invalid Markdown characters (unescaped _, *, [, ] etc.)
+ */
+async function safeSendMarkdown(ctx: any, text: string): Promise<void> {
+  try {
+    await ctx.reply(text, { parse_mode: 'Markdown' });
+  } catch (err) {
+    // If Markdown parsing fails, send as plain text
+    console.warn('[Bot] Markdown send failed, falling back to plain text:', err instanceof Error ? err.message : err);
+    await ctx.reply(text);
+  }
+}
+
 // Helper function to build main menu keyboard
 function buildMainMenuKeyboard(): InlineKeyboard {
   const keyboard = new InlineKeyboard();
@@ -393,7 +407,7 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     // Get detailed AI analysis
     try {
       const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
-      await ctx.reply(analysis, { parse_mode: 'Markdown' });
+      await safeSendMarkdown(ctx, analysis);
     } catch (analysisError) {
       console.error('Error generating daily analysis:', analysisError);
       await ctx.reply('⚠️ Не удалось сгенерировать анализ. Попробуйте позже.');
@@ -464,7 +478,7 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
     // Get AI analysis of results
     try {
       const analysis = await analysisService.analyzeResults(eventsForAnalysis);
-      await ctx.reply(analysis, { parse_mode: 'Markdown' });
+      await safeSendMarkdown(ctx, analysis);
     } catch (analysisError) {
       console.error('Error generating results analysis:', analysisError);
       await ctx.reply('⚠️ Не удалось сгенерировать анализ результатов. Попробуйте позже.');
@@ -543,7 +557,7 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
     // Get detailed AI analysis for tomorrow
     try {
       const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
-      await ctx.reply(analysis, { parse_mode: 'Markdown' });
+      await safeSendMarkdown(ctx, analysis);
     } catch (analysisError) {
       console.error('Error generating tomorrow analysis:', analysisError);
       await ctx.reply('⚠️ Не удалось сгенерировать анализ. Попробуйте позже.');
