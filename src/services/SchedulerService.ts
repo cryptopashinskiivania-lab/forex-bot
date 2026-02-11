@@ -161,6 +161,22 @@ function shouldSendReminder(event: CalendarEvent, userId: number): boolean {
   }
 }
 
+// Helper: delay for given milliseconds
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Helper: run an async function with a timeout
+function withTimeout<T>(fn: () => Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout (${ms}ms) for: ${label}`)), ms);
+    fn().then(
+      (result) => { clearTimeout(timer); resolve(result); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 export class SchedulerService {
   private calendarService: CalendarService;
   private myfxbookService: MyfxbookService;
@@ -168,6 +184,8 @@ export class SchedulerService {
   private rssService: RssService;
   private dataQualityService: DataQualityService;
   private cronTasks: cron.ScheduledTask[] = [];
+  private isMinuteCheckRunning: boolean = false;
+  private isDailyCheckRunning: boolean = false;
 
   constructor() {
     this.calendarService = new CalendarService();
@@ -223,6 +241,13 @@ export class SchedulerService {
 
     // Run every hour; for each user send daily digest at 08:00 in that user's timezone
     const dailyNewsTask = cron.schedule('0 * * * *', async () => {
+      // Prevent overlapping runs
+      if (this.isDailyCheckRunning) {
+        console.log('[Scheduler] Daily check still running, skipping...');
+        return;
+      }
+      this.isDailyCheckRunning = true;
+
       const now = new Date();
       try {
         const users = database.getUsers();
@@ -239,7 +264,11 @@ export class SchedulerService {
           }
           console.log(`[Scheduler] Running daily news at 08:00 for user ${user.user_id} (${userTz})...`);
           try {
-            const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id, false);
+            const events = await withTimeout(
+              () => aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id, false),
+              60000,
+              `aggregateCoreEvents for user ${user.user_id}`
+            );
             const monitoredAssets = database.getMonitoredAssets(user.user_id);
             const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
             const { deliver: userEvents, skipped } = this.dataQualityService.filterForDelivery(
@@ -290,13 +319,21 @@ export class SchedulerService {
           }
         }
       } catch (error) {
-        console.error('[Scheduler] Error in daily news:', error);
+        console.error('[Scheduler] Error in daily news:', error instanceof Error ? error.message : error);
+      } finally {
+        this.isDailyCheckRunning = false;
       }
     });
     this.cronTasks.push(dailyNewsTask);
 
     // Check for events and RSS every 3 minutes (optimized from every minute)
     const minuteCheckTask = cron.schedule('*/3 * * * *', async () => {
+      // Prevent overlapping runs
+      if (this.isMinuteCheckRunning) {
+        console.log('[Scheduler] Previous minute-check still running, skipping...');
+        return;
+      }
+      this.isMinuteCheckRunning = true;
       console.log('[Scheduler] Running scheduled check (every 3 minutes)...');
 
       try {
@@ -308,16 +345,19 @@ export class SchedulerService {
           return;
         }
 
-        // Process calendar events for each user (with their news source preference)
-        await Promise.allSettled(
-          users.map(async (user) => {
+        // Process users SEQUENTIALLY to avoid overwhelming Groq/Telegram APIs
+        for (const user of users) {
             try {
               const userId = user.user_id;
               const monitoredAssets = database.getMonitoredAssets(userId);
               const isRssEnabled = database.isRssEnabled(userId);
               
-              // Get events for this user (based on their news source preference)
-              const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, userId, false);
+              // Get events for this user (based on their news source preference) with timeout
+              const events = await withTimeout(
+                () => aggregateCoreEvents(this.calendarService, this.myfxbookService, userId, false),
+                60000,
+                `aggregateCoreEvents for user ${userId}`
+              );
               
               // Filter events by user's monitored assets
               const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
@@ -483,12 +523,16 @@ export class SchedulerService {
                 }
               }
             } catch (error) {
-              console.error(`[Scheduler] Error processing notifications for user ${user.user_id}:`, error);
+              console.error(`[Scheduler] Error processing notifications for user ${user.user_id}:`, error instanceof Error ? error.message : error);
             }
-          })
-        );
+
+          // Delay between users to avoid rate limits (Telegram + Groq)
+          await delay(2000);
+        }
       } catch (err) {
-        console.error('[Scheduler] Error in scheduled check:', err);
+        console.error('[Scheduler] Error in scheduled check:', err instanceof Error ? err.message : err);
+      } finally {
+        this.isMinuteCheckRunning = false;
       }
     });
     this.cronTasks.push(minuteCheckTask);

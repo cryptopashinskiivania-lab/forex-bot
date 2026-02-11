@@ -1,4 +1,5 @@
 import { Bot, InlineKeyboard } from 'grammy';
+import { autoRetry } from '@grammyjs/auto-retry';
 import { env } from './config/env';
 import { database } from './db/database';
 import { AnalysisService } from './services/AnalysisService';
@@ -11,6 +12,17 @@ import { initializeAdminAlerts } from './utils/adminAlerts';
 import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { aggregateCoreEvents } from './utils/eventAggregation';
+
+// --- Global error handlers to prevent silent crashes ---
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Promise Rejection:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('[FATAL] Uncaught Exception:', error);
+  // Give time to flush logs, then exit (process manager like pm2 will restart)
+  setTimeout(() => process.exit(1), 1000);
+});
 
 // User states for conversation flow
 type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | null;
@@ -92,6 +104,12 @@ function resolveTimezoneInput(input: string): string | null {
 
 // Create a bot instance
 const bot = new Bot(env.BOT_TOKEN);
+
+// --- Install auto-retry plugin for Telegram rate limits (429 errors) ---
+bot.api.config.use(autoRetry({
+  maxRetryAttempts: 5,
+  maxDelaySeconds: 60,
+}));
 
 database.cleanup();
 
@@ -184,9 +202,10 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// Debug middleware: Log all incoming updates
+// Lightweight debug middleware: Log update type only (not full payload to reduce I/O)
 bot.use(async (ctx, next) => {
-  console.log('Received update:', ctx.update);
+  const updateType = ctx.update.message ? 'message' : ctx.update.callback_query ? 'callback_query' : 'other';
+  console.log(`[Bot] Update: ${updateType} from chat ${ctx.chat?.id}`);
   await next();
 });
 
@@ -1252,10 +1271,10 @@ bot.on('message:text', async (ctx) => {
   }
 });
 
-// Error handler
+// Error handler for middleware/update processing errors
 bot.catch((err) => {
-  console.error('Bot error:', err);
-  // Optionally send error message to user if context is available
+  console.error('[Bot] Error processing update:', err.message || err);
+  // Send error message to user if context is available
   if (err.ctx) {
     err.ctx.reply('❌ Произошла ошибка. Попробуйте позже.').catch(() => {});
   }
@@ -1264,14 +1283,21 @@ bot.catch((err) => {
 // Start the scheduler service (before starting bot)
 schedulerService.start(bot);
 
-// Start the bot (must be at the very end)
-bot.start();
+// --- Start the bot with resilience options ---
+bot.start({
+  // Drop pending updates so the bot doesn't choke on a backlog after restart
+  drop_pending_updates: true,
+  // Callback when polling starts
+  onStart: () => {
+    console.log('✅ Bot started with SQLite persistence and Timezone support');
+  },
+  // Limit update types to only what we handle
+  allowed_updates: ['message', 'callback_query'],
+});
 
-console.log('✅ Bot started with SQLite persistence and Timezone support');
-
-// Graceful shutdown handlers
+// --- Graceful shutdown on SIGINT / SIGTERM ---
 async function shutdown(signal: string) {
-  console.log(`\n${signal} received. Shutting down gracefully...`);
+  console.log(`\n[Bot] ${signal} received. Shutting down gracefully...`);
   
   try {
     // Stop the scheduler (also closes browsers)
@@ -1279,7 +1305,7 @@ async function shutdown(signal: string) {
     console.log('✅ Scheduler stopped');
     
     // Stop the bot
-    await bot.stop();
+    bot.stop();
     console.log('✅ Bot stopped');
     
     process.exit(0);

@@ -7,6 +7,11 @@
     "dev": "nodemon",
     "build": "tsc",
     "start": "ts-node src/bot.ts",
+    "pm2:start": "npm run build && pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop forex-bot",
+    "pm2:restart": "npm run build && pm2 restart forex-bot",
+    "pm2:logs": "pm2 logs forex-bot",
+    "pm2:status": "pm2 status",
     "test": "ts-node tests/DataQualityService.test.ts",
     "test:calendar": "ts-node scripts/test-calendar-scrape.ts",
     "test:cross-source": "ts-node scripts/test-cross-source-conflicts.ts",
@@ -21,6 +26,7 @@
   "license": "ISC",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@grammyjs/auto-retry": "^2.0.2",
     "axios": "^1.13.2",
     "better-sqlite3": "^12.6.2",
     "cheerio": "^1.1.2",
@@ -33,6 +39,7 @@
     "groq-sdk": "^0.37.0",
     "node-cron": "^4.2.1",
     "playwright": "^1.49.0",
+    "pm2": "^6.0.14",
     "rss-parser": "^3.13.0"
   },
   "devDependencies": {
