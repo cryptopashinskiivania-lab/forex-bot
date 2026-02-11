@@ -12,29 +12,21 @@ export interface RssNewsItem {
 export class RssService {
   private parser: Parser;
   private readonly feedUrl = 'https://www.fxstreet.com/rss/news';
-  private readonly baseKeywords = ['Breaking', 'Central Bank', 'Fed', 'ECB', 'BOE', 'BOJ', 'RBNZ'];
+  // Include all major currencies and assets keywords for broad coverage
+  // Filtering per user is done in SchedulerService based on their monitored assets
+  private readonly keywords = [
+    'Breaking', 'Central Bank', 'Fed', 'ECB', 'BOE', 'BOJ', 'RBNZ',
+    'USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'NZD', 'CHF',
+    'Gold', 'XAU', 'GOLD',
+    'Bitcoin', 'BTC', 'Cryptocurrency', 'Crypto',
+    'Oil', 'Crude', 'WTI', 'Brent'
+  ];
   private readonly timeWindowMinutes = 10;
-  
-  private getKeywords(): string[] {
-    const monitoredAssets = database.getMonitoredAssets();
-    // Map assets to keywords (e.g., XAU -> Gold, BTC -> Bitcoin, OIL -> Oil)
-    const assetKeywords: Record<string, string[]> = {
-      XAU: ['Gold', 'XAU', 'GOLD'],
-      BTC: ['Bitcoin', 'BTC', 'Cryptocurrency', 'Crypto'],
-      OIL: ['Oil', 'Crude', 'WTI', 'Brent'],
-    };
-    
-    const keywords = [...this.baseKeywords, ...monitoredAssets];
-    
-    // Add asset-specific keywords
-    for (const asset of monitoredAssets) {
-      if (assetKeywords[asset]) {
-        keywords.push(...assetKeywords[asset]);
-      }
-    }
-    
-    return keywords;
-  }
+
+  // Cache RSS results for 6 minutes to reduce network/memory usage
+  private cachedItems: RssNewsItem[] | null = null;
+  private cacheTimestamp: number = 0;
+  private readonly cacheTtlMs = 6 * 60 * 1000; // 6 minutes
 
   constructor() {
     this.parser = new Parser({
@@ -48,6 +40,12 @@ export class RssService {
    * Get latest news from RSS feed filtered by time and keywords
    */
   async getLatestNews(): Promise<RssNewsItem[]> {
+    // Check cache first
+    if (this.cachedItems && Date.now() - this.cacheTimestamp < this.cacheTtlMs) {
+      console.log(`[RssService] Using cached RSS items (${this.cachedItems.length} items)`);
+      return this.cachedItems;
+    }
+
     try {
       console.log(`[RssService] Fetching RSS feed from ${this.feedUrl}`);
       const feed = await this.parser.parseURL(this.feedUrl);
@@ -85,9 +83,8 @@ export class RssService {
           .join(' ')
           .toUpperCase();
 
-        // Check if any keyword matches (using dynamic keywords from database)
-        const keywords = this.getKeywords();
-        const hasKeyword = keywords.some((keyword) =>
+        // Check if any keyword matches
+        const hasKeyword = this.keywords.some((keyword) =>
           searchText.includes(keyword.toUpperCase())
         );
 
@@ -112,6 +109,11 @@ export class RssService {
       }
 
       console.log(`[RssService] Found ${filteredItems.length} relevant news items from last ${this.timeWindowMinutes} minutes`);
+      
+      // Update cache
+      this.cachedItems = filteredItems;
+      this.cacheTimestamp = Date.now();
+      
       return filteredItems;
     } catch (error) {
       console.error('[RssService] Error fetching RSS feed:', error);

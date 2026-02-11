@@ -1,11 +1,16 @@
 import * as cron from 'node-cron';
 import crypto from 'crypto';
 import { Bot } from 'grammy';
+import { toZonedTime } from 'date-fns-tz';
+import { addMinutes, parseISO, format } from 'date-fns';
 import { CalendarService, CalendarEvent } from './CalendarService';
+import { MyfxbookService } from './MyfxbookService';
 import { AnalysisService, AnalysisResult } from './AnalysisService';
 import { RssService, RssNewsItem } from './RssService';
+import { DataQualityService } from './DataQualityService';
 import { env } from '../config/env';
 import { database } from '../db/database';
+import { aggregateCoreEvents } from '../utils/eventAggregation';
 
 const CURRENCY_FLAGS: Record<string, string> = {
   USD: '🇺🇸',
@@ -13,6 +18,9 @@ const CURRENCY_FLAGS: Record<string, string> = {
   GBP: '🇬🇧',
   JPY: '🇯🇵',
   NZD: '🇳🇿',
+  CAD: '🇨🇦',
+  AUD: '🇦🇺',
+  CHF: '🇨🇭',
   XAU: '🏆',
   BTC: '₿',
   OIL: '🛢️',
@@ -66,15 +74,125 @@ function isEmpty(s: string): boolean {
   return !t || t === '—' || t === '-';
 }
 
+/**
+ * Format event time to 24-hour (HH:mm) in the given timezone
+ */
+function formatTime24(event: CalendarEvent, timezone: string): string {
+  if (event.timeISO) {
+    try {
+      const eventTime = parseISO(event.timeISO);
+      const localTime = toZonedTime(eventTime, timezone);
+      return format(localTime, 'HH:mm');
+    } catch {
+      // Fall through
+    }
+  }
+  
+  // Try to parse the time string and convert to 24-hour format
+  const timeStr = event.time.trim();
+  
+  // If it's already in 24-hour format (HH:mm), return as is
+  if (/^\d{1,2}:\d{2}$/.test(timeStr)) {
+    // Normalize to HH:mm format
+    const [hours, minutes] = timeStr.split(':');
+    return `${hours.padStart(2, '0')}:${minutes}`;
+  }
+  
+  // Try to parse AM/PM format
+  const amPmMatch = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)/i);
+  if (amPmMatch) {
+    let hours = parseInt(amPmMatch[1], 10);
+    const minutes = amPmMatch[2];
+    const ampm = amPmMatch[3].toUpperCase();
+    
+    if (ampm === 'PM' && hours !== 12) {
+      hours += 12;
+    } else if (ampm === 'AM' && hours === 12) {
+      hours = 0;
+    }
+    
+    return `${hours.toString().padStart(2, '0')}:${minutes}`;
+  }
+  
+  // If we can't parse it, return original (for special cases like "All Day", "Tentative")
+  return timeStr;
+}
+
+/**
+ * Check if current time in user's timezone is within quiet hours (23:00 - 08:00)
+ * Uses per-user timezone from settings (default Europe/Kyiv)
+ */
+function isQuietHours(userId: number): boolean {
+  if (!database.isQuietHoursEnabled(userId)) {
+    return false;
+  }
+  const userTz = database.getTimezone(userId);
+  const now = new Date();
+  const localTime = toZonedTime(now, userTz);
+  const hour = localTime.getHours();
+  return hour >= 23 || hour < 8;
+}
+
+/**
+ * Check if we should send notification for an event (15 minutes before event time)
+ * Now checks per-user quiet hours
+ */
+function shouldSendReminder(event: CalendarEvent, userId: number): boolean {
+  if (!event.timeISO) {
+    // For events without valid time, send immediately (if not quiet hours)
+    return !isQuietHours(userId);
+  }
+  
+  try {
+    const eventTime = parseISO(event.timeISO);
+    const now = new Date();
+    
+    // Calculate time difference in minutes
+    const timeDiffMinutes = (eventTime.getTime() - now.getTime()) / (1000 * 60);
+    
+    // Send reminder if we're between 14 and 16 minutes before the event
+    // This gives us a 2-minute window to catch the reminder
+    const shouldSend = timeDiffMinutes >= 14 && timeDiffMinutes <= 16;
+    
+    return shouldSend && !isQuietHours(userId);
+  } catch (error) {
+    console.error('[Scheduler] Error checking reminder time:', error);
+    return false;
+  }
+}
+
+// Helper: delay for given milliseconds
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Helper: run an async function with a timeout
+function withTimeout<T>(fn: () => Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout (${ms}ms) for: ${label}`)), ms);
+    fn().then(
+      (result) => { clearTimeout(timer); resolve(result); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 export class SchedulerService {
   private calendarService: CalendarService;
+  private myfxbookService: MyfxbookService;
   private analysisService: AnalysisService;
   private rssService: RssService;
+  private dataQualityService: DataQualityService;
+  private cronTasks: cron.ScheduledTask[] = [];
+  private isMinuteCheckRunning: boolean = false;
+  private isDailyCheckRunning: boolean = false;
 
   constructor() {
     this.calendarService = new CalendarService();
+    this.myfxbookService = new MyfxbookService();
     this.analysisService = new AnalysisService();
     this.rssService = new RssService();
+    this.dataQualityService = new DataQualityService();
   }
 
   private getHeader(
@@ -102,6 +220,7 @@ export class SchedulerService {
     const trendArrow = getTrendArrow(result.reasoning, result.sentiment);
     
     let msg = `${header} | ${flag} ${currency} | ${title}\n\n`;
+    
     msg += `📡 Источник: ${source}\n`;
     msg += `🎯 Влияние: ${score}/10 ${emoji}\n`;
     msg += `💚 Настроение: ${sentimentEmoji} ${result.sentiment === 'Pos' ? 'Позитивное' : result.sentiment === 'Neg' ? 'Негативное' : 'Нейтральное'} ${trendArrow}\n`;
@@ -117,126 +236,330 @@ export class SchedulerService {
   }
 
   start(bot: Bot): void {
-    const adminChatId = env.ADMIN_CHAT_ID || process.env.ADMIN_CHAT_ID;
+    console.log('Starting SchedulerService with per-user timezone support...');
+    console.log('[Scheduler] Multi-user mode: notifications will be sent to all registered users based on their settings');
 
-    if (!adminChatId) {
-      console.warn('[Scheduler] No Admin Chat ID set, notifications disabled');
-      console.warn('[Scheduler] Set ADMIN_CHAT_ID in .env to enable automatic notifications');
-      return;
-    }
+    // Run every hour; for each user send daily digest at 08:00 in that user's timezone
+    const dailyNewsTask = cron.schedule('0 * * * *', async () => {
+      // Prevent overlapping runs
+      if (this.isDailyCheckRunning) {
+        console.log('[Scheduler] Daily check still running, skipping...');
+        return;
+      }
+      this.isDailyCheckRunning = true;
 
-    console.log('Starting SchedulerService - checking every minute...');
+      const now = new Date();
+      try {
+        const users = database.getUsers();
+        if (users.length === 0) {
+          return;
+        }
+        for (const user of users) {
+          const userTz = database.getTimezone(user.user_id);
+          const localTime = toZonedTime(now, userTz);
+          const hour = localTime.getHours();
+          const minute = localTime.getMinutes();
+          if (hour !== 8 || minute !== 0) {
+            continue;
+          }
+          console.log(`[Scheduler] Running daily news at 08:00 for user ${user.user_id} (${userTz})...`);
+          try {
+            const events = await withTimeout(
+              () => aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id, false),
+              60000,
+              `aggregateCoreEvents for user ${user.user_id}`
+            );
+            const monitoredAssets = database.getMonitoredAssets(user.user_id);
+            const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
+            const { deliver: userEvents, skipped } = this.dataQualityService.filterForDelivery(
+              userEventsRaw,
+              { mode: 'general', nowUtc: new Date() }
+            );
+            if (skipped.length > 0) {
+              console.log(`[Scheduler] Daily digest: ${skipped.length} events skipped for user ${user.user_id}`);
+              skipped.forEach(issue => {
+                database.logDataIssue(
+                  issue.eventId,
+                  issue.source,
+                  issue.type,
+                  issue.message,
+                  issue.details
+                );
+              });
+            }
+            if (userEvents.length === 0) {
+              await bot.api.sendMessage(user.user_id, '📅 Сегодня нет событий с высоким/средним влиянием для ваших активов.')
+                .catch(err => console.error(`[Scheduler] Error sending to user ${user.user_id}:`, err));
+              continue;
+            }
+            const lines = userEvents.map((e, i) => {
+              const n = i + 1;
+              const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
+              const time24 = formatTime24(e, userTz);
+              return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
+            });
+            const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
+            await bot.api.sendMessage(user.user_id, eventsText);
+            try {
+              const eventsForAnalysis = userEvents.map(e => {
+                const time24 = formatTime24(e, userTz);
+                const parts = [`${time24} - [${e.currency}] ${e.title} (${e.impact})`];
+                if (e.forecast && e.forecast !== '—') parts.push(`Прогноз: ${e.forecast}`);
+                if (e.previous && e.previous !== '—') parts.push(`Предыдущее: ${e.previous}`);
+                if (e.actual && e.actual !== '—') parts.push(`Факт: ${e.actual}`);
+                return parts.join(' | ');
+              }).join('\n');
+              const analysis = await this.analysisService.analyzeDailySchedule(eventsForAnalysis);
+              // Try Markdown first, fallback to plain text if Telegram rejects
+              try {
+                await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
+              } catch (mdErr) {
+                console.warn(`[Scheduler] Markdown send failed for user ${user.user_id}, sending plain text`);
+                await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`);
+              }
+            } catch (analysisError) {
+              console.error(`[Scheduler] Error generating daily analysis for user ${user.user_id}:`, analysisError);
+            }
+          } catch (error) {
+            console.error(`[Scheduler] Error sending daily news to user ${user.user_id}:`, error);
+          }
+        }
+      } catch (error) {
+        console.error('[Scheduler] Error in daily news:', error instanceof Error ? error.message : error);
+      } finally {
+        this.isDailyCheckRunning = false;
+      }
+    });
+    this.cronTasks.push(dailyNewsTask);
 
-    cron.schedule('* * * * *', async () => {
-      console.log('[Scheduler] Running scheduled check...');
+    // Check for events and RSS every 6 minutes (optimized for memory usage)
+    const minuteCheckTask = cron.schedule('*/6 * * * *', async () => {
+      // Prevent overlapping runs
+      if (this.isMinuteCheckRunning) {
+        console.log('[Scheduler] Previous minute-check still running, skipping...');
+        return;
+      }
+      this.isMinuteCheckRunning = true;
+      console.log('[Scheduler] Running scheduled check (every 6 minutes)...');
 
       try {
-        // Check if RSS is enabled before fetching
-        const isRssEnabled = database.isRssEnabled();
+        // Get all registered users
+        const users = database.getUsers();
         
-        const [events, rssItems] = await Promise.all([
-          this.calendarService.getEventsForToday(),
-          isRssEnabled ? this.rssService.getLatestNews() : Promise.resolve([]),
-        ]);
-
-        const toProcess: Array<
-          | { type: 'calendar'; event: CalendarEvent; id: string; time: string }
-          | { type: 'rss'; item: RssNewsItem; id: string; time: string }
-        > = [];
-
-        for (const event of events) {
-          // Use timeISO if available (parsed time), otherwise use raw time string
-          // This handles cases like "All Day" or "Tentative" where timeISO is undefined
-          const time = event.timeISO || event.time;
-          const id = itemId(event.title, time);
-          if (database.hasSent(id)) continue;
-          
-          // For events without valid timeISO (All Day, Tentative), process them immediately
-          // if they are high/medium impact (they're already filtered by CalendarService)
-          toProcess.push({ type: 'calendar', event, id, time });
+        if (users.length === 0) {
+          console.log('[Scheduler] No registered users found');
+          return;
         }
 
-        for (const item of rssItems) {
-          const time = item.pubDate?.toISOString() ?? item.title;
-          const id = itemId(item.title, time);
-          if (database.hasSent(id)) continue;
-          toProcess.push({ type: 'rss', item, id, time });
-        }
-
-        console.log(`[Scheduler] ${toProcess.length} new items to process`);
-
-        for (const entry of toProcess) {
-          try {
-            if (entry.type === 'calendar') {
-              const { event, id } = entry;
-              const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-              const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
-              const emoji = scoreEmoji(result.score);
-              const header = this.getHeader(false, event.isResult);
-              const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
-              const msg = this.formatMessage(
-                header,
-                flag,
-                event.currency,
-                event.title,
-                event.source || 'ForexFactory',
-                result.score,
-                emoji,
-                event.actual,
-                event.forecast,
-                result
+        // Process users SEQUENTIALLY to avoid overwhelming Groq/Telegram APIs
+        for (const user of users) {
+            try {
+              const userId = user.user_id;
+              const monitoredAssets = database.getMonitoredAssets(userId);
+              const isRssEnabled = database.isRssEnabled(userId);
+              
+              // Get events for this user (based on their news source preference) with timeout
+              const events = await withTimeout(
+                () => aggregateCoreEvents(this.calendarService, this.myfxbookService, userId, false),
+                60000,
+                `aggregateCoreEvents for user ${userId}`
               );
-              await bot.api.sendMessage(adminChatId, msg, { parse_mode: undefined });
-              database.markAsSent(id);
-              console.log(`[Scheduler] Calendar notification sent: ${event.title}`);
-            } else {
-              const { item, id } = entry;
-              const text = `Breaking News: ${item.title}. Summary: ${item.summary}`;
-              const result = await this.analysisService.analyzeNews(text, item.source);
-              const emoji = scoreEmoji(result.score);
-              const header = this.getHeader(true, false);
               
-              // Try to extract currency from title/summary for better flag display
-              const monitoredAssets = database.getMonitoredAssets();
-              let detectedCurrency = '';
-              let flag = '📰';
+              // Filter events by user's monitored assets
+              const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
               
-              for (const asset of monitoredAssets) {
-                if (item.title.toUpperCase().includes(asset) || item.summary.toUpperCase().includes(asset)) {
-                  detectedCurrency = asset;
-                  flag = CURRENCY_FLAGS[asset] || '📰';
-                  break;
+              // IMPORTANT: Apply data quality filter before processing
+              const { deliver: userEvents } = this.dataQualityService.filterForDelivery(
+                userEventsRaw,
+                { mode: 'general', nowUtc: new Date() }
+              );
+              
+              // Process calendar events
+              for (const event of userEvents) {
+                const time = event.timeISO || event.time;
+                const id = itemId(event.title, time);
+                
+                // Check for reminder (15 minutes before event)
+                // Note: filterForDelivery already filtered out past events, 
+                // but shouldSendReminder checks the specific 15-minute window
+                if (event.timeISO && shouldSendReminder(event, userId)) {
+                  const reminderId = `reminder_${userId}_${id}`;
+                  if (!database.hasSent(reminderId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
+                      const emoji = scoreEmoji(result.score);
+                      const header = '⏰ НАПОМИНАНИЕ (за 15 мин)';
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(reminderId);
+                      console.log(`[Scheduler] Reminder sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending reminder to user ${userId}:`, err);
+                    }
+                  }
+                }
+                
+                // Check for result (if actual is available and not sent yet)
+                // Results are important, so send them even during quiet hours
+                if (event.isResult) {
+                  const resultId = `result_${userId}_${id}`;
+                  if (!database.hasSent(resultId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(false, event.isResult);
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(resultId);
+                      console.log(`[Scheduler] Result sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending result to user ${userId}:`, err);
+                    }
+                  }
+                }
+                
+                // For events without valid timeISO (All Day, Tentative), process them immediately
+                // if they are high/medium impact and not in quiet hours
+                if (!event.timeISO && !isQuietHours(userId)) {
+                  const eventId = `event_${userId}_${id}`;
+                  if (!database.hasSent(eventId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(false, false);
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(eventId);
+                      console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending event to user ${userId}:`, err);
+                    }
+                  }
                 }
               }
               
-              const displayCurrency = detectedCurrency || item.source;
-              const msg = this.formatMessage(
-                header,
-                flag,
-                displayCurrency,
-                item.title,
-                item.source,
-                result.score,
-                emoji,
-                '',
-                '',
-                result
-              );
-              let full = msg;
-              if (item.link) full += `\n\n🔗 ${item.link}`;
-              await bot.api.sendMessage(adminChatId, full, { parse_mode: undefined });
-              database.markAsSent(id);
-              console.log(`[Scheduler] RSS notification sent: ${item.title}`);
+              // Process RSS if enabled for this user
+              if (isRssEnabled && !isQuietHours(userId)) {
+                const rssItems = await this.rssService.getLatestNews().catch(() => []);
+                
+                for (const item of rssItems) {
+                  const time = item.pubDate?.toISOString() ?? item.title;
+                  const rssId = `rss_${userId}_${itemId(item.title, time)}`;
+                  
+                  if (!database.hasSent(rssId)) {
+                    try {
+                      const text = `Breaking News: ${item.title}. Summary: ${item.summary}`;
+                      const result = await this.analysisService.analyzeNews(text, item.source);
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(true, false);
+                      
+                      // Try to extract currency from title/summary for better flag display
+                      let detectedCurrency = '';
+                      let flag = '📰';
+                      
+                      for (const asset of monitoredAssets) {
+                        if (item.title.toUpperCase().includes(asset) || item.summary.toUpperCase().includes(asset)) {
+                          detectedCurrency = asset;
+                          flag = CURRENCY_FLAGS[asset] || '📰';
+                          break;
+                        }
+                      }
+                      
+                      const displayCurrency = detectedCurrency || item.source;
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        displayCurrency,
+                        item.title,
+                        item.source,
+                        result.score,
+                        emoji,
+                        '',
+                        '',
+                        result
+                      );
+                      let full = msg;
+                      if (item.link) full += `\n\n🔗 ${item.link}`;
+                      await bot.api.sendMessage(userId, full, { parse_mode: undefined });
+                      database.markAsSent(rssId);
+                      console.log(`[Scheduler] RSS sent to user ${userId}: ${item.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending RSS to user ${userId}:`, err);
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              console.error(`[Scheduler] Error processing notifications for user ${user.user_id}:`, error instanceof Error ? error.message : error);
             }
-          } catch (err) {
-            console.error(`[Scheduler] Error processing item:`, err);
-          }
+
+          // Delay between users to avoid rate limits (Telegram + Groq)
+          await delay(2000);
         }
       } catch (err) {
-        console.error('[Scheduler] Error in scheduled check:', err);
+        console.error('[Scheduler] Error in scheduled check:', err instanceof Error ? err.message : err);
+      } finally {
+        this.isMinuteCheckRunning = false;
       }
     });
+    this.cronTasks.push(minuteCheckTask);
 
     console.log('SchedulerService started successfully');
+  }
+
+  /**
+   * Stop all cron tasks and cleanup resources
+   */
+  async stop(): Promise<void> {
+    console.log('[Scheduler] Stopping all cron tasks...');
+    for (const task of this.cronTasks) {
+      task.stop();
+    }
+    this.cronTasks = [];
+    console.log('[Scheduler] All cron tasks stopped');
+    
+    // Close both browsers (ForexFactory and Myfxbook now use Playwright)
+    await this.calendarService.close();
+    await this.myfxbookService.close();
+    console.log('[Scheduler] Services cleaned up');
   }
 }
