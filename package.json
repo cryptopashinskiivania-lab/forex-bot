@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "nodemon",
     "build": "tsc",
-    "start": "ts-node src/bot.ts",
+    "start": "node --max-old-space-size=256 dist/bot.js",
+    "start:dev": "ts-node src/bot.ts",
     "pm2:start": "npm run build && pm2 start ecosystem.config.js",
     "pm2:stop": "pm2 stop forex-bot",
     "pm2:restart": "npm run build && pm2 restart forex-bot",

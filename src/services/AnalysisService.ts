@@ -9,6 +9,16 @@ export interface AnalysisResult {
   affected_pairs: string[];
 }
 
+// Models in priority order: main model first, fallback second
+const MODELS = [
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export class AnalysisService {
   private groq: Groq;
   // Cache for AI analysis results (10 minutes TTL)
@@ -17,7 +27,59 @@ export class AnalysisService {
 
   constructor() {
     this.groq = new Groq({ apiKey: env.GROQ_API_KEY });
-    console.log('Initializing AnalysisService with Groq (llama-3.3-70b-versatile)');
+    console.log(`Initializing AnalysisService with Groq (models: ${MODELS.join(', ')})`);
+  }
+
+  /**
+   * Call Groq API with automatic retry and fallback model.
+   * On 429 rate limit: wait briefly, then try fallback model.
+   */
+  private async callGroq(
+    messages: Array<{ role: 'system' | 'user'; content: string }>,
+    temperature: number,
+    maxTokens: number
+  ): Promise<string> {
+    for (let i = 0; i < MODELS.length; i++) {
+      const model = MODELS[i];
+      try {
+        const completion = await this.groq.chat.completions.create({
+          model,
+          messages,
+          temperature,
+          max_tokens: maxTokens,
+        });
+
+        const responseText = completion.choices[0]?.message?.content;
+        if (!responseText) {
+          throw new Error('No text in API response');
+        }
+        return responseText;
+      } catch (error: unknown) {
+        const isRateLimit = error instanceof Error && 'status' in error && (error as any).status === 429;
+
+        if (isRateLimit) {
+          const retryAfter = (error as any).headers?.['retry-after'];
+          const waitSeconds = retryAfter ? Math.min(Number(retryAfter), 30) : 5;
+
+          console.warn(`[AnalysisService] Rate limit on ${model}. Waiting before trying next model...`);
+
+          // If there's a next model to try, wait briefly and switch
+          if (i < MODELS.length - 1) {
+            await sleep(Math.min(waitSeconds * 1000, 10000)); // wait max 10s
+            console.log(`[AnalysisService] Switching to fallback model: ${MODELS[i + 1]}`);
+            continue;
+          }
+
+          // Last model also rate limited
+          throw new Error(`AI временно недоступен (rate limit). Попробуйте через ${waitSeconds} сек.`);
+        }
+
+        // Not a rate limit error — throw immediately
+        throw error;
+      }
+    }
+
+    throw new Error('Не удалось получить ответ от AI');
   }
 
   private getCacheKey(method: string, text: string, source?: string): string {
@@ -86,9 +148,8 @@ OUTPUT FORMAT (только JSON, без другого текста):
 ${text}`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты профессиональный аналитик рынка Форекс. Всегда отвечай только валидным JSON, без markdown, без объяснений.'
@@ -98,17 +159,9 @@ ${text}`;
             content: systemPrompt
           }
         ],
-        temperature: 0.3,
-        max_tokens: 600
-      });
-
-      // Extract text from Groq API response
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        console.error('API Response structure:', JSON.stringify(completion, null, 2));
-        throw new Error('No text in API response');
-      }
+        0.3,
+        600
+      );
 
       // Clean the response - remove markdown code blocks if present
       const cleanText = responseText.replace(/```json|```/g, '').trim();
@@ -141,13 +194,7 @@ ${text}`;
       
       return analysis;
     } catch (error) {
-      console.error('=== Groq API Error ===');
-      console.error('Error:', error);
-      if (error instanceof Error) {
-        console.error('Error message:', error.message);
-        console.error('Error stack:', error.stack);
-      }
-      console.error('========================');
+      console.error('[AnalysisService] analyzeNews error:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to analyze news: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
@@ -228,9 +275,8 @@ ${eventsText}
 Выведи анализ СТРОГО в указанном формате выше.`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты старший трейдер Форекс. Анализируй события детально, используя финансовую логику. Отвечай на русском языке в формате Markdown.'
@@ -240,17 +286,10 @@ ${eventsText}
             content: systemPrompt
           }
         ],
-        temperature: 0.4,
-        max_tokens: 1500
-      });
+        0.4,
+        1500
+      );
 
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        throw new Error('No text in API response');
-      }
-
-      // Clean the response
       const cleanText = responseText.trim();
       
       // Store in cache
@@ -261,8 +300,7 @@ ${eventsText}
       
       return cleanText;
     } catch (error) {
-      console.error('=== Groq API Error (analyzeDailySchedule) ===');
-      console.error('Error:', error);
+      console.error('[AnalysisService] analyzeDailySchedule error:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to analyze daily schedule: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
@@ -296,9 +334,8 @@ CONSTRAINTS:
 ${question}`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты ментор по Форекс. Отвечай на вопросы кратко, профессионально и практично. Используй русский язык.'
@@ -308,17 +345,10 @@ ${question}`;
             content: systemPrompt
           }
         ],
-        temperature: 0.5,
-        max_tokens: 800
-      });
+        0.5,
+        800
+      );
 
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        throw new Error('No text in API response');
-      }
-
-      // Clean the response
       const cleanText = responseText.trim();
       
       // Store in cache
@@ -329,8 +359,7 @@ ${question}`;
       
       return cleanText;
     } catch (error) {
-      console.error('=== Groq API Error (answerQuestion) ===');
-      console.error('Error:', error);
+      console.error('[AnalysisService] answerQuestion error:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to answer question: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
@@ -411,9 +440,8 @@ ${eventsText}
 Выведи анализ СТРОГО в указанном формате выше.`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты старший трейдер Форекс. Анализируй результаты событий детально, фокусируясь на отклонениях от прогнозов. Отвечай на русском языке в формате Markdown.'
@@ -423,17 +451,10 @@ ${eventsText}
             content: systemPrompt
           }
         ],
-        temperature: 0.4,
-        max_tokens: 1500
-      });
+        0.4,
+        1500
+      );
 
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        throw new Error('No text in API response');
-      }
-
-      // Clean the response
       const cleanText = responseText.trim();
       
       // Store in cache
@@ -444,8 +465,7 @@ ${eventsText}
       
       return cleanText;
     } catch (error) {
-      console.error('=== Groq API Error (analyzeResults) ===');
-      console.error('Error:', error);
+      console.error('[AnalysisService] analyzeResults error:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to analyze results: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }

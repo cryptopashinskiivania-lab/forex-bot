@@ -332,15 +332,15 @@ export class SchedulerService {
     });
     this.cronTasks.push(dailyNewsTask);
 
-    // Check for events and RSS every 3 minutes (optimized from every minute)
-    const minuteCheckTask = cron.schedule('*/3 * * * *', async () => {
+    // Check for events and RSS every 6 minutes (optimized for memory usage)
+    const minuteCheckTask = cron.schedule('*/6 * * * *', async () => {
       // Prevent overlapping runs
       if (this.isMinuteCheckRunning) {
         console.log('[Scheduler] Previous minute-check still running, skipping...');
         return;
       }
       this.isMinuteCheckRunning = true;
-      console.log('[Scheduler] Running scheduled check (every 3 minutes)...');
+      console.log('[Scheduler] Running scheduled check (every 6 minutes)...');
 
       try {
         // Get all registered users

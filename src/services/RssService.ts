@@ -23,6 +23,11 @@ export class RssService {
   ];
   private readonly timeWindowMinutes = 10;
 
+  // Cache RSS results for 6 minutes to reduce network/memory usage
+  private cachedItems: RssNewsItem[] | null = null;
+  private cacheTimestamp: number = 0;
+  private readonly cacheTtlMs = 6 * 60 * 1000; // 6 minutes
+
   constructor() {
     this.parser = new Parser({
       customFields: {
@@ -35,6 +40,12 @@ export class RssService {
    * Get latest news from RSS feed filtered by time and keywords
    */
   async getLatestNews(): Promise<RssNewsItem[]> {
+    // Check cache first
+    if (this.cachedItems && Date.now() - this.cacheTimestamp < this.cacheTtlMs) {
+      console.log(`[RssService] Using cached RSS items (${this.cachedItems.length} items)`);
+      return this.cachedItems;
+    }
+
     try {
       console.log(`[RssService] Fetching RSS feed from ${this.feedUrl}`);
       const feed = await this.parser.parseURL(this.feedUrl);
@@ -98,6 +109,11 @@ export class RssService {
       }
 
       console.log(`[RssService] Found ${filteredItems.length} relevant news items from last ${this.timeWindowMinutes} minutes`);
+      
+      // Update cache
+      this.cachedItems = filteredItems;
+      this.cacheTimestamp = Date.now();
+      
       return filteredItems;
     } catch (error) {
       console.error('[RssService] Error fetching RSS feed:', error);

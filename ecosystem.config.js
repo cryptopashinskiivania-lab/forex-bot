@@ -2,8 +2,8 @@ module.exports = {
   apps: [
     {
       name: 'forex-bot',
-      script: 'node',
-      args: 'dist/bot.js',
+      script: 'dist/bot.js',
+      node_args: '--max-old-space-size=256',
       // Автоматический перезапуск при падении
       autorestart: true,
       // Максимум 10 перезапусков за 15 минут (защита от бесконечного цикла)
@@ -11,8 +11,8 @@ module.exports = {
       min_uptime: '10s',
       // Задержка между перезапусками (3 секунды)
       restart_delay: 3000,
-      // Перезапуск если память превышает 512MB
-      max_memory_restart: '512M',
+      // Перезапуск если память превышает 300MB
+      max_memory_restart: '300M',
       // Логи
       error_file: './logs/pm2-error.log',
       out_file: './logs/pm2-out.log',
