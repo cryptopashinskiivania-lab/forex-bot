@@ -12,29 +12,16 @@ export interface RssNewsItem {
 export class RssService {
   private parser: Parser;
   private readonly feedUrl = 'https://www.fxstreet.com/rss/news';
-  private readonly baseKeywords = ['Breaking', 'Central Bank', 'Fed', 'ECB', 'BOE', 'BOJ', 'RBNZ'];
+  // Include all major currencies and assets keywords for broad coverage
+  // Filtering per user is done in SchedulerService based on their monitored assets
+  private readonly keywords = [
+    'Breaking', 'Central Bank', 'Fed', 'ECB', 'BOE', 'BOJ', 'RBNZ',
+    'USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'NZD', 'CHF',
+    'Gold', 'XAU', 'GOLD',
+    'Bitcoin', 'BTC', 'Cryptocurrency', 'Crypto',
+    'Oil', 'Crude', 'WTI', 'Brent'
+  ];
   private readonly timeWindowMinutes = 10;
-  
-  private getKeywords(): string[] {
-    const monitoredAssets = database.getMonitoredAssets();
-    // Map assets to keywords (e.g., XAU -> Gold, BTC -> Bitcoin, OIL -> Oil)
-    const assetKeywords: Record<string, string[]> = {
-      XAU: ['Gold', 'XAU', 'GOLD'],
-      BTC: ['Bitcoin', 'BTC', 'Cryptocurrency', 'Crypto'],
-      OIL: ['Oil', 'Crude', 'WTI', 'Brent'],
-    };
-    
-    const keywords = [...this.baseKeywords, ...monitoredAssets];
-    
-    // Add asset-specific keywords
-    for (const asset of monitoredAssets) {
-      if (assetKeywords[asset]) {
-        keywords.push(...assetKeywords[asset]);
-      }
-    }
-    
-    return keywords;
-  }
 
   constructor() {
     this.parser = new Parser({
@@ -85,9 +72,8 @@ export class RssService {
           .join(' ')
           .toUpperCase();
 
-        // Check if any keyword matches (using dynamic keywords from database)
-        const keywords = this.getKeywords();
-        const hasKeyword = keywords.some((keyword) =>
+        // Check if any keyword matches
+        const hasKeyword = this.keywords.some((keyword) =>
           searchText.includes(keyword.toUpperCase())
         );
 

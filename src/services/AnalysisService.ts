@@ -9,15 +9,89 @@ export interface AnalysisResult {
   affected_pairs: string[];
 }
 
+// Primary and fallback models (each has its own separate rate limit on Groq)
+const PRIMARY_MODEL = 'llama-3.3-70b-versatile';
+const FALLBACK_MODEL = 'llama-3.1-8b-instant';
+
 export class AnalysisService {
   private groq: Groq;
+  // Cache for AI analysis results (10 minutes TTL)
+  private cache = new Map<string, { result: any, expires: number }>();
+  private readonly CACHE_TTL = 10 * 60 * 1000; // 10 minutes in milliseconds
 
   constructor() {
     this.groq = new Groq({ apiKey: env.GROQ_API_KEY });
-    console.log('Initializing AnalysisService with Groq (llama-3.3-70b-versatile)');
+    console.log(`Initializing AnalysisService with Groq (primary: ${PRIMARY_MODEL}, fallback: ${FALLBACK_MODEL})`);
+  }
+
+  /**
+   * Call Groq API with automatic fallback to a smaller model on rate limit (429).
+   * Each model has its own separate daily token limit on Groq.
+   */
+  private async callGroq(
+    messages: Array<{ role: 'system' | 'user'; content: string }>,
+    temperature: number,
+    maxTokens: number
+  ): Promise<string> {
+    // Try primary model first
+    try {
+      const completion = await this.groq.chat.completions.create({
+        model: PRIMARY_MODEL,
+        messages,
+        temperature,
+        max_tokens: maxTokens,
+      });
+      const text = completion.choices[0]?.message?.content;
+      if (!text) throw new Error('No text in API response');
+      return text;
+    } catch (primaryError: any) {
+      // If rate limited (429), try fallback model
+      if (primaryError?.status === 429) {
+        console.warn(`[AnalysisService] ${PRIMARY_MODEL} rate limited, falling back to ${FALLBACK_MODEL}`);
+        try {
+          const completion = await this.groq.chat.completions.create({
+            model: FALLBACK_MODEL,
+            messages,
+            temperature,
+            max_tokens: maxTokens,
+          });
+          const text = completion.choices[0]?.message?.content;
+          if (!text) throw new Error('No text in API response (fallback)');
+          return text;
+        } catch (fallbackError: any) {
+          // If fallback also rate limited, throw with clear message
+          if (fallbackError?.status === 429) {
+            throw new Error('Все модели Groq достигли дневного лимита. Попробуйте через несколько минут или обновите тариф на https://console.groq.com/settings/billing');
+          }
+          throw fallbackError;
+        }
+      }
+      throw primaryError;
+    }
+  }
+
+  private getCacheKey(method: string, text: string, source?: string): string {
+    // Create a simple hash of the input to use as cache key
+    const input = `${method}:${text}:${source || ''}`;
+    // Simple hash function
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+      const char = input.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return hash.toString(36);
   }
 
   async analyzeNews(text: string, source?: string): Promise<AnalysisResult> {
+    // Check cache first
+    const cacheKey = this.getCacheKey('analyzeNews', text, source);
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expires > Date.now()) {
+      console.log(`[AnalysisService] Using cached analysis (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
+      return cached.result;
+    }
+
     const sourceNote = source && source !== 'ForexFactory' 
       ? `\nВАЖНО: Источник новости - "${source}". Если это слухи, геополитика или другие неофициальные источники, обрати особое внимание на волатильность настроений и потенциальное влияние на рынок.`
       : '';
@@ -62,9 +136,8 @@ OUTPUT FORMAT (только JSON, без другого текста):
 ${text}`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты профессиональный аналитик рынка Форекс. Всегда отвечай только валидным JSON, без markdown, без объяснений.'
@@ -74,17 +147,9 @@ ${text}`;
             content: systemPrompt
           }
         ],
-        temperature: 0.3,
-        max_tokens: 600
-      });
-
-      // Extract text from Groq API response
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        console.error('API Response structure:', JSON.stringify(completion, null, 2));
-        throw new Error('No text in API response');
-      }
+        0.3,
+        600
+      );
 
       // Clean the response - remove markdown code blocks if present
       const cleanText = responseText.replace(/```json|```/g, '').trim();
@@ -109,6 +174,12 @@ ${text}`;
         throw new Error('Invalid affected_pairs in analysis result');
       }
       
+      // Store in cache
+      this.cache.set(cacheKey, {
+        result: analysis,
+        expires: Date.now() + this.CACHE_TTL
+      });
+      
       return analysis;
     } catch (error) {
       console.error('=== Groq API Error ===');
@@ -123,6 +194,14 @@ ${text}`;
   }
 
   async analyzeDailySchedule(eventsText: string): Promise<string> {
+    // Check cache first
+    const cacheKey = this.getCacheKey('analyzeDailySchedule', eventsText);
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expires > Date.now()) {
+      console.log(`[AnalysisService] Using cached daily schedule analysis (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
+      return cached.result;
+    }
+
     const systemPrompt = `ROLE: Ты старший количественный аналитик Форекс с 15-летним опытом в макро-трейдинге.
 
 CONTEXT: Пользователь - профессиональный трейдер. Ему нужен строго фактический, математически обоснованный анализ событий календаря.
@@ -133,33 +212,65 @@ METHODOLOGY (Chain-of-Thought):
 1. DECONSTRUCT: Определи ключевые события, фактические числа vs прогнозы для каждого.
 2. DIAGNOSE: Сравни прогнозы с историческими нормами. Какие отклонения ожидаются?
 3. DEVELOP: Сформулируй причинно-следственные связи для каждого события (например, "ВВП > 2.5% → подтверждение роста экономики → вероятность повышения ставки → сила USD").
-4. DELIVER: Выведи структурированный анализ в формате Markdown.
+4. DELIVER: Выведи структурированный анализ.
 
 CONSTRAINTS:
 - Никаких абстрактных фраз ("Рынок волатилен"). Используй конкретные термины ("Ожидается волатильность > 50 пунктов для GBPUSD").
 - Язык: Русский.
 
-ТРЕБОВАНИЯ К АНАЛИЗУ:
-1. **Общее настроение рынка**: Одно предложение, описывающее общее ожидание рынка (например, "Рынок ожидает публикации ВВП США").
-2. **Разбор по событиям**: Для каждого ключевого события (High и Medium impact) предоставь:
-   - 🕒 [Время] [Валюта] [Название события]
-   - 💡 Анализ: Конкретный прогноз с финансовой логикой (например, "Если ВВП > 2.5% → USD бычий, потому что сильные данные подтверждают рост экономики и возможность повышения ставки").
-3. **Ключевой фокус**: Какая пара наиболее важна сегодня и почему.
+ФОРМАТ ВЫВОДА:
+📊 ═══════════════════════════════
+     ДЕТАЛЬНЫЙ АНАЛИЗ ДНЯ
+═══════════════════════════════
 
-ФОРМАТ: Чистый текст (Markdown), структурированный как указано выше
+💭 Общее настроение:
+▸ [Одно предложение о том, чего ожидает рынок сегодня]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📌 СОБЫТИЯ:
+
+🔴 HIGH IMPACT
+├─ 🕒 [Время] | 🇺🇸/🇪🇺/🇬🇧/🇯🇵/🇳🇿 [Валюта]
+├─ 📋 [Название события]
+├─ 📊 Прогноз: [значение] | Предыдущее: [значение]
+└─ 💡 АНАЛИЗ:
+   ▸ [Ожидаемое направление и логика]
+   ▸ [Влияние на валютные пары конкретно]
+   ▸ [Ожидаемая волатильность в pips если возможно оценить]
+
+[Повторить для каждого High события]
+
+🟠 MEDIUM IMPACT
+├─ 🕒 [Время] | [Флаг] [Валюта]
+├─ 📋 [Название события]
+├─ 📊 Прогноз: [значение] | Предыдущее: [значение]
+└─ 💡 АНАЛИЗ:
+   ▸ [Краткая оценка влияния]
+
+[Повторить для каждого Medium события]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 КЛЮЧЕВОЙ ФОКУС:
+▸ [Пара]: [Причина, почему эта пара наиболее важна]
+▸ Риски: [Основные риски дня]
+▸ Возможности: [Торговые возможности]
+
+ВАЖНО:
 - Используй финансовую логику: объясняй связи между данными и движением валют
 - Если есть прогнозы (Forecast) и предыдущие значения (Previous), используй их для анализа
 - Фокусируйся на парах: GBPUSD, EURUSD, NZDUSD, USDJPY
+- Используй точные флаги стран: 🇺🇸 для USD, 🇪🇺 для EUR, 🇬🇧 для GBP, 🇯🇵 для JPY, 🇳🇿 для NZD
 
 События дня:
 ${eventsText}
 
-Выведи анализ в указанном формате.`;
+Выведи анализ СТРОГО в указанном формате выше.`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты старший трейдер Форекс. Анализируй события детально, используя финансовую логику. Отвечай на русском языке в формате Markdown.'
@@ -169,28 +280,35 @@ ${eventsText}
             content: systemPrompt
           }
         ],
-        temperature: 0.4,
-        max_tokens: 1500
-      });
-
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        throw new Error('No text in API response');
-      }
+        0.4,
+        1500
+      );
 
       // Clean the response
       const cleanText = responseText.trim();
       
+      // Store in cache
+      this.cache.set(cacheKey, {
+        result: cleanText,
+        expires: Date.now() + this.CACHE_TTL
+      });
+      
       return cleanText;
     } catch (error) {
-      console.error('=== Groq API Error (analyzeDailySchedule) ===');
-      console.error('Error:', error);
+      console.error('[AnalysisService] Error in analyzeDailySchedule:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to analyze daily schedule: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   async answerQuestion(question: string, context?: string): Promise<string> {
+    // Check cache first
+    const cacheKey = this.getCacheKey('answerQuestion', question, context);
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expires > Date.now()) {
+      console.log(`[AnalysisService] Using cached question answer (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
+      return cached.result;
+    }
+
     const contextNote = context 
       ? `\n\nТЕКУЩИЙ КОНТЕКСТ РЫНКА:\n${context}`
       : '';
@@ -211,9 +329,8 @@ CONSTRAINTS:
 ${question}`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты ментор по Форекс. Отвечай на вопросы кратко, профессионально и практично. Используй русский язык.'
@@ -223,24 +340,130 @@ ${question}`;
             content: systemPrompt
           }
         ],
-        temperature: 0.5,
-        max_tokens: 800
-      });
-
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        throw new Error('No text in API response');
-      }
+        0.5,
+        800
+      );
 
       // Clean the response
       const cleanText = responseText.trim();
       
+      // Store in cache
+      this.cache.set(cacheKey, {
+        result: cleanText,
+        expires: Date.now() + this.CACHE_TTL
+      });
+      
       return cleanText;
     } catch (error) {
-      console.error('=== Groq API Error (answerQuestion) ===');
-      console.error('Error:', error);
+      console.error('[AnalysisService] Error in answerQuestion:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to answer question: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  async analyzeResults(eventsText: string): Promise<string> {
+    // Check cache first
+    const cacheKey = this.getCacheKey('analyzeResults', eventsText);
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expires > Date.now()) {
+      console.log(`[AnalysisService] Using cached results analysis (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
+      return cached.result;
+    }
+
+    const systemPrompt = `ROLE: Ты старший количественный аналитик Форекс с 15-летним опытом в макро-трейдинге.
+
+CONTEXT: Пользователь - профессиональный трейдер. Ему нужен строго фактический анализ результатов экономических событий.
+
+TASK: Проанализируй результаты экономических новостей за сегодня.
+
+METHODOLOGY (Chain-of-Thought):
+1. DECONSTRUCT: Определи ключевые события, которые уже вышли (есть фактические данные).
+2. DIAGNOSE: Сравни фактические данные с прогнозами. Какие отклонения произошли?
+3. DEVELOP: Сформулируй причинно-следственные связи для каждого события (например, "CPI вышел 3.5% vs прогноз 3.2% → инфляция выше ожиданий → давление на ФРС повысить ставку → бычий сигнал для USD").
+4. DELIVER: Выведи структурированный анализ.
+
+CONSTRAINTS:
+- Никаких абстрактных фраз ("Рынок волатилен"). Используй конкретные термины ("Отклонение от прогноза на +0.3% создало волатильность 60 пунктов для EURUSD").
+- Язык: Русский.
+
+ФОРМАТ ВЫВОДА:
+📊 ═══════════════════════════════
+           ИТОГИ ДНЯ
+═══════════════════════════════
+
+📋 Общий вывод:
+▸ [1-2 предложения о том, как результаты повлияли на рынок]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 РЕЗУЛЬТАТЫ:
+
+🔴 [Время] | 🇺🇸/🇪🇺/🇬🇧/🇯🇵/🇳🇿 [Валюта]
+├─ 📋 [Название события]
+├─ 📈 Факт:    [значение]
+├─ 📊 Прогноз: [значение]
+├─ 📉 Пред:    [значение]
+├─ ━━━━━━━━━━━━━━━━━━━━━━━━
+├─ 🎯 Отклонение: [+/-X%] (🟢сильные/🟡нейтральные/🔴слабые данные)
+└─ 💡 АНАЛИЗ:
+   ▸ [Объяснение отклонения]
+   ▸ [Влияние на валюту]
+   ▸ [Влияние на конкретные пары: EURUSD/GBPUSD/USDJPY]
+   ▸ [Фактическая наблюдаемая волатильность если известна]
+
+[Повторить для каждого события с результатами]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚡ КЛЮЧЕВЫЕ СЮРПРИЗЫ:
+▸ [Событие 1]: Отклонение [X%] → [влияние на пары]
+▸ [Событие 2]: Отклонение [X%] → [влияние на пары]
+
+🎯 ИТОГОВОЕ ВЛИЯНИЕ НА ПАРЫ:
+▸ EURUSD: [направление и причина]
+▸ GBPUSD: [направление и причина]
+▸ USDJPY: [направление и причина]
+
+ВАЖНО:
+- Используй финансовую логику: объясняй связи между данными и движением валют
+- Фокусируйся на ОТКЛОНЕНИЯХ от прогноза
+- Фокусируйся на парах: GBPUSD, EURUSD, NZDUSD, USDJPY
+- Используй точные флаги стран: 🇺🇸 для USD, 🇪🇺 для EUR, 🇬🇧 для GBP, 🇯🇵 для JPY, 🇳🇿 для NZD
+- Используй цветовые индикаторы: 🟢 для сильных данных выше прогноза, 🔴 для слабых данных ниже прогноза, 🟡 для нейтральных
+
+События с результатами:
+${eventsText}
+
+Выведи анализ СТРОГО в указанном формате выше.`;
+
+    try {
+      const responseText = await this.callGroq(
+        [
+          {
+            role: 'system',
+            content: 'Ты старший трейдер Форекс. Анализируй результаты событий детально, фокусируясь на отклонениях от прогнозов. Отвечай на русском языке в формате Markdown.'
+          },
+          {
+            role: 'user',
+            content: systemPrompt
+          }
+        ],
+        0.4,
+        1500
+      );
+
+      // Clean the response
+      const cleanText = responseText.trim();
+      
+      // Store in cache
+      this.cache.set(cacheKey, {
+        result: cleanText,
+        expires: Date.now() + this.CACHE_TTL
+      });
+      
+      return cleanText;
+    } catch (error) {
+      console.error('[AnalysisService] Error in analyzeResults:', error instanceof Error ? error.message : error);
+      throw new Error(`Failed to analyze results: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 }
