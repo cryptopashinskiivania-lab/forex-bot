@@ -9,6 +9,10 @@ export interface AnalysisResult {
   affected_pairs: string[];
 }
 
+// Primary and fallback models (each has its own separate rate limit on Groq)
+const PRIMARY_MODEL = 'llama-3.3-70b-versatile';
+const FALLBACK_MODEL = 'llama-3.1-8b-instant';
+
 export class AnalysisService {
   private groq: Groq;
   // Cache for AI analysis results (10 minutes TTL)
@@ -17,7 +21,53 @@ export class AnalysisService {
 
   constructor() {
     this.groq = new Groq({ apiKey: env.GROQ_API_KEY });
-    console.log('Initializing AnalysisService with Groq (llama-3.3-70b-versatile)');
+    console.log(`Initializing AnalysisService with Groq (primary: ${PRIMARY_MODEL}, fallback: ${FALLBACK_MODEL})`);
+  }
+
+  /**
+   * Call Groq API with automatic fallback to a smaller model on rate limit (429).
+   * Each model has its own separate daily token limit on Groq.
+   */
+  private async callGroq(
+    messages: Array<{ role: 'system' | 'user'; content: string }>,
+    temperature: number,
+    maxTokens: number
+  ): Promise<string> {
+    // Try primary model first
+    try {
+      const completion = await this.groq.chat.completions.create({
+        model: PRIMARY_MODEL,
+        messages,
+        temperature,
+        max_tokens: maxTokens,
+      });
+      const text = completion.choices[0]?.message?.content;
+      if (!text) throw new Error('No text in API response');
+      return text;
+    } catch (primaryError: any) {
+      // If rate limited (429), try fallback model
+      if (primaryError?.status === 429) {
+        console.warn(`[AnalysisService] ${PRIMARY_MODEL} rate limited, falling back to ${FALLBACK_MODEL}`);
+        try {
+          const completion = await this.groq.chat.completions.create({
+            model: FALLBACK_MODEL,
+            messages,
+            temperature,
+            max_tokens: maxTokens,
+          });
+          const text = completion.choices[0]?.message?.content;
+          if (!text) throw new Error('No text in API response (fallback)');
+          return text;
+        } catch (fallbackError: any) {
+          // If fallback also rate limited, throw with clear message
+          if (fallbackError?.status === 429) {
+            throw new Error('Все модели Groq достигли дневного лимита. Попробуйте через несколько минут или обновите тариф на https://console.groq.com/settings/billing');
+          }
+          throw fallbackError;
+        }
+      }
+      throw primaryError;
+    }
   }
 
   private getCacheKey(method: string, text: string, source?: string): string {
@@ -86,9 +136,8 @@ OUTPUT FORMAT (только JSON, без другого текста):
 ${text}`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты профессиональный аналитик рынка Форекс. Всегда отвечай только валидным JSON, без markdown, без объяснений.'
@@ -98,17 +147,9 @@ ${text}`;
             content: systemPrompt
           }
         ],
-        temperature: 0.3,
-        max_tokens: 600
-      });
-
-      // Extract text from Groq API response
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        console.error('API Response structure:', JSON.stringify(completion, null, 2));
-        throw new Error('No text in API response');
-      }
+        0.3,
+        600
+      );
 
       // Clean the response - remove markdown code blocks if present
       const cleanText = responseText.replace(/```json|```/g, '').trim();
@@ -228,9 +269,8 @@ ${eventsText}
 Выведи анализ СТРОГО в указанном формате выше.`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты старший трейдер Форекс. Анализируй события детально, используя финансовую логику. Отвечай на русском языке в формате Markdown.'
@@ -240,15 +280,9 @@ ${eventsText}
             content: systemPrompt
           }
         ],
-        temperature: 0.4,
-        max_tokens: 1500
-      });
-
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        throw new Error('No text in API response');
-      }
+        0.4,
+        1500
+      );
 
       // Clean the response
       const cleanText = responseText.trim();
@@ -261,8 +295,7 @@ ${eventsText}
       
       return cleanText;
     } catch (error) {
-      console.error('=== Groq API Error (analyzeDailySchedule) ===');
-      console.error('Error:', error);
+      console.error('[AnalysisService] Error in analyzeDailySchedule:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to analyze daily schedule: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
@@ -296,9 +329,8 @@ CONSTRAINTS:
 ${question}`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты ментор по Форекс. Отвечай на вопросы кратко, профессионально и практично. Используй русский язык.'
@@ -308,15 +340,9 @@ ${question}`;
             content: systemPrompt
           }
         ],
-        temperature: 0.5,
-        max_tokens: 800
-      });
-
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        throw new Error('No text in API response');
-      }
+        0.5,
+        800
+      );
 
       // Clean the response
       const cleanText = responseText.trim();
@@ -329,8 +355,7 @@ ${question}`;
       
       return cleanText;
     } catch (error) {
-      console.error('=== Groq API Error (answerQuestion) ===');
-      console.error('Error:', error);
+      console.error('[AnalysisService] Error in answerQuestion:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to answer question: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
@@ -411,9 +436,8 @@ ${eventsText}
 Выведи анализ СТРОГО в указанном формате выше.`;
 
     try {
-      const completion = await this.groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
+      const responseText = await this.callGroq(
+        [
           {
             role: 'system',
             content: 'Ты старший трейдер Форекс. Анализируй результаты событий детально, фокусируясь на отклонениях от прогнозов. Отвечай на русском языке в формате Markdown.'
@@ -423,15 +447,9 @@ ${eventsText}
             content: systemPrompt
           }
         ],
-        temperature: 0.4,
-        max_tokens: 1500
-      });
-
-      const responseText = completion.choices[0]?.message?.content;
-      
-      if (!responseText) {
-        throw new Error('No text in API response');
-      }
+        0.4,
+        1500
+      );
 
       // Clean the response
       const cleanText = responseText.trim();
@@ -444,8 +462,7 @@ ${eventsText}
       
       return cleanText;
     } catch (error) {
-      console.error('=== Groq API Error (analyzeResults) ===');
-      console.error('Error:', error);
+      console.error('[AnalysisService] Error in analyzeResults:', error instanceof Error ? error.message : error);
       throw new Error(`Failed to analyze results: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
