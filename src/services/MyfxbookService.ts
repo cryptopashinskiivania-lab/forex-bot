@@ -392,17 +392,19 @@ export class MyfxbookService {
           console.log(`  - ${issue.type}: ${issue.message}`);
         });
         
-        // IMPORTANT: Send alert to admin if critical issues detected
-        const criticalIssues = issues.filter(i => 
-          i.type === 'MISSING_REQUIRED_FIELD' ||
-          i.type === 'TIME_INCONSISTENCY' ||
-          i.type === 'INVALID_RANGE'
-        );
-        if (criticalIssues.length > 0) {
-          const urlType = url.includes('tomorrow') ? 'Tomorrow' : 'Today';
-          sendCriticalDataAlert(criticalIssues, `Myfxbook Calendar (${urlType})`)
-            .catch(err => console.error('[MyfxbookService] Failed to send alert:', err));
-        }
+        // NOTE: Automatic critical data quality alerts are DISABLED
+        // Use manual scripts (e.g., daily-quality-report.ts) to send alerts on demand
+        // 
+        // const criticalIssues = issues.filter(i => 
+        //   i.type === 'MISSING_REQUIRED_FIELD' ||
+        //   i.type === 'TIME_INCONSISTENCY' ||
+        //   i.type === 'INVALID_RANGE'
+        // );
+        // if (criticalIssues.length > 0) {
+        //   const urlType = url.includes('tomorrow') ? 'Tomorrow' : 'Today';
+        //   sendCriticalDataAlert(criticalIssues, `Myfxbook Calendar (${urlType}`)
+        //     .catch(err => console.error('[MyfxbookService] Failed to send alert:', err));
+        // }
       }
       
       // Store validated events in cache
@@ -419,48 +421,44 @@ export class MyfxbookService {
     }
   }
 
-  async getEventsForToday(): Promise<CalendarEvent[]> {
+  /**
+   * Get today's events. Optional userTimezone: if provided, "today" is in user's timezone (for multi-user bot).
+   */
+  async getEventsForToday(userTimezone?: string): Promise<CalendarEvent[]> {
     const events = await this.fetchEvents(CALENDAR_URL_TODAY);
-    
-    // Filter to only include today's events
-    const tz = getTimezone();
+    const tz = userTimezone || getTimezone();
     const nowLocal = dayjs.tz(new Date(), tz);
     const todayStart = nowLocal.startOf('day');
     const todayEnd = nowLocal.endOf('day');
-    
+
     return events.filter(event => {
       if (!event.timeISO) return false;
-      
       const eventDate = dayjs(event.timeISO).tz(tz);
       const isToday = eventDate.isAfter(todayStart) && eventDate.isBefore(todayEnd);
-      
       if (!isToday) {
-        console.log(`[MyfxbookService] Filtered out event (not today): ${event.title} at ${eventDate.format('MMM DD HH:mm')}`);
+        console.log(`[MyfxbookService] Filtered out event (not today in ${tz}): ${event.title} at ${eventDate.format('MMM DD HH:mm')}`);
       }
-      
       return isToday;
     });
   }
 
-  async getEventsForTomorrow(): Promise<CalendarEvent[]> {
+  /**
+   * Get tomorrow's events. Optional userTimezone: if provided, "tomorrow" is in user's timezone.
+   */
+  async getEventsForTomorrow(userTimezone?: string): Promise<CalendarEvent[]> {
     const events = await this.fetchEvents(CALENDAR_URL_TOMORROW);
-    
-    // Filter to only include tomorrow's events
-    const tz = getTimezone();
+    const tz = userTimezone || getTimezone();
     const nowLocal = dayjs.tz(new Date(), tz);
     const tomorrowStart = nowLocal.add(1, 'day').startOf('day');
     const tomorrowEnd = nowLocal.add(1, 'day').endOf('day');
-    
+
     return events.filter(event => {
       if (!event.timeISO) return false;
-      
       const eventDate = dayjs(event.timeISO).tz(tz);
       const isTomorrow = eventDate.isAfter(tomorrowStart) && eventDate.isBefore(tomorrowEnd);
-      
       if (!isTomorrow) {
-        console.log(`[MyfxbookService] Filtered out event (not tomorrow): ${event.title} at ${eventDate.format('MMM DD HH:mm')}`);
+        console.log(`[MyfxbookService] Filtered out event (not tomorrow in ${tz}): ${event.title} at ${eventDate.format('MMM DD HH:mm')}`);
       }
-      
       return isTomorrow;
     });
   }

@@ -10,10 +10,7 @@ import { RssService, RssNewsItem } from './RssService';
 import { DataQualityService } from './DataQualityService';
 import { env } from '../config/env';
 import { database } from '../db/database';
-import { getVolatility } from '../data/volatility';
 import { aggregateCoreEvents } from '../utils/eventAggregation';
-
-const KYIV_TIMEZONE = 'Europe/Kyiv';
 
 const CURRENCY_FLAGS: Record<string, string> = {
   USD: '🇺🇸',
@@ -78,18 +75,16 @@ function isEmpty(s: string): boolean {
 }
 
 /**
- * Format time to 24-hour format (HH:mm)
- * If timeISO is available, use it; otherwise try to parse the time string
+ * Format event time to 24-hour (HH:mm) in the given timezone
  */
-function formatTime24(event: CalendarEvent): string {
-  // If we have ISO time, format it directly
+function formatTime24(event: CalendarEvent, timezone: string): string {
   if (event.timeISO) {
     try {
       const eventTime = parseISO(event.timeISO);
-      const kyivTime = toZonedTime(eventTime, KYIV_TIMEZONE);
-      return format(kyivTime, 'HH:mm');
+      const localTime = toZonedTime(eventTime, timezone);
+      return format(localTime, 'HH:mm');
     } catch {
-      // Fall through to string parsing
+      // Fall through
     }
   }
   
@@ -124,19 +119,17 @@ function formatTime24(event: CalendarEvent): string {
 }
 
 /**
- * Check if current time in Kyiv timezone is within quiet hours (23:00 - 08:00)
- * Now checks per-user setting
+ * Check if current time in user's timezone is within quiet hours (23:00 - 08:00)
+ * Uses per-user timezone from settings (default Europe/Kyiv)
  */
 function isQuietHours(userId: number): boolean {
   if (!database.isQuietHoursEnabled(userId)) {
     return false;
   }
-  
+  const userTz = database.getTimezone(userId);
   const now = new Date();
-  const kyivTime = toZonedTime(now, KYIV_TIMEZONE);
-  const hour = kyivTime.getHours();
-  
-  // Quiet hours: 23:00 - 08:00 (23:00 to 23:59, and 00:00 to 07:59)
+  const localTime = toZonedTime(now, userTz);
+  const hour = localTime.getHours();
   return hour >= 23 || hour < 8;
 }
 
@@ -210,13 +203,6 @@ export class SchedulerService {
     
     let msg = `${header} | ${flag} ${currency} | ${title}\n\n`;
     
-    // Add volatility information if available (whitelist approach: only if found in VOLATILITY_RULES)
-    const volatility = getVolatility(title, currency);
-    if (volatility) {
-      msg += `📉 Average Volatility: ${volatility}\n`;
-    }
-    // If volatility is null, no line is added (whitelist: only show if in rules)
-    
     msg += `📡 Источник: ${source}\n`;
     msg += `🎯 Влияние: ${score}/10 ${emoji}\n`;
     msg += `💚 Настроение: ${sentimentEmoji} ${result.sentiment === 'Pos' ? 'Позитивное' : result.sentiment === 'Neg' ? 'Негативное' : 'Нейтральное'} ${trendArrow}\n`;
@@ -232,112 +218,79 @@ export class SchedulerService {
   }
 
   start(bot: Bot): void {
-    console.log('Starting SchedulerService with Kyiv timezone support...');
+    console.log('Starting SchedulerService with per-user timezone support...');
     console.log('[Scheduler] Multi-user mode: notifications will be sent to all registered users based on their settings');
 
-    // Schedule daily news at 08:00 Kyiv time
-    // Convert 08:00 Kyiv to UTC cron expression
-    // Note: node-cron doesn't support timezones directly, so we'll use a workaround
-    // We'll check the time in the cron job itself
+    // Run every hour; for each user send daily digest at 08:00 in that user's timezone
     const dailyNewsTask = cron.schedule('0 * * * *', async () => {
       const now = new Date();
-      const kyivTime = toZonedTime(now, KYIV_TIMEZONE);
-      const hour = kyivTime.getHours();
-      const minute = kyivTime.getMinutes();
-      
-      // Check if it's 08:00 Kyiv time
-      if (hour === 8 && minute === 0) {
-        console.log('[Scheduler] Running daily news at 08:00 Kyiv time...');
-        try {
-          // Get all registered users
-          const users = database.getUsers();
-          
-          if (users.length === 0) {
-            console.log('[Scheduler] No registered users found');
-            return;
-          }
-
-          // Send daily digest to each user based on their monitored assets and news source
-          await Promise.allSettled(
-            users.map(async (user) => {
-              try {
-                // Get events for this user (based on their news source preference)
-                const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id, false);
-                
-                const monitoredAssets = database.getMonitoredAssets(user.user_id);
-                
-                // Filter events by user's monitored assets
-                const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
-                
-                // IMPORTANT: Apply data quality filter before delivery
-                const { deliver: userEvents, skipped } = this.dataQualityService.filterForDelivery(
-                  userEventsRaw,
-                  { mode: 'general', nowUtc: new Date() }
-                );
-                
-                if (skipped.length > 0) {
-                  console.log(`[Scheduler] Daily digest: ${skipped.length} events skipped for user ${user.user_id}`);
-                  // Log skipped issues to database for quality monitoring
-                  skipped.forEach(issue => {
-                    database.logDataIssue(
-                      issue.eventId,
-                      issue.source,
-                      issue.type,
-                      issue.message,
-                      issue.details
-                    );
-                  });
-                }
-                
-                if (userEvents.length === 0) {
-                  await bot.api.sendMessage(user.user_id, '📅 Сегодня нет событий с высоким/средним влиянием для ваших активов.')
-                    .catch(err => console.error(`[Scheduler] Error sending to user ${user.user_id}:`, err));
-                  return;
-                }
-                
-                // Format events list
-                const lines = userEvents.map((e, i) => {
-                  const n = i + 1;
-                  const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-                  const time24 = formatTime24(e);
-                  return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
-                });
-                const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
-                
-                await bot.api.sendMessage(user.user_id, eventsText);
-                
-                // Get AI analysis
-                try {
-                  const eventsForAnalysis = userEvents.map(e => {
-                    const time24 = formatTime24(e);
-                    const parts = [
-                      `${time24} - [${e.currency}] ${e.title} (${e.impact})`
-                    ];
-                    if (e.forecast && e.forecast !== '—') {
-                      parts.push(`Прогноз: ${e.forecast}`);
-                    }
-                    if (e.previous && e.previous !== '—') {
-                      parts.push(`Предыдущее: ${e.previous}`);
-                    }
-                    if (e.actual && e.actual !== '—') {
-                      parts.push(`Факт: ${e.actual}`);
-                    }
-                    return parts.join(' | ');
-                  }).join('\n');
-                  
-                  const analysis = await this.analysisService.analyzeDailySchedule(eventsForAnalysis);
-                  await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
-                } catch (analysisError) {
-                  console.error(`[Scheduler] Error generating daily analysis for user ${user.user_id}:`, analysisError);
-                }
-              } catch (error) {
-                console.error(`[Scheduler] Error sending daily news to user ${user.user_id}:`, error);
-              }
-            })
-          );
-        } catch (error) {
-          console.error('[Scheduler] Error in daily news:', error);
+      try {
+        const users = database.getUsers();
+        if (users.length === 0) {
+          return;
         }
+        for (const user of users) {
+          const userTz = database.getTimezone(user.user_id);
+          const localTime = toZonedTime(now, userTz);
+          const hour = localTime.getHours();
+          const minute = localTime.getMinutes();
+          if (hour !== 8 || minute !== 0) {
+            continue;
+          }
+          console.log(`[Scheduler] Running daily news at 08:00 for user ${user.user_id} (${userTz})...`);
+          try {
+            const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id, false);
+            const monitoredAssets = database.getMonitoredAssets(user.user_id);
+            const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
+            const { deliver: userEvents, skipped } = this.dataQualityService.filterForDelivery(
+              userEventsRaw,
+              { mode: 'general', nowUtc: new Date() }
+            );
+            if (skipped.length > 0) {
+              console.log(`[Scheduler] Daily digest: ${skipped.length} events skipped for user ${user.user_id}`);
+              skipped.forEach(issue => {
+                database.logDataIssue(
+                  issue.eventId,
+                  issue.source,
+                  issue.type,
+                  issue.message,
+                  issue.details
+                );
+              });
+            }
+            if (userEvents.length === 0) {
+              await bot.api.sendMessage(user.user_id, '📅 Сегодня нет событий с высоким/средним влиянием для ваших активов.')
+                .catch(err => console.error(`[Scheduler] Error sending to user ${user.user_id}:`, err));
+              continue;
+            }
+            const lines = userEvents.map((e, i) => {
+              const n = i + 1;
+              const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
+              const time24 = formatTime24(e, userTz);
+              return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
+            });
+            const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
+            await bot.api.sendMessage(user.user_id, eventsText);
+            try {
+              const eventsForAnalysis = userEvents.map(e => {
+                const time24 = formatTime24(e, userTz);
+                const parts = [`${time24} - [${e.currency}] ${e.title} (${e.impact})`];
+                if (e.forecast && e.forecast !== '—') parts.push(`Прогноз: ${e.forecast}`);
+                if (e.previous && e.previous !== '—') parts.push(`Предыдущее: ${e.previous}`);
+                if (e.actual && e.actual !== '—') parts.push(`Факт: ${e.actual}`);
+                return parts.join(' | ');
+              }).join('\n');
+              const analysis = await this.analysisService.analyzeDailySchedule(eventsForAnalysis);
+              await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
+            } catch (analysisError) {
+              console.error(`[Scheduler] Error generating daily analysis for user ${user.user_id}:`, analysisError);
+            }
+          } catch (error) {
+            console.error(`[Scheduler] Error sending daily news to user ${user.user_id}:`, error);
+          }
+        }
+      } catch (error) {
+        console.error('[Scheduler] Error in daily news:', error);
       }
     });
     this.cronTasks.push(dailyNewsTask);

@@ -226,5 +226,22 @@ export const database = {
     const sourceKey = 'news_source';
     db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
       .run(userId, sourceKey, source);
+  },
+
+  // User timezone (IANA, e.g. Europe/Kyiv). Used for quiet hours and time display.
+  getTimezone: (userId: number): string => {
+    const tzKey = 'user_timezone';
+    const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
+      .get(userId, tzKey) as { value: string } | undefined;
+    if (!row || !row.value) {
+      return 'Europe/Kyiv';
+    }
+    return row.value;
+  },
+
+  setTimezone: (userId: number, timezone: string): void => {
+    const tzKey = 'user_timezone';
+    db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
+      .run(userId, tzKey, timezone);
   }
 };

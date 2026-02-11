@@ -1,9 +1,15 @@
 import crypto from 'crypto';
 import { parseISO } from 'date-fns';
+import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
 import { CalendarService, CalendarEvent } from '../services/CalendarService';
 import { MyfxbookService } from '../services/MyfxbookService';
 import { DataQualityService } from '../services/DataQualityService';
 import { database } from '../db/database';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 /**
  * Generate MD5 hash from string
@@ -21,8 +27,9 @@ function isEmpty(s: string): boolean {
 }
 
 /**
- * Generate deduplication key based on time and currency
- * Used to detect duplicate events from different sources
+ * Generate deduplication key based on source, time, currency AND title
+ * Used to detect duplicate events WITHIN THE SAME source only
+ * Events from different sources are NOT considered duplicates
  */
 function deduplicationKey(event: CalendarEvent): string {
   let timeKey = event.timeISO || event.time;
@@ -40,25 +47,30 @@ function deduplicationKey(event: CalendarEvent): string {
     }
   }
   
-  return md5(`${timeKey}_${event.currency}`);
+  // Normalize title for better matching (lowercase, remove extra spaces)
+  const normalizedTitle = event.title.toLowerCase().trim().replace(/\s+/g, ' ');
+  
+  // IMPORTANT: Include source AND title in the key so events with same time+currency but different titles are NOT deduplicated
+  return md5(`${event.source}_${timeKey}_${event.currency}_${normalizedTitle}`);
 }
 
 /**
- * Aggregate Core news sources (ForexFactory + Myfxbook) with smart deduplication
+ * Aggregate Core news sources (ForexFactory + Myfxbook)
  * 
  * This function:
  * 1. Fetches events from ForexFactory and/or Myfxbook based on user preference
- * 2. Deduplicates events using smart logic:
- *    - Events with same time (within 5 min) + same currency are considered duplicates
- *    - Prefers events with actual/forecast data
- *    - Prefers High impact over Medium/Low
- *    - Prefers ForexFactory as more reliable source (when data quality is equal)
+ * 2. Deduplicates events WITHIN each source only (same source + time + currency)
+ * 3. Events from different sources are shown separately (no cross-source deduplication)
+ * 
+ * IMPORTANT: If user selects "Both" sources, events from ForexFactory and Myfxbook
+ * are displayed independently, even if they represent the same real-world event.
+ * This is by design - each source is treated as an independent news provider.
  * 
  * @param calendarService - ForexFactory service instance
  * @param myfxbookService - Myfxbook service instance
  * @param userId - User ID to get news source preference
  * @param forTomorrow - If true, fetch tomorrow's events; otherwise today's
- * @returns Deduplicated array of calendar events
+ * @returns Array of calendar events (deduplicated within each source)
  */
 export async function aggregateCoreEvents(
   calendarService: CalendarService,
@@ -67,14 +79,12 @@ export async function aggregateCoreEvents(
   forTomorrow: boolean = false
 ): Promise<CalendarEvent[]> {
   try {
-    // Get user's news source preference
     const newsSource = database.getNewsSource(userId);
-    
-    // Determine which sources to fetch
+    const userTz = database.getTimezone(userId);
+
     const fetchForexFactory = newsSource === 'ForexFactory' || newsSource === 'Both';
     const fetchMyfxbook = newsSource === 'Myfxbook' || newsSource === 'Both';
-    
-    // Fetch from selected sources in parallel
+
     const [forexFactoryEvents, myfxbookEvents] = await Promise.all([
       fetchForexFactory
         ? (forTomorrow
@@ -89,11 +99,11 @@ export async function aggregateCoreEvents(
         : Promise.resolve([]),
       fetchMyfxbook
         ? (forTomorrow
-            ? myfxbookService.getEventsForTomorrow().catch(err => {
+            ? myfxbookService.getEventsForTomorrow(userTz).catch(err => {
                 console.error('[EventAggregation] Error fetching Myfxbook events:', err);
                 return [];
               })
-            : myfxbookService.getEventsForToday().catch(err => {
+            : myfxbookService.getEventsForToday(userTz).catch(err => {
                 console.error('[EventAggregation] Error fetching Myfxbook events:', err);
                 return [];
               }))
@@ -106,7 +116,8 @@ export async function aggregateCoreEvents(
     // Combine all events
     const allEvents = [...forexFactoryEvents, ...myfxbookEvents];
     
-    // Smart deduplication: if same time (within 5 min) + same currency, keep the best one
+    // Deduplication WITHIN each source only (not across sources)
+    // If same source + time (within 5 min) + currency, keep only one
     const deduplicationMap = new Map<string, CalendarEvent>();
     const seenKeys = new Set<string>();
     
@@ -114,11 +125,11 @@ export async function aggregateCoreEvents(
       const key = deduplicationKey(event);
       
       if (!seenKeys.has(key)) {
-        // First time seeing this event
+        // First time seeing this event (source + time + currency combination)
         seenKeys.add(key);
         deduplicationMap.set(key, event);
       } else {
-        // We already have an event with this key - choose the better one
+        // Duplicate within SAME source - keep the better one
         const existing = deduplicationMap.get(key);
         if (existing) {
           const existingHasData = !isEmpty(existing.actual) || !isEmpty(existing.forecast);
@@ -127,25 +138,41 @@ export async function aggregateCoreEvents(
           // Decision logic (in order of priority):
           // 1. Prefer event with actual/forecast data
           // 2. Prefer High impact over Medium/Low
-          // 3. Prefer ForexFactory as more reliable source
           const shouldReplace = 
             (currentHasData && !existingHasData) ||
-            (event.impact === 'High' && existing.impact !== 'High') ||
-            (event.source === 'ForexFactory' && existing.source !== 'ForexFactory');
+            (event.impact === 'High' && existing.impact !== 'High');
           
           if (shouldReplace) {
             deduplicationMap.set(key, event);
-            console.log(`[EventAggregation] Replaced duplicate: ${existing.title} (${existing.source}) → ${event.title} (${event.source})`);
+            console.log(`[EventAggregation] Replaced duplicate within ${event.source}: ${existing.title} → ${event.title}`);
           } else {
-            console.log(`[EventAggregation] Kept existing: ${existing.title} (${existing.source}), skipped: ${event.title} (${event.source})`);
+            console.log(`[EventAggregation] Kept existing in ${existing.source}: ${existing.title}, skipped: ${event.title}`);
           }
         }
       }
     }
     
-    const deduplicatedEvents = Array.from(deduplicationMap.values());
-    console.log(`[EventAggregation] ${userInfo}Total after deduplication: ${deduplicatedEvents.length} events`);
-    
+    let deduplicatedEvents = Array.from(deduplicationMap.values());
+
+    // Filter by user's calendar day in their timezone (so "today"/"tomorrow" match user's local date)
+    const dayStart = forTomorrow
+      ? dayjs.tz(dayjs(), userTz).add(1, 'day').startOf('day')
+      : dayjs.tz(dayjs(), userTz).startOf('day');
+    const dayEnd = forTomorrow
+      ? dayjs.tz(dayjs(), userTz).add(1, 'day').endOf('day')
+      : dayjs.tz(dayjs(), userTz).endOf('day');
+    const before = deduplicatedEvents.length;
+    deduplicatedEvents = deduplicatedEvents.filter(event => {
+      if (!event.timeISO) return true; // keep events without time (e.g. All Day)
+      const t = dayjs(event.timeISO);
+      return (t.isAfter(dayStart) || t.isSame(dayStart)) && (t.isBefore(dayEnd) || t.isSame(dayEnd));
+    });
+    if (before !== deduplicatedEvents.length) {
+      console.log(`[EventAggregation] ${userInfo}Filtered to user day in ${userTz}: ${deduplicatedEvents.length} events (was ${before})`);
+    }
+
+    console.log(`[EventAggregation] ${userInfo}Total events (no cross-source deduplication): ${deduplicatedEvents.length}`);
+
     // Check for cross-source conflicts (if both sources are active)
     if (forexFactoryEvents.length > 0 && myfxbookEvents.length > 0) {
       const dataQualityService = new DataQualityService();

@@ -10,12 +10,85 @@ import { initializeQueue } from './services/MessageQueue';
 import { initializeAdminAlerts } from './utils/adminAlerts';
 import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
-import { getVolatility } from './data/volatility';
 import { aggregateCoreEvents } from './utils/eventAggregation';
 
 // User states for conversation flow
-type UserState = 'WAITING_FOR_QUESTION' | null;
+type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | null;
 const userStates = new Map<number, UserState>();
+
+// Popular timezones; callback_data uses index (tz_0, tz_1, ...) to avoid encoding underscores in IANA ids like America/New_York
+const POPULAR_TIMEZONES: { label: string; iana: string }[] = [
+  { label: 'Киев', iana: 'Europe/Kyiv' },
+  { label: 'Москва', iana: 'Europe/Moscow' },
+  { label: 'Лондон', iana: 'Europe/London' },
+  { label: 'Берлин', iana: 'Europe/Berlin' },
+  { label: 'Нью-Йорк', iana: 'America/New_York' },
+  { label: 'Лос-Анджелес', iana: 'America/Los_Angeles' },
+  { label: 'Токио', iana: 'Asia/Tokyo' },
+  { label: 'Дубай', iana: 'Asia/Dubai' },
+  { label: 'Сингапур', iana: 'Asia/Singapore' },
+  { label: 'UTC', iana: 'UTC' },
+];
+
+const TIMEZONE_DISPLAY_NAMES: Record<string, string> = Object.fromEntries(
+  POPULAR_TIMEZONES.map((t) => [t.iana, t.label])
+);
+
+function timezoneToCallbackData(index: number): string {
+  return 'tz_' + index;
+}
+
+function getTimezoneDisplayName(iana: string): string {
+  return TIMEZONE_DISPLAY_NAMES[iana] ?? iana;
+}
+
+function isValidIANATimezone(iana: string): boolean {
+  try {
+    new Intl.DateTimeFormat('ru', { timeZone: iana });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const CITY_TO_IANA: Record<string, string> = {
+  'киев': 'Europe/Kyiv',
+  'kiev': 'Europe/Kyiv',
+  'kyiv': 'Europe/Kyiv',
+  'москва': 'Europe/Moscow',
+  'moscow': 'Europe/Moscow',
+  'лондон': 'Europe/London',
+  'london': 'Europe/London',
+  'берлин': 'Europe/Berlin',
+  'berlin': 'Europe/Berlin',
+  'нью-йорк': 'America/New_York',
+  'new york': 'America/New_York',
+  'newyork': 'America/New_York',
+  'лос-анджелес': 'America/Los_Angeles',
+  'los angeles': 'America/Los_Angeles',
+  'токио': 'Asia/Tokyo',
+  'tokyo': 'Asia/Tokyo',
+  'дубай': 'Asia/Dubai',
+  'dubai': 'Asia/Dubai',
+  'сингапур': 'Asia/Singapore',
+  'singapore': 'Asia/Singapore',
+};
+
+function resolveTimezoneInput(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  const key = trimmed.toLowerCase().replace(/\s+/g, ' ');
+  if (CITY_TO_IANA[key]) {
+    return CITY_TO_IANA[key];
+  }
+  if (trimmed.includes('/') && isValidIANATimezone(trimmed)) {
+    return trimmed;
+  }
+  if (isValidIANATimezone(trimmed)) {
+    return trimmed;
+  }
+  return null;
+}
 
 // Create a bot instance
 const bot = new Bot(env.BOT_TOKEN);
@@ -36,16 +109,14 @@ const schedulerService = new SchedulerService();
 const dataQualityService = new DataQualityService();
 
 /**
- * Format time to 24-hour format (HH:mm)
- * If timeISO is available, use it; otherwise try to parse the time string
+ * Format event time to 24-hour format (HH:mm) in the user's timezone
  */
-function formatTime24(event: CalendarEvent): string {
-  // If we have ISO time, format it directly
+function formatTime24(event: CalendarEvent, timezone: string): string {
   if (event.timeISO) {
     try {
       const eventTime = parseISO(event.timeISO);
-      const kyivTime = toZonedTime(eventTime, 'Europe/Kyiv');
-      return format(kyivTime, 'HH:mm');
+      const localTime = toZonedTime(eventTime, timezone);
+      return format(localTime, 'HH:mm');
     } catch {
       // Fall through to string parsing
     }
@@ -182,6 +253,7 @@ bot.command('daily', async (ctx) => {
     }
 
     // Separate events by source
+    const userTz = database.getTimezone(userId);
     const forexFactoryEvents = events.filter(e => e.source === 'ForexFactory');
     const myfxbookEvents = events.filter(e => e.source === 'Myfxbook');
 
@@ -194,10 +266,8 @@ bot.command('daily', async (ctx) => {
       const ffLines = forexFactoryEvents.map((e) => {
         eventNumber++;
         const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-        const time24 = formatTime24(e);
-        const volatility = getVolatility(e.title, e.currency);
-        const volatilityText = volatility ? ` 📉 ~${volatility}` : '';
-        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}${volatilityText}`;
+        const time24 = formatTime24(e, userTz);
+        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
       });
       eventsText += ffLines.join('\n\n') + '\n\n';
     }
@@ -208,10 +278,8 @@ bot.command('daily', async (ctx) => {
       const mbLines = myfxbookEvents.map((e) => {
         eventNumber++;
         const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-        const time24 = formatTime24(e);
-        const volatility = getVolatility(e.title, e.currency);
-        const volatilityText = volatility ? ` 📉 ~${volatility}` : '';
-        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}${volatilityText}`;
+        const time24 = formatTime24(e, userTz);
+        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
       });
       eventsText += mbLines.join('\n\n');
     }
@@ -279,8 +347,9 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     }
 
     // Prepare detailed events text for AI analysis (with all available data)
+    const userTz = database.getTimezone(userId);
     const eventsForAnalysis = events.map(e => {
-      const time24 = formatTime24(e);
+      const time24 = formatTime24(e, userTz);
       const parts = [
         `${time24} - [${e.currency}] ${e.title} (${e.impact})`
       ];
@@ -361,9 +430,9 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
 
     await ctx.answerCallbackQuery({ text: '🧠 Анализирую результаты...', show_alert: false });
 
-    // Prepare events with results for AI analysis
+    const userTz = database.getTimezone(userId);
     const eventsForAnalysis = eventsWithResults.map(e => {
-      const time24 = formatTime24(e);
+      const time24 = formatTime24(e, userTz);
       return `${time24} - [${e.currency}] ${e.title} (${e.impact}) | Прогноз: ${e.forecast} | Факт: ${e.actual}`;
     }).join('\n');
 
@@ -432,9 +501,9 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
       return;
     }
 
-    // Prepare detailed events text for AI analysis (with all available data)
+    const userTz = database.getTimezone(userId);
     const eventsForAnalysis = events.map(e => {
-      const time24 = formatTime24(e);
+      const time24 = formatTime24(e, userTz);
       const parts = [
         `${time24} - [${e.currency}] ${e.title} (${e.impact})`
       ];
@@ -447,7 +516,6 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
       return parts.join(' | ');
     }).join('\n');
 
-    // Additional validation: check if prepared string is not empty
     if (!eventsForAnalysis.trim()) {
       await ctx.reply('⚠️ Не удалось подготовить данные для анализа.');
       return;
@@ -483,9 +551,10 @@ bot.command('calendar', async (ctx) => {
       return;
     }
 
+    const userTz = database.getTimezone(userId);
     const lines = events.map((e, i) => {
       const n = i + 1;
-      const time24 = formatTime24(e);
+      const time24 = formatTime24(e, userTz);
       return `${n}. [${e.currency}] ${e.impact}\n   ${e.title}\n   🕐 ${time24}  •  F: ${e.forecast}  •  P: ${e.previous}`;
     });
     const text = `📅 ForexFactory – Сегодня (Высокое/Среднее влияние, USD GBP EUR JPY NZD)\n\n${lines.join('\n\n')}`;
@@ -529,38 +598,35 @@ bot.command('tomorrow', async (ctx) => {
       return;
     }
 
-    // Separate events by source
+    const userTz = database.getTimezone(userId);
     const forexFactoryEvents = events.filter(e => e.source === 'ForexFactory');
     const myfxbookEvents = events.filter(e => e.source === 'Myfxbook');
 
     let eventsText = '📅 Календарь на завтра:\n\n';
     let eventNumber = 0;
 
-    // ForexFactory events
     if (forexFactoryEvents.length > 0) {
       eventsText += '━━━ 📰 ForexFactory ━━━\n\n';
       const ffLines = forexFactoryEvents.map((e) => {
         eventNumber++;
         const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-        const time24 = formatTime24(e);
+        const time24 = formatTime24(e, userTz);
         return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
       });
       eventsText += ffLines.join('\n\n') + '\n\n';
     }
 
-    // Myfxbook events
     if (myfxbookEvents.length > 0) {
       eventsText += '━━━ 📊 Myfxbook ━━━\n\n';
       const mbLines = myfxbookEvents.map((e) => {
         eventNumber++;
         const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-        const time24 = formatTime24(e);
+        const time24 = formatTime24(e, userTz);
         return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
       });
       eventsText += mbLines.join('\n\n');
     }
 
-    // Create keyboard with AI Forecast button
     const keyboard = new InlineKeyboard();
     keyboard.row({ text: '🔮 AI Forecast', callback_data: 'tomorrow_ai_forecast' });
 
@@ -622,10 +688,11 @@ async function processQuestion(ctx: any, question: string) {
       }
       const events = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
       if (events.length > 0) {
+        const userTz = database.getTimezone(userId);
         const eventsForContext = events
-          .slice(0, 5) // Limit to first 5 events for context
+          .slice(0, 5)
           .map(e => {
-            const time24 = formatTime24(e);
+            const time24 = formatTime24(e, userTz);
             return `${time24} - [${e.currency}] ${e.title}${e.forecast && e.forecast !== '—' ? ` (Прогноз: ${e.forecast})` : ''}`;
           })
           .join('\n');
@@ -694,6 +761,11 @@ function buildSettingsKeyboard(userId: number): InlineKeyboard {
                      newsSource === 'Myfxbook' ? '📊 Myfxbook' : 
                      '🔄 Оба источника';
   keyboard.row({ text: `📡 Источник новостей: ${sourceText}`, callback_data: 'settings_news_source' });
+
+  // Add Timezone selection button
+  const userTz = database.getTimezone(userId);
+  const tzLabel = getTimezoneDisplayName(userTz);
+  keyboard.row({ text: `🕐 Часовой пояс: ${tzLabel}`, callback_data: 'settings_timezone' });
   
   // Add "Close" button at the bottom
   keyboard.row({ text: '✅ Готово', callback_data: 'settings_close' });
@@ -726,8 +798,9 @@ bot.command('settings', async (ctx) => {
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
 **Источник новостей:** ${sourceName}
+**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -774,8 +847,9 @@ bot.callbackQuery(/^toggle_(.+)$/, async (ctx) => {
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
 **Источник новостей:** ${sourceName}
+**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -820,8 +894,9 @@ bot.callbackQuery('settings_toggle_rss', async (ctx) => {
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
 **Источник новостей:** ${sourceName}
+**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -865,8 +940,9 @@ bot.callbackQuery('settings_toggle_quiet_hours', async (ctx) => {
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isNowEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Тихий режим:** ${isNowEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
 **Источник новостей:** ${sourceName}
+**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -915,6 +991,90 @@ bot.callbackQuery('settings_news_source', async (ctx) => {
   }
 });
 
+// Handle Timezone selection button – show sub-menu
+bot.callbackQuery('settings_timezone', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const currentTz = database.getTimezone(userId);
+    const keyboard = new InlineKeyboard();
+    POPULAR_TIMEZONES.forEach((t, i) => {
+      const isCurrent = currentTz === t.iana;
+      keyboard.row({
+        text: isCurrent ? `✅ ${t.label}` : t.label,
+        callback_data: timezoneToCallbackData(i)
+      });
+    });
+    keyboard.row({ text: '✏️ Ввести вручную', callback_data: 'tz_manual' });
+    keyboard.row({ text: '◀️ Назад', callback_data: 'settings_back' });
+    await ctx.editMessageText(
+      '🕐 **Часовой пояс**\n\nВыберите город или нажмите «Ввести вручную» и отправьте название города (Москва, Киев) или IANA (Europe/Moscow).\n\nТихий режим (23:00–08:00) считается в выбранном поясе.',
+      { parse_mode: 'Markdown', reply_markup: keyboard }
+    );
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error showing timezone menu:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при открытии меню', show_alert: false });
+  }
+});
+
+// Handle "Enter timezone manually" – set state and ask for input (must be before generic tz_*)
+bot.callbackQuery('tz_manual', async (ctx) => {
+  try {
+    if (!ctx.from || !ctx.chat) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка', show_alert: false });
+      return;
+    }
+    userStates.set(ctx.chat.id, 'WAITING_TIMEZONE');
+    await ctx.editMessageText('✏️ Введите название города (например: Москва, Киев) или IANA (например: Europe/Moscow):');
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error starting manual timezone input:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка', show_alert: false });
+  }
+});
+
+// Handle timezone selection from list (tz_0, tz_1, ...)
+bot.callbackQuery(/^tz_\d+$/, async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const index = parseInt(ctx.callbackQuery.data.replace(/^tz_/, ''), 10);
+    const item = POPULAR_TIMEZONES[index];
+    if (!item) {
+      await ctx.answerCallbackQuery({ text: '❌ Неизвестный часовой пояс', show_alert: true });
+      return;
+    }
+    const iana = item.iana;
+    database.setTimezone(userId, iana);
+    const label = getTimezoneDisplayName(iana);
+    await ctx.answerCallbackQuery({ text: `Часовой пояс: ${label}`, show_alert: false });
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+    const newsSource = database.getNewsSource(userId);
+    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : newsSource === 'Myfxbook' ? 'Myfxbook' : 'Оба источника';
+    const keyboard = buildSettingsKeyboard(userId);
+    const message = `⚙️ **Настройки**
+
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
+**Часовой пояс:** ${label}
+
+Нажмите на кнопку, чтобы изменить настройку:`;
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard });
+  } catch (error) {
+    console.error('Error setting timezone:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при сохранении', show_alert: false });
+  }
+});
+
 // Handle news source selection callbacks
 bot.callbackQuery(/^source_(forexfactory|myfxbook|both)$/, async (ctx) => {
   try {
@@ -951,8 +1111,9 @@ bot.callbackQuery(/^source_(forexfactory|myfxbook|both)$/, async (ctx) => {
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
 **Источник новостей:** ${sourceName}
+**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -986,8 +1147,9 @@ bot.callbackQuery('settings_back', async (ctx) => {
     const message = `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00 Kyiv)' : '❌ Выключен'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
 **Источник новостей:** ${sourceName}
+**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
     
@@ -1043,10 +1205,41 @@ bot.on('message:text', async (ctx) => {
   
   // If it's a command, reset state and let command handlers process it
   if (ctx.message.text?.startsWith('/')) {
-    if (state === 'WAITING_FOR_QUESTION') {
-      userStates.delete(chatId); // Reset state when command is sent
+    if (state === 'WAITING_FOR_QUESTION' || state === 'WAITING_TIMEZONE') {
+      userStates.delete(chatId);
     }
-    return; // Let command handlers process the command
+    return;
+  }
+
+  // Handle manual timezone input
+  if (state === 'WAITING_TIMEZONE') {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const iana = resolveTimezoneInput(ctx.message.text ?? '');
+    userStates.delete(chatId);
+    if (iana) {
+      database.setTimezone(userId, iana);
+      const label = getTimezoneDisplayName(iana);
+      const monitoredAssets = database.getMonitoredAssets(userId);
+      const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+      const newsSource = database.getNewsSource(userId);
+      const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : newsSource === 'Myfxbook' ? 'Myfxbook' : 'Оба источника';
+      const keyboard = buildSettingsKeyboard(userId);
+      const message = `✅ Часовой пояс сохранён: **${label}**
+
+⚙️ **Настройки**
+
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
+**Часовой пояс:** ${label}
+
+Нажмите на кнопку, чтобы изменить настройку:`;
+      await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard });
+    } else {
+      await ctx.reply('❌ Не удалось определить часовой пояс. Введите город (Москва, Киев) или IANA (Europe/Moscow).');
+    }
+    return;
   }
   
   // Only process if user is in WAITING_FOR_QUESTION state

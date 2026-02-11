@@ -53,7 +53,13 @@ function isSpecialTimeString(timeStr: string): boolean {
   );
 }
 
-function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined {
+/**
+ * Parse time string to ISO format
+ * @param raw - Raw time string from ForexFactory (e.g. "3:30pm", "15:30")
+ * @param baseDate - Base date for the event
+ * @param sourceTimezone - Timezone of the source (detected from ForexFactory)
+ */
+function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs, sourceTimezone: string): string | undefined {
   const t = raw.trim();
   
   // Check for special time strings first
@@ -82,7 +88,7 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
         const parsed = dayjs(combined, fmt);
         if (parsed.isValid()) {
           // Extract components from the parsed time
-          // These represent the time AS SHOWN on ForexFactory (which is in America/New_York timezone)
+          // These represent the time AS SHOWN on ForexFactory
           const year = parsed.year();
           const month = String(parsed.month() + 1).padStart(2, '0');
           const day = String(parsed.date()).padStart(2, '0');
@@ -90,19 +96,19 @@ function parseTimeToISO(raw: string, baseDate: dayjs.Dayjs): string | undefined 
           const minutes = String(parsed.minute()).padStart(2, '0');
           const seconds = '00';
           
-          // This time string represents America/New_York local time (as set in Playwright timezoneId)
+          // This time string represents the time in sourceTimezone
           const dateString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
           
-          // CRITICAL: Convert from America/New_York local time to UTC
-          // fromZonedTime interprets the date string as being in FF_TZ timezone
+          // CRITICAL: Convert from source timezone to UTC
+          // fromZonedTime interprets the date string as being in sourceTimezone
           // and returns the corresponding UTC Date object
-          const utcDate = fromZonedTime(dateString, FF_TZ);
+          const utcDate = fromZonedTime(dateString, sourceTimezone);
           
           // Convert to ISO string (which is in UTC)
           const isoString = utcDate.toISOString();
           
           // DEBUG: Log the parsing details
-          console.log(`[CalendarService] Time parsing: "${t}" -> Local: ${dateString} (${FF_TZ}) -> UTC: ${isoString}`);
+          console.log(`[CalendarService] Time parsing: "${t}" -> Local: ${dateString} (${sourceTimezone}) -> UTC: ${isoString}`);
           
           // Validate the ISO string is reasonable (not 1970 or far future)
           if (utcDate.getFullYear() >= 2000 && utcDate.getFullYear() <= 2100) {
@@ -132,6 +138,11 @@ export class CalendarService {
   // Cache for calendar events (5 minutes TTL)
   private cache = new Map<string, { data: CalendarEvent[], expires: number }>();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes in milliseconds
+  
+  // Cache for detected timezone (1 hour TTL)
+  private detectedTimezone: string | null = null;
+  private timezoneDetectionTime: number = 0;
+  private readonly TIMEZONE_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
   constructor() {
     this.dataQualityService = new DataQualityService();
@@ -174,19 +185,110 @@ export class CalendarService {
   }
 
   /**
+   * Get ForexFactory timezone with caching (1 hour TTL)
+   */
+  private async getForexFactoryTimezone(): Promise<string> {
+    // Check cache first
+    const now = Date.now();
+    if (this.detectedTimezone && (now - this.timezoneDetectionTime) < this.TIMEZONE_CACHE_TTL) {
+      console.log(`[CalendarService] Using cached timezone: ${this.detectedTimezone}`);
+      return this.detectedTimezone;
+    }
+    
+    // Detect timezone from ForexFactory
+    console.log('[CalendarService] Detecting timezone from ForexFactory...');
+    const browser = await this.getBrowser();
+    const page = await browser.newPage({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+      locale: 'en-US',
+    });
+    
+    try {
+      const timezone = await this.detectForexFactoryTimezone(page);
+      // Cache the result
+      this.detectedTimezone = timezone;
+      this.timezoneDetectionTime = now;
+      console.log(`[CalendarService] Timezone detected and cached: ${timezone}`);
+      return timezone;
+    } finally {
+      await page.close();
+    }
+  }
+
+  /**
+   * Detect timezone from ForexFactory website by reading the /timezone page
+   * ForexFactory stores timezone in user's session/cookies
+   */
+  private async detectForexFactoryTimezone(page: Page): Promise<string> {
+    try {
+      // Navigate to timezone settings page
+      await page.goto('https://www.forexfactory.com/timezone', { 
+        waitUntil: 'domcontentloaded',
+        timeout: 30000 
+      });
+      
+      // Wait for page to fully load
+      await page.waitForTimeout(2000);
+      
+      // Extract timezone from the settings page
+      const timezoneInfo = await page.evaluate(() => {
+        // @ts-ignore
+        const bodyText = document.body.textContent || '';
+        
+        // Look for timezone in format "(GMT+02:00) Bucharest"
+        const gmtMatch = bodyText.match(/\(GMT([+-]\d{2}:\d{2})\)\s*([A-Za-z\s,]+)/);
+        
+        return {
+          rawText: gmtMatch ? gmtMatch[0] : null,
+          offset: gmtMatch ? gmtMatch[1] : null,
+          city: gmtMatch ? gmtMatch[2].trim() : null
+        };
+      });
+      
+      console.log(`[CalendarService] ForexFactory timezone detected:`, timezoneInfo);
+      
+      // Map detected timezone to IANA timezone ID
+      if (!timezoneInfo.offset) {
+        console.warn('[CalendarService] Could not detect timezone, using default Europe/Kiev');
+        return 'Europe/Kiev';
+      }
+      
+      // Map common GMT offsets to timezones
+      const offsetMap: Record<string, string> = {
+        '+02:00': 'Europe/Kiev',      // Kyiv, Bucharest
+        '+03:00': 'Europe/Moscow',     // Moscow
+        '+00:00': 'Europe/London',     // London (GMT)
+        '+01:00': 'Europe/Paris',      // Paris, Berlin
+        '-05:00': 'America/New_York',  // EST
+        '-08:00': 'America/Los_Angeles', // PST
+        '+08:00': 'Asia/Shanghai',     // Shanghai
+        '+09:00': 'Asia/Tokyo',        // Tokyo
+      };
+      
+      const detectedTz = offsetMap[timezoneInfo.offset] || 'Europe/Kiev';
+      console.log(`[CalendarService] Using timezone: ${detectedTz}`);
+      
+      return detectedTz;
+    } catch (error) {
+      console.error('[CalendarService] Error detecting timezone:', error);
+      return 'Europe/Kiev';
+    }
+  }
+
+  /**
    * Fetch HTML using Playwright to bypass Cloudflare
+   * Note: ForexFactory ignores browser timezone and uses user's session timezone
    */
   private async fetchHTML(url: string): Promise<string> {
     const browser = await this.getBrowser();
     const page: Page = await browser.newPage({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
-      timezoneId: 'America/New_York', // Set timezone to match ForexFactory (EST/EDT)
       locale: 'en-US',
     });
 
     try {
-      console.log(`[CalendarService] Playwright timezone set to: America/New_York, FF_TZ: ${FF_TZ}`);
       console.log(`[CalendarService] Navigating to ${url}...`);
       await page.goto(url, { 
         waitUntil: 'domcontentloaded',
@@ -215,14 +317,20 @@ export class CalendarService {
     }
 
     console.log(`[CalendarService] Cache miss or expired for ${url}, fetching fresh data...`);
+    
+    // IMPORTANT: Detect ForexFactory timezone BEFORE fetching HTML
+    // ForexFactory shows times in user's configured timezone (from session/cookies)
+    const sourceTimezone = await this.getForexFactoryTimezone();
+    console.log(`[CalendarService] Using source timezone: ${sourceTimezone}`);
+    
     const html = await this.fetchHTML(url);
 
     const $ = cheerio.load(html);
     const events: CalendarEvent[] = [];
-    // Base date in America/New_York timezone (ForexFactory shows times in EST/EDT)
+    // Base date in detected source timezone
     const baseDate = url.includes('tomorrow')
-      ? dayjs().tz(FF_TZ).add(1, 'day')
-      : dayjs().tz(FF_TZ);
+      ? dayjs().tz(sourceTimezone).add(1, 'day')
+      : dayjs().tz(sourceTimezone);
 
     const allRows = $('table.calendar__table tr');
     console.log(`[CalendarService] Found ${allRows.length} total rows in calendar table`);
@@ -230,6 +338,10 @@ export class CalendarService {
     let rowsProcessed = 0;
     let eventsFound = 0;
     let eventsFiltered = 0;
+    
+    // IMPORTANT: ForexFactory shows time only for the first event in a group
+    // We need to remember the last seen time and apply it to events without time
+    let lastSeenTime = '—';
 
     allRows.each((_, rowEl) => {
       rowsProcessed++;
@@ -244,7 +356,25 @@ export class CalendarService {
         .text()
         .trim()
         .replace(/\s+/g, ' ');
-      const time = $row.find('.calendar__time').text().trim() || '—';
+      
+      // Read time from the cell
+      const timeRaw = $row.find('.calendar__time').text().trim();
+      
+      // If time is present and not empty, remember it for next events
+      // ForexFactory shows time only once for a group of events at the same time
+      let time: string;
+      if (timeRaw && timeRaw !== '' && timeRaw !== '—' && !isSpecialTimeString(timeRaw)) {
+        lastSeenTime = timeRaw;
+        time = timeRaw;
+      } else if (timeRaw === '' || timeRaw === '—') {
+        // Empty cell - use last seen time from previous row
+        time = lastSeenTime;
+      } else {
+        // Special time string (Tentative, All Day, etc.)
+        time = timeRaw;
+        lastSeenTime = '—'; // Reset last seen time for special cases
+      }
+      
       const forecast = $row.find('.calendar__forecast').text().trim() || '—';
       const previous = $row.find('.calendar__previous').text().trim() || '—';
       const actual = $row.find('.calendar__actual').text().trim() || '—';
@@ -285,7 +415,7 @@ export class CalendarService {
         /Speech|Minutes|Statement|Press Conference|Policy Report/i.test(title);
       if (allEmpty && !isSpeechMinutesStatement) return;
 
-      const timeISO = parseTimeToISO(time, baseDate);
+      const timeISO = parseTimeToISO(time, baseDate, sourceTimezone);
       const isResult = !noActual;
 
       events.push({
@@ -330,17 +460,19 @@ export class CalendarService {
         console.log(`  - ${issue.type}: ${issue.message}`);
       });
       
-      // IMPORTANT: Send alert to admin if critical issues detected
-      const criticalIssues = issues.filter(i => 
-        i.type === 'MISSING_REQUIRED_FIELD' ||
-        i.type === 'TIME_INCONSISTENCY' ||
-        i.type === 'INVALID_RANGE'
-      );
-      if (criticalIssues.length > 0) {
-        const urlType = url.includes('tomorrow') ? 'Tomorrow' : 'Today';
-        sendCriticalDataAlert(criticalIssues, `ForexFactory Calendar (${urlType})`)
-          .catch(err => console.error('[CalendarService] Failed to send alert:', err));
-      }
+      // NOTE: Automatic critical data quality alerts are DISABLED
+      // Use manual scripts (e.g., daily-quality-report.ts) to send alerts on demand
+      // 
+      // const criticalIssues = issues.filter(i => 
+      //   i.type === 'MISSING_REQUIRED_FIELD' ||
+      //   i.type === 'TIME_INCONSISTENCY' ||
+      //   i.type === 'INVALID_RANGE'
+      // );
+      // if (criticalIssues.length > 0) {
+      //   const urlType = url.includes('tomorrow') ? 'Tomorrow' : 'Today';
+      //   sendCriticalDataAlert(criticalIssues, `ForexFactory Calendar (${urlType}`)
+      //     .catch(err => console.error('[CalendarService] Failed to send alert:', err));
+      // }
     }
 
     // Store validated events in cache
