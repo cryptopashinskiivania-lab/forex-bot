@@ -322,9 +322,11 @@ export class DataQualityService {
     const { mode = 'general', nowUtc = new Date() } = options;
     const deliver: CalendarEvent[] = [];
     const skipped: DataIssue[] = [];
-    
-    console.log(`[DataQualityService] Filtering ${events.length} events for delivery (mode: ${mode})`);
-    
+
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.log(`[DataQualityService] Filtering ${events.length} events for delivery (mode: ${mode})`);
+    }
+
     for (const event of events) {
       const eventId = generateEventId(event);
       let shouldSkip = false;
@@ -413,12 +415,12 @@ export class DataQualityService {
         deliver.push(event);
       }
     }
-    
+
     console.log(`[DataQualityService] Filtering complete: ${deliver.length} to deliver, ${skipped.length} skipped`);
-    
+
     return { deliver, skipped };
   }
-  
+
   /**
    * AI Review (placeholder for future implementation)
    * 

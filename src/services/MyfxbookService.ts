@@ -431,15 +431,18 @@ export class MyfxbookService {
     const todayStart = nowLocal.startOf('day');
     const todayEnd = nowLocal.endOf('day');
 
-    return events.filter(event => {
+    const filtered = events.filter(event => {
       if (!event.timeISO) return false;
       const eventDate = dayjs(event.timeISO).tz(tz);
-      const isToday = eventDate.isAfter(todayStart) && eventDate.isBefore(todayEnd);
-      if (!isToday) {
-        console.log(`[MyfxbookService] Filtered out event (not today in ${tz}): ${event.title} at ${eventDate.format('MMM DD HH:mm')}`);
-      }
-      return isToday;
+      return eventDate.isAfter(todayStart) && eventDate.isBefore(todayEnd);
     });
+    if (process.env.LOG_LEVEL === 'debug') {
+      const filteredOut = events.length - filtered.length;
+      if (filteredOut > 0) {
+        console.log(`[MyfxbookService] Today (${tz}): ${filtered.length} events, ${filteredOut} filtered out`);
+      }
+    }
+    return filtered;
   }
 
   /**
@@ -452,15 +455,18 @@ export class MyfxbookService {
     const tomorrowStart = nowLocal.add(1, 'day').startOf('day');
     const tomorrowEnd = nowLocal.add(1, 'day').endOf('day');
 
-    return events.filter(event => {
+    const filtered = events.filter(event => {
       if (!event.timeISO) return false;
       const eventDate = dayjs(event.timeISO).tz(tz);
-      const isTomorrow = eventDate.isAfter(tomorrowStart) && eventDate.isBefore(tomorrowEnd);
-      if (!isTomorrow) {
-        console.log(`[MyfxbookService] Filtered out event (not tomorrow in ${tz}): ${event.title} at ${eventDate.format('MMM DD HH:mm')}`);
-      }
-      return isTomorrow;
+      return eventDate.isAfter(tomorrowStart) && eventDate.isBefore(tomorrowEnd);
     });
+    if (process.env.LOG_LEVEL === 'debug') {
+      const filteredOut = events.length - filtered.length;
+      if (filteredOut > 0) {
+        console.log(`[MyfxbookService] Tomorrow (${tz}): ${filtered.length} events, ${filteredOut} filtered out`);
+      }
+    }
+    return filtered;
   }
 
   /**

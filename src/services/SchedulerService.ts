@@ -308,9 +308,13 @@ export class SchedulerService {
           return;
         }
 
-        // Process calendar events for each user (with their news source preference)
-        await Promise.allSettled(
-          users.map(async (user) => {
+        const BATCH_SIZE = 40;
+        const BATCH_DELAY_MS = 150;
+
+        for (let i = 0; i < users.length; i += BATCH_SIZE) {
+          const chunk = users.slice(i, i + BATCH_SIZE);
+          await Promise.allSettled(
+            chunk.map(async (user) => {
             try {
               const userId = user.user_id;
               const monitoredAssets = database.getMonitoredAssets(userId);
@@ -486,7 +490,11 @@ export class SchedulerService {
               console.error(`[Scheduler] Error processing notifications for user ${user.user_id}:`, error);
             }
           })
-        );
+          );
+          if (i + BATCH_SIZE < users.length) {
+            await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
+          }
+        }
       } catch (err) {
         console.error('[Scheduler] Error in scheduled check:', err);
       }

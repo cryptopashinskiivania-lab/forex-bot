@@ -11,6 +11,22 @@ import { database } from '../db/database';
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
+/** Cache for events filtered by (source, day, tz) to avoid repeated filter passes (Phase 2.1). */
+const FILTERED_EVENTS_CACHE_TTL_MS = 5 * 60 * 1000;
+const filteredByTzCache = new Map<string, { data: CalendarEvent[]; expires: number }>();
+
+function getCachedFilteredEvents(source: 'Myfxbook', day: 'today' | 'tomorrow', tz: string): CalendarEvent[] | null {
+  const key = `${source}_${day}_${tz}`;
+  const entry = filteredByTzCache.get(key);
+  if (entry && entry.expires > Date.now()) return entry.data;
+  return null;
+}
+
+function setCachedFilteredEvents(source: 'Myfxbook', day: 'today' | 'tomorrow', tz: string, data: CalendarEvent[]): void {
+  const key = `${source}_${day}_${tz}`;
+  filteredByTzCache.set(key, { data, expires: Date.now() + FILTERED_EVENTS_CACHE_TTL_MS });
+}
+
 /**
  * Generate MD5 hash from string
  */
@@ -85,33 +101,38 @@ export async function aggregateCoreEvents(
     const fetchForexFactory = newsSource === 'ForexFactory' || newsSource === 'Both';
     const fetchMyfxbook = newsSource === 'Myfxbook' || newsSource === 'Both';
 
-    const [forexFactoryEvents, myfxbookEvents] = await Promise.all([
-      fetchForexFactory
-        ? (forTomorrow
-            ? calendarService.getEventsForTomorrow().catch(err => {
-                console.error('[EventAggregation] Error fetching ForexFactory events:', err);
-                return [];
-              })
-            : calendarService.getEventsForToday().catch(err => {
-                console.error('[EventAggregation] Error fetching ForexFactory events:', err);
-                return [];
-              }))
-        : Promise.resolve([]),
-      fetchMyfxbook
-        ? (forTomorrow
-            ? myfxbookService.getEventsForTomorrow(userTz).catch(err => {
-                console.error('[EventAggregation] Error fetching Myfxbook events:', err);
-                return [];
-              })
-            : myfxbookService.getEventsForToday(userTz).catch(err => {
-                console.error('[EventAggregation] Error fetching Myfxbook events:', err);
-                return [];
-              }))
-        : Promise.resolve([]),
-    ]);
+    const dayKey = forTomorrow ? 'tomorrow' : 'today';
+    let myfxbookEvents: CalendarEvent[] = [];
+    if (fetchMyfxbook) {
+      const cached = getCachedFilteredEvents('Myfxbook', dayKey, userTz);
+      if (cached !== null) {
+        myfxbookEvents = cached;
+      } else {
+        myfxbookEvents = await (forTomorrow
+          ? myfxbookService.getEventsForTomorrow(userTz)
+          : myfxbookService.getEventsForToday(userTz)
+        ).catch(err => {
+          console.error('[EventAggregation] Error fetching Myfxbook events:', err);
+          return [];
+        });
+        setCachedFilteredEvents('Myfxbook', dayKey, userTz, myfxbookEvents);
+      }
+    }
+
+    const forexFactoryEvents = fetchForexFactory
+      ? await (forTomorrow
+          ? calendarService.getEventsForTomorrow()
+          : calendarService.getEventsForToday()
+        ).catch(err => {
+          console.error('[EventAggregation] Error fetching ForexFactory events:', err);
+          return [];
+        })
+      : [];
 
     const userInfo = `User ${userId} | Source: ${newsSource} | ${forTomorrow ? 'Tomorrow' : 'Today'} | `;
-    console.log(`[EventAggregation] ${userInfo}ForexFactory: ${forexFactoryEvents.length}, Myfxbook: ${myfxbookEvents.length}`);
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.log(`[EventAggregation] ${userInfo}ForexFactory: ${forexFactoryEvents.length}, Myfxbook: ${myfxbookEvents.length}`);
+    }
 
     // Combine all events
     const allEvents = [...forexFactoryEvents, ...myfxbookEvents];
@@ -144,8 +165,10 @@ export async function aggregateCoreEvents(
           
           if (shouldReplace) {
             deduplicationMap.set(key, event);
-            console.log(`[EventAggregation] Replaced duplicate within ${event.source}: ${existing.title} → ${event.title}`);
-          } else {
+            if (process.env.LOG_LEVEL === 'debug') {
+              console.log(`[EventAggregation] Replaced duplicate within ${event.source}: ${existing.title} → ${event.title}`);
+            }
+          } else if (process.env.LOG_LEVEL === 'debug') {
             console.log(`[EventAggregation] Kept existing in ${existing.source}: ${existing.title}, skipped: ${event.title}`);
           }
         }
@@ -167,11 +190,13 @@ export async function aggregateCoreEvents(
       const t = dayjs(event.timeISO);
       return (t.isAfter(dayStart) || t.isSame(dayStart)) && (t.isBefore(dayEnd) || t.isSame(dayEnd));
     });
-    if (before !== deduplicatedEvents.length) {
+    if (process.env.LOG_LEVEL === 'debug' && before !== deduplicatedEvents.length) {
       console.log(`[EventAggregation] ${userInfo}Filtered to user day in ${userTz}: ${deduplicatedEvents.length} events (was ${before})`);
     }
 
-    console.log(`[EventAggregation] ${userInfo}Total events (no cross-source deduplication): ${deduplicatedEvents.length}`);
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.log(`[EventAggregation] ${userInfo}Total events: ${deduplicatedEvents.length}`);
+    }
 
     // Check for cross-source conflicts (if both sources are active)
     if (forexFactoryEvents.length > 0 && myfxbookEvents.length > 0) {

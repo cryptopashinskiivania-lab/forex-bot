@@ -11,6 +11,8 @@ const messageQueue: QueuedMessage[] = [];
 let isProcessingQueue = false;
 let botInstance: Bot | null = null;
 
+const MAX_QUEUE_LENGTH = 2000;
+
 /**
  * Initialize the message queue with a bot instance
  */
@@ -30,9 +32,16 @@ export function addToQueue(chatId: string | number, text: string, options?: { pa
     console.error('[Queue] Bot instance not initialized. Call initializeQueue first.');
     return;
   }
-  
+
+  if (messageQueue.length >= MAX_QUEUE_LENGTH) {
+    console.warn(`[Queue] Queue full (max ${MAX_QUEUE_LENGTH}). Message to chat ${chatId} dropped.`);
+    return;
+  }
+
   messageQueue.push({ chatId, text, options });
-  console.log(`[Queue] Message added to queue. Queue length: ${messageQueue.length}`);
+  if (process.env.LOG_LEVEL === 'debug') {
+    console.log(`[Queue] Message added. Queue length: ${messageQueue.length}`);
+  }
 }
 
 /**

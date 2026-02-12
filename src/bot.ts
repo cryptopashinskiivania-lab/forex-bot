@@ -12,9 +12,38 @@ import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { aggregateCoreEvents } from './utils/eventAggregation';
 
-// User states for conversation flow
+// User states for conversation flow (with TTL 30 min by last activity to limit memory)
 type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | null;
-const userStates = new Map<number, UserState>();
+const USER_STATE_TTL_MS = 30 * 60 * 1000;
+const USER_STATE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+
+const userStateEntries = new Map<number, { state: UserState; lastActivity: number }>();
+
+function setUserState(chatId: number, state: UserState): void {
+  userStateEntries.set(chatId, { state, lastActivity: Date.now() });
+}
+
+function getUserState(chatId: number): UserState | undefined {
+  const entry = userStateEntries.get(chatId);
+  if (!entry) return undefined;
+  entry.lastActivity = Date.now();
+  return entry.state;
+}
+
+function deleteUserState(chatId: number): void {
+  userStateEntries.delete(chatId);
+}
+
+function cleanupExpiredUserStates(): void {
+  const now = Date.now();
+  for (const [chatId, entry] of userStateEntries.entries()) {
+    if (now - entry.lastActivity > USER_STATE_TTL_MS) {
+      userStateEntries.delete(chatId);
+    }
+  }
+}
+
+setInterval(cleanupExpiredUserStates, USER_STATE_CLEANUP_INTERVAL_MS);
 
 // Popular timezones; callback_data uses index (tz_0, tz_1, ...) to avoid encoding underscores in IANA ids like America/New_York
 const POPULAR_TIMEZONES: { label: string; iana: string }[] = [
@@ -665,7 +694,7 @@ bot.command('ask', async (ctx) => {
   
   if (!text) {
     // Enter question mode
-    userStates.set(ctx.chat.id, 'WAITING_FOR_QUESTION');
+    setUserState(ctx.chat.id, 'WAITING_FOR_QUESTION');
     await ctx.reply('Слушаю, задавай вопрос...');
     return;
   }
@@ -680,7 +709,7 @@ bot.callbackQuery('ask_question', async (ctx) => {
     await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить чат', show_alert: false });
     return;
   }
-  userStates.set(ctx.chat.id, 'WAITING_FOR_QUESTION');
+  setUserState(ctx.chat.id, 'WAITING_FOR_QUESTION');
   await ctx.answerCallbackQuery();
   await ctx.reply('Слушаю, задавай вопрос...');
 });
@@ -790,7 +819,7 @@ bot.command('settings', async (ctx) => {
   try {
     // Reset state if user was in question mode
     if (ctx.chat) {
-      userStates.delete(ctx.chat.id);
+      deleteUserState(ctx.chat.id);
     }
     
     if (!ctx.from) {
@@ -1040,7 +1069,7 @@ bot.callbackQuery('tz_manual', async (ctx) => {
       await ctx.answerCallbackQuery({ text: '❌ Ошибка', show_alert: false });
       return;
     }
-    userStates.set(ctx.chat.id, 'WAITING_TIMEZONE');
+    setUserState(ctx.chat.id, 'WAITING_TIMEZONE');
     await ctx.editMessageText('✏️ Введите название города (например: Москва, Киев) или IANA (например: Europe/Moscow):');
     await ctx.answerCallbackQuery();
   } catch (error) {
@@ -1213,12 +1242,12 @@ bot.on('message:text', async (ctx) => {
     return; // Skip if chat is undefined
   }
   const chatId = ctx.chat.id;
-  const state = userStates.get(chatId);
-  
+  const state = getUserState(chatId);
+
   // If it's a command, reset state and let command handlers process it
   if (ctx.message.text?.startsWith('/')) {
     if (state === 'WAITING_FOR_QUESTION' || state === 'WAITING_TIMEZONE') {
-      userStates.delete(chatId);
+      deleteUserState(chatId);
     }
     return;
   }
@@ -1228,7 +1257,7 @@ bot.on('message:text', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId) return;
     const iana = resolveTimezoneInput(ctx.message.text ?? '');
-    userStates.delete(chatId);
+    deleteUserState(chatId);
     if (iana) {
       database.setTimezone(userId, iana);
       const label = getTimezoneDisplayName(iana);
@@ -1258,7 +1287,7 @@ bot.on('message:text', async (ctx) => {
   if (state === 'WAITING_FOR_QUESTION') {
     const question = ctx.message.text?.trim();
     if (question) {
-      userStates.delete(chatId); // Reset state
+      deleteUserState(chatId); // Reset state
       await processQuestion(ctx, question);
     }
   }

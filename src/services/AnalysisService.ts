@@ -9,11 +9,32 @@ export interface AnalysisResult {
   affected_pairs: string[];
 }
 
+const MAX_CACHE_ENTRIES = 800;
+
 export class AnalysisService {
   private groq: Groq;
-  // Cache for AI analysis results (10 minutes TTL)
-  private cache = new Map<string, { result: any, expires: number }>();
+  // Cache for AI analysis results (10 minutes TTL, max 800 entries to limit memory)
+  private cache = new Map<string, { result: AnalysisResult | string; expires: number }>();
   private readonly CACHE_TTL = 10 * 60 * 1000; // 10 minutes in milliseconds
+
+  private evictCacheIfNeeded(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (entry.expires <= now) this.cache.delete(key);
+    }
+    while (this.cache.size >= MAX_CACHE_ENTRIES) {
+      let oldestKey: string | null = null;
+      let oldestExpires = Infinity;
+      for (const [key, entry] of this.cache.entries()) {
+        if (entry.expires < oldestExpires) {
+          oldestExpires = entry.expires;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey !== null) this.cache.delete(oldestKey);
+      else break;
+    }
+  }
 
   constructor() {
     this.groq = new Groq({ apiKey: env.GROQ_API_KEY });
@@ -39,7 +60,7 @@ export class AnalysisService {
     const cached = this.cache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
       console.log(`[AnalysisService] Using cached analysis (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
-      return cached.result;
+      return cached.result as AnalysisResult;
     }
 
     const sourceNote = source && source !== 'ForexFactory' 
@@ -133,7 +154,7 @@ ${text}`;
         throw new Error('Invalid affected_pairs in analysis result');
       }
       
-      // Store in cache
+      this.evictCacheIfNeeded();
       this.cache.set(cacheKey, {
         result: analysis,
         expires: Date.now() + this.CACHE_TTL
@@ -158,7 +179,7 @@ ${text}`;
     const cached = this.cache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
       console.log(`[AnalysisService] Using cached daily schedule analysis (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
-      return cached.result;
+      return cached.result as string;
     }
 
     const systemPrompt = `ROLE: Ты старший количественный аналитик Форекс с 15-летним опытом в макро-трейдинге.
@@ -253,7 +274,7 @@ ${eventsText}
       // Clean the response
       const cleanText = responseText.trim();
       
-      // Store in cache
+      this.evictCacheIfNeeded();
       this.cache.set(cacheKey, {
         result: cleanText,
         expires: Date.now() + this.CACHE_TTL
@@ -273,7 +294,7 @@ ${eventsText}
     const cached = this.cache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
       console.log(`[AnalysisService] Using cached question answer (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
-      return cached.result;
+      return cached.result as string;
     }
 
     const contextNote = context 
@@ -321,7 +342,7 @@ ${question}`;
       // Clean the response
       const cleanText = responseText.trim();
       
-      // Store in cache
+      this.evictCacheIfNeeded();
       this.cache.set(cacheKey, {
         result: cleanText,
         expires: Date.now() + this.CACHE_TTL
@@ -341,7 +362,7 @@ ${question}`;
     const cached = this.cache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
       console.log(`[AnalysisService] Using cached results analysis (expires in ${Math.round((cached.expires - Date.now()) / 1000)}s)`);
-      return cached.result;
+      return cached.result as string;
     }
 
     const systemPrompt = `ROLE: Ты старший количественный аналитик Форекс с 15-летним опытом в макро-трейдинге.
@@ -436,7 +457,7 @@ ${eventsText}
       // Clean the response
       const cleanText = responseText.trim();
       
-      // Store in cache
+      this.evictCacheIfNeeded();
       this.cache.set(cacheKey, {
         result: cleanText,
         expires: Date.now() + this.CACHE_TTL
