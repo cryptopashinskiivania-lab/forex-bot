@@ -188,18 +188,32 @@ function buildMainMenuKeyboard(): InlineKeyboard {
   return keyboard;
 }
 
-// Set up persistent menu commands (non-fatal on rate limit)
-bot.api.setMyCommands([
+// Команды по умолчанию (без /stats — она только для админа)
+const defaultCommands = [
   { command: 'daily', description: '📊 Сводка за сегодня' },
   { command: 'tomorrow', description: '📅 Календарь на завтра' },
   { command: 'settings', description: '⚙️ Настройки' },
   { command: 'ask', description: '❓ Вопрос эксперту' },
   { command: 'id', description: '🆔 Мой ID' },
-  { command: 'stats', description: '📊 Статистика (админ)' },
   { command: 'help', description: 'ℹ️ Помощь' },
-]).catch((err) => {
+];
+
+bot.api.setMyCommands(defaultCommands).catch((err) => {
   console.warn('[Bot] setMyCommands failed (e.g. rate limit):', err instanceof Error ? err.message : err);
 });
+
+// Для админа — тот же список плюс /stats (видна только в чате админа)
+if (env.ADMIN_CHAT_ID) {
+  const adminCommands = [
+    ...defaultCommands,
+    { command: 'stats', description: '📊 Статистика (админ)' },
+  ];
+  bot.api
+    .setMyCommands(adminCommands, { scope: { type: 'chat', chat_id: Number(env.ADMIN_CHAT_ID) } })
+    .catch((err) => {
+      console.warn('[Bot] setMyCommands (admin scope) failed:', err instanceof Error ? err.message : err);
+    });
+}
 
 // Auto-register users middleware
 bot.use(async (ctx, next) => {
@@ -210,6 +224,26 @@ bot.use(async (ctx, next) => {
       ctx.from.first_name,
       ctx.from.last_name
     );
+  }
+  await next();
+});
+
+// Analytics: log user events (commands, callbacks)
+bot.use(async (ctx, next) => {
+  const userId = ctx.from?.id;
+  if (!userId) {
+    await next();
+    return;
+  }
+  if (ctx.callbackQuery?.data) {
+    const data = ctx.callbackQuery.data;
+    const eventName = data.startsWith('toggle_') ? 'toggle_asset' : data;
+    database.logUserEvent(userId, 'callback', eventName);
+  } else if (ctx.message?.text?.startsWith('/')) {
+    const match = ctx.message.text.trim().split(/\s+/)[0]?.replace(/^\//, '');
+    if (match) {
+      database.logUserEvent(userId, 'command', match.toLowerCase());
+    }
   }
   await next();
 });
@@ -406,8 +440,17 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
       const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
       await ctx.reply(analysis, { parse_mode: 'Markdown' });
     } catch (analysisError) {
-      console.error('Error generating daily analysis:', analysisError);
-      await ctx.reply('⚠️ Не удалось сгенерировать анализ. Попробуйте позже.');
+      const errMsg = analysisError instanceof Error ? analysisError.message : String(analysisError);
+      console.error('[Bot] AI Forecast error:', errMsg, analysisError);
+      const isDailyLimit = /tokens per day|TPD|rate limit reached/i.test(errMsg);
+      const isRateLimit = /429|rate limit|too many requests/i.test(errMsg);
+      await ctx.reply(
+        isDailyLimit
+          ? '⚠️ Исчерпан дневной лимит запросов к AI (Groq). Попробуйте завтра или обновите тариф: console.groq.com'
+          : isRateLimit
+            ? '⚠️ Превышен лимит запросов к AI. Подождите 1–2 минуты и попробуйте снова.'
+            : '⚠️ Не удалось сгенерировать анализ. Попробуйте позже.'
+      );
     }
   } catch (error) {
     console.error('Error in daily AI forecast callback:', error);
@@ -477,8 +520,17 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
       const analysis = await analysisService.analyzeResults(eventsForAnalysis);
       await ctx.reply(analysis, { parse_mode: 'Markdown' });
     } catch (analysisError) {
-      console.error('Error generating results analysis:', analysisError);
-      await ctx.reply('⚠️ Не удалось сгенерировать анализ результатов. Попробуйте позже.');
+      const errMsg = analysisError instanceof Error ? analysisError.message : String(analysisError);
+      console.error('[Bot] AI Results error:', errMsg, analysisError);
+      const isDailyLimit = /tokens per day|TPD|rate limit reached/i.test(errMsg);
+      const isRateLimit = /429|rate limit|too many requests/i.test(errMsg);
+      await ctx.reply(
+        isDailyLimit
+          ? '⚠️ Исчерпан дневной лимит запросов к AI (Groq). Попробуйте завтра или обновите тариф: console.groq.com'
+          : isRateLimit
+            ? '⚠️ Превышен лимит запросов к AI. Подождите 1–2 минуты и попробуйте снова.'
+            : '⚠️ Не удалось сгенерировать анализ результатов. Попробуйте позже.'
+      );
     }
   } catch (error) {
     console.error('Error in daily AI results callback:', error);
@@ -556,8 +608,17 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
       const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
       await ctx.reply(analysis, { parse_mode: 'Markdown' });
     } catch (analysisError) {
-      console.error('Error generating tomorrow analysis:', analysisError);
-      await ctx.reply('⚠️ Не удалось сгенерировать анализ. Попробуйте позже.');
+      const errMsg = analysisError instanceof Error ? analysisError.message : String(analysisError);
+      console.error('[Bot] Tomorrow AI Forecast error:', errMsg, analysisError);
+      const isDailyLimit = /tokens per day|TPD|rate limit reached/i.test(errMsg);
+      const isRateLimit = /429|rate limit|too many requests/i.test(errMsg);
+      await ctx.reply(
+        isDailyLimit
+          ? '⚠️ Исчерпан дневной лимит запросов к AI (Groq). Попробуйте завтра или обновите тариф: console.groq.com'
+          : isRateLimit
+            ? '⚠️ Превышен лимит запросов к AI. Подождите 1–2 минуты и попробуйте снова.'
+            : '⚠️ Не удалось сгенерировать анализ. Попробуйте позже.'
+      );
     }
   } catch (error) {
     console.error('Error in tomorrow AI forecast callback:', error);
@@ -674,16 +735,61 @@ bot.command('id', (ctx) => {
   ctx.reply(`🆔 Ваш Chat ID: \`${ctx.chat.id}\``, { parse_mode: 'Markdown' });
 });
 
-// Handle /stats command – количество пользователей (только для администратора)
+// Handle /stats command – аналитика (только для администратора)
 bot.command('stats', (ctx) => {
   const isAdmin = env.ADMIN_CHAT_ID && String(ctx.from?.id) === env.ADMIN_CHAT_ID;
   if (!isAdmin) {
     ctx.reply('Доступ только для администратора.');
     return;
   }
-  const count = database.getUserCount();
-  ctx.reply(`📊 Пользователей на сервере: ${count}`);
+  const stats = database.getAnalyticsStats(30);
+  const featureLines = stats.featureUsage
+    .slice(0, 15)
+    .map((f) => {
+      const label = formatFeatureLabel(f.event_name);
+      return `  ${label}: ${f.count}`;
+    })
+    .join('\n');
+  const text = `📊 **Статистика бота**
+
+👥 **Пользователи**
+  Всего: ${stats.totalUsers}
+  Активных за 24ч: ${stats.dau}
+  Активных за 7 дней: ${stats.wau}
+  Активных за 30 дней: ${stats.mau}
+
+📈 **Использование функций** (за 30 дней)
+${featureLines || '  Нет данных'}`;
+  ctx.reply(text, { parse_mode: 'Markdown' });
 });
+
+function formatFeatureLabel(name: string): string {
+  if (name.startsWith('tz_')) return 'Выбор часового пояса';
+  const labels: Record<string, string> = {
+    start: '/start',
+    daily: '/daily',
+    tomorrow: '/tomorrow',
+    settings: '/settings',
+    ask: '/ask',
+    help: '/help',
+    id: '/id',
+    daily_ai_forecast: 'AI Forecast (сегодня)',
+    daily_ai_results: 'AI Results (сегодня)',
+    tomorrow_ai_forecast: 'AI Forecast (завтра)',
+    ask_question: 'Вопросы к AI',
+    toggle_asset: 'Настройка активов',
+    settings_toggle_rss: 'RSS',
+    settings_toggle_quiet_hours: 'Тихий режим',
+    settings_news_source: 'Источник новостей',
+    settings_timezone: 'Часовой пояс',
+    source_forexfactory: 'Источник: ForexFactory',
+    source_myfxbook: 'Источник: Myfxbook',
+    source_both: 'Источник: оба',
+    settings_back: 'Назад в настройки',
+    settings_close: 'Закрыть настройки',
+  };
+  return labels[name] ?? name;
+}
 
 // Handle /ask command (backward compatibility)
 bot.command('ask', async (ctx) => {
@@ -716,13 +822,16 @@ bot.callbackQuery('ask_question', async (ctx) => {
 
 // Helper function to process questions
 async function processQuestion(ctx: any, question: string) {
+  const userId = ctx.from?.id;
+  if (userId) {
+    database.logUserEvent(userId, 'message', 'ask_question');
+  }
   try {
     await ctx.reply('🧠 Анализирую ваш вопрос...');
     
     // Optionally get current market context (today's events) to provide better answers
     let context: string | undefined;
     try {
-      const userId = ctx.from?.id;
       if (!userId) {
         // Skip context if no userId
         return;
@@ -747,8 +856,15 @@ async function processQuestion(ctx: any, question: string) {
     const answer = await analysisService.answerQuestion(question, context);
     await ctx.reply(`💡 Ответ:\n\n${answer}`);
   } catch (error) {
-    console.error('Error in processQuestion:', error);
-    await ctx.reply(`❌ Ошибка при обработке вопроса: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('[Bot] processQuestion error:', errMsg, error);
+    const isRateLimit =
+      /429|rate limit|tokens per day|TPD|rate_limit_exceeded/i.test(errMsg);
+    await ctx.reply(
+      isRateLimit
+        ? '⚠️ Исчерпан дневной лимит запросов к AI (Groq). Попробуйте завтра или обновите тариф: console.groq.com'
+        : '❌ Ошибка при обработке вопроса. Попробуйте позже.'
+    );
   }
 }
 
@@ -1332,5 +1448,14 @@ async function shutdown(signal: string) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// Ensure errors are logged for diagnostics (even when reducing verbose logs)
+process.on('uncaughtException', (err) => {
+  console.error('[CRITICAL] uncaughtException:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[CRITICAL] unhandledRejection:', reason, promise);
+});
 
 

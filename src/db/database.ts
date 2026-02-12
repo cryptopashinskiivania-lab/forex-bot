@@ -34,7 +34,17 @@ db.exec(`
     message TEXT NOT NULL,
     details TEXT,
     created_at INTEGER NOT NULL
-  )
+  );
+  
+  CREATE TABLE IF NOT EXISTS user_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_user_events_created ON user_events(created_at);
+  CREATE INDEX IF NOT EXISTS idx_user_events_name_created ON user_events(event_name, created_at);
 `);
 
 // Default monitored assets (major currencies only)
@@ -87,6 +97,60 @@ export const database = {
     // Also cleanup old data issues (keep only last 7 days)
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     db.prepare('DELETE FROM data_issues WHERE created_at < ?').run(sevenDaysAgo);
+    
+    // Cleanup old user_events (keep last 90 days)
+    const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    db.prepare('DELETE FROM user_events WHERE created_at < ?').run(ninetyDaysAgo);
+  },
+
+  // User analytics
+  logUserEvent: (userId: number, eventType: 'command' | 'callback' | 'message', eventName: string): void => {
+    try {
+      db.prepare(
+        'INSERT INTO user_events (user_id, event_type, event_name, created_at) VALUES (?, ?, ?, ?)'
+      ).run(userId, eventType, eventName, Date.now());
+    } catch (err) {
+      console.warn('[DB] logUserEvent failed:', err instanceof Error ? err.message : err);
+    }
+  },
+
+  getAnalyticsStats: (periodDays: number): {
+    dau: number;
+    wau: number;
+    mau: number;
+    totalUsers: number;
+    featureUsage: Array<{ event_name: string; count: number }>;
+  } => {
+    const now = Date.now();
+    const msDay = 24 * 60 * 60 * 1000;
+    const oneDayAgo = now - msDay;
+    const sevenDaysAgo = now - 7 * msDay;
+    const thirtyDaysAgo = now - 30 * msDay;
+
+    const dau = (db.prepare(
+      'SELECT COUNT(DISTINCT user_id) as c FROM user_events WHERE created_at >= ?'
+    ).get(oneDayAgo) as { c: number })?.c ?? 0;
+
+    const wau = (db.prepare(
+      'SELECT COUNT(DISTINCT user_id) as c FROM user_events WHERE created_at >= ?'
+    ).get(sevenDaysAgo) as { c: number })?.c ?? 0;
+
+    const mau = (db.prepare(
+      'SELECT COUNT(DISTINCT user_id) as c FROM user_events WHERE created_at >= ?'
+    ).get(thirtyDaysAgo) as { c: number })?.c ?? 0;
+
+    const totalUsers = database.getUserCount();
+
+    const cutoff = now - periodDays * msDay;
+    const featureRows = db.prepare(
+      `SELECT event_name, COUNT(*) as count FROM user_events 
+       WHERE created_at >= ? 
+       GROUP BY event_name 
+       ORDER BY count DESC 
+       LIMIT 30`
+    ).all(cutoff) as Array<{ event_name: string; count: number }>;
+
+    return { dau, wau, mau, totalUsers, featureUsage: featureRows };
   },
   
   // Data quality issue tracking
