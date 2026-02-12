@@ -166,6 +166,7 @@ bot.api.setMyCommands([
   { command: 'settings', description: '⚙️ Настройки' },
   { command: 'ask', description: '❓ Вопрос эксперту' },
   { command: 'id', description: '🆔 Мой ID' },
+  { command: 'stats', description: '📊 Статистика (админ)' },
   { command: 'help', description: 'ℹ️ Помощь' },
 ]).catch((err) => {
   console.warn('[Bot] setMyCommands failed (e.g. rate limit):', err instanceof Error ? err.message : err);
@@ -642,6 +643,17 @@ bot.command('tomorrow', async (ctx) => {
 // Handle /id command – get user's chat ID for configuration
 bot.command('id', (ctx) => {
   ctx.reply(`🆔 Ваш Chat ID: \`${ctx.chat.id}\``, { parse_mode: 'Markdown' });
+});
+
+// Handle /stats command – количество пользователей (только для администратора)
+bot.command('stats', (ctx) => {
+  const isAdmin = env.ADMIN_CHAT_ID && String(ctx.from?.id) === env.ADMIN_CHAT_ID;
+  if (!isAdmin) {
+    ctx.reply('Доступ только для администратора.');
+    return;
+  }
+  const count = database.getUserCount();
+  ctx.reply(`📊 Пользователей на сервере: ${count}`);
 });
 
 // Handle /ask command (backward compatibility)

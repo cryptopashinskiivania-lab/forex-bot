@@ -60,7 +60,12 @@ export const database = {
   getUsers: (): User[] => {
     return db.prepare('SELECT * FROM users').all() as User[];
   },
-  
+
+  getUserCount: (): number => {
+    const row = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
+    return row?.count ?? 0;
+  },
+
   getUserById: (userId: number): User | undefined => {
     return db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId) as User | undefined;
   },
