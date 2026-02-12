@@ -15,6 +15,7 @@ import {
   FilterResult,
   AiQualitySummary,
 } from '../types/DataQuality';
+import { isPlaceholderActual } from '../utils/calendarValue';
 
 /**
  * Constants for validation rules
@@ -333,8 +334,9 @@ export class DataQualityService {
       
       // 1. Skip events without time (unless it's a special case)
       if (!event.timeISO) {
-        // Allow events without time for AI Results mode (if they have actual data)
-        if (mode === 'ai_results' && !isEmpty(event.actual)) {
+        // Allow events without time for AI Results mode (if they have real actual data, not PENDING)
+        const hasRealActualForTime = typeof event.actual === 'string' && !isEmpty(event.actual) && !isPlaceholderActual(event.actual);
+        if (mode === 'ai_results' && hasRealActualForTime) {
           // OK to include
         } else {
           skipped.push({
@@ -393,8 +395,10 @@ export class DataQualityService {
       }
       
       if (!shouldSkip && mode === 'ai_results') {
-        // For AI Results: event should have BOTH actual AND forecast data
-        if (isEmpty(event.actual) || isEmpty(event.forecast)) {
+        // For AI Results: event should have BOTH actual AND forecast data (PENDING is not real actual)
+        const hasRealActual = typeof event.actual === 'string' && !isEmpty(event.actual) && !isPlaceholderActual(event.actual);
+        const hasForecast = !isEmpty(event.forecast);
+        if (!hasRealActual || !hasForecast) {
           skipped.push({
             eventId,
             source: (event.source as 'ForexFactory' | 'Myfxbook') || 'ForexFactory',
@@ -402,8 +406,8 @@ export class DataQualityService {
             message: `Event missing actual or forecast data (AI Results requires both)`,
             details: { 
               event,
-              hasActual: !isEmpty(event.actual),
-              hasForecast: !isEmpty(event.forecast),
+              hasActual: hasRealActual,
+              hasForecast,
             },
           });
           shouldSkip = true;

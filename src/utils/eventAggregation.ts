@@ -7,6 +7,7 @@ import { CalendarService, CalendarEvent } from '../services/CalendarService';
 import { MyfxbookService } from '../services/MyfxbookService';
 import { DataQualityService } from '../services/DataQualityService';
 import { database } from '../db/database';
+import { isPlaceholderActual } from './calendarValue';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -153,8 +154,8 @@ export async function aggregateCoreEvents(
         // Duplicate within SAME source - keep the better one
         const existing = deduplicationMap.get(key);
         if (existing) {
-          const existingHasData = !isEmpty(existing.actual) || !isEmpty(existing.forecast);
-          const currentHasData = !isEmpty(event.actual) || !isEmpty(event.forecast);
+          const existingHasData = !isPlaceholderActual(existing.actual) || !isEmpty(existing.forecast);
+          const currentHasData = !isPlaceholderActual(event.actual) || !isEmpty(event.forecast);
           
           // Decision logic (in order of priority):
           // 1. Prefer event with actual/forecast data

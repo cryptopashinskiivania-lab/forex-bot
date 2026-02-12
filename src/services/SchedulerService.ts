@@ -11,6 +11,7 @@ import { DataQualityService } from './DataQualityService';
 import { env } from '../config/env';
 import { database } from '../db/database';
 import { aggregateCoreEvents } from '../utils/eventAggregation';
+import { isPlaceholderActual } from '../utils/calendarValue';
 
 const CURRENCY_FLAGS: Record<string, string> = {
   USD: '🇺🇸',
@@ -72,6 +73,11 @@ function scoreEmoji(score: number): string {
 function isEmpty(s: string): boolean {
   const t = (s || '').trim();
   return !t || t === '—' || t === '-';
+}
+
+/** Don't show "Факт: PENDING" — treat placeholders as no data (safety net if event wasn't normalized at source). */
+function hasRealActual(actual: string): boolean {
+  return !isEmpty(actual) && !isPlaceholderActual(actual);
 }
 
 /**
@@ -206,9 +212,9 @@ export class SchedulerService {
     msg += `📡 Источник: ${source}\n`;
     msg += `🎯 Влияние: ${score}/10 ${emoji}\n`;
     msg += `💚 Настроение: ${sentimentEmoji} ${result.sentiment === 'Pos' ? 'Позитивное' : result.sentiment === 'Neg' ? 'Негативное' : 'Нейтральное'} ${trendArrow}\n`;
-    if (!isEmpty(actual) || !isEmpty(forecast)) {
+    if (hasRealActual(actual) || !isEmpty(forecast)) {
       const parts: string[] = [];
-      if (!isEmpty(actual)) parts.push(`Факт: ${actual}`);
+      if (hasRealActual(actual)) parts.push(`Факт: ${actual}`);
       if (!isEmpty(forecast)) parts.push(`Прогноз: ${forecast}`);
       msg += `📊 ${parts.join(' | ')}\n`;
     }

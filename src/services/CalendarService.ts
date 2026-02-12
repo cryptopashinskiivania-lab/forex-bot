@@ -8,6 +8,7 @@ import { fromZonedTime } from 'date-fns-tz';
 import { database } from '../db/database';
 import { DataQualityService } from './DataQualityService';
 import { sendCriticalDataAlert } from '../utils/adminAlerts';
+import { isPlaceholderActual } from '../utils/calendarValue';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -377,7 +378,9 @@ export class CalendarService {
       
       const forecast = $row.find('.calendar__forecast').text().trim() || '—';
       const previous = $row.find('.calendar__previous').text().trim() || '—';
-      const actual = $row.find('.calendar__actual').text().trim() || '—';
+      const actualRaw = $row.find('.calendar__actual').text().trim() || '—';
+      // Treat PENDING and similar as no data so we don't show "РЕЗУЛЬТАТ" until real value is available
+      const actual = isPlaceholderActual(actualRaw) ? '—' : (actualRaw || '—');
 
       if (!title || currency === 'Currency' || currency === 'All') return;
 

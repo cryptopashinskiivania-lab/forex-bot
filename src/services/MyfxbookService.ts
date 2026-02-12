@@ -9,6 +9,7 @@ import { CalendarEvent } from './CalendarService';
 import { database } from '../db/database';
 import { DataQualityService } from './DataQualityService';
 import { sendCriticalDataAlert } from '../utils/adminAlerts';
+import { isPlaceholderActual } from '../utils/calendarValue';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -307,7 +308,9 @@ export class MyfxbookService {
           const impactText = $cells.eq(5).text().trim() || '';
           const previous = $cells.eq(6).text().trim() || '—';
           const forecast = $cells.eq(7).text().trim() || '—';
-          const actual = $cells.eq(8).text().trim() || '—';
+          const actualRaw = $cells.eq(8).text().trim() || '—';
+          // Treat PENDING and similar as no data so we don't show "РЕЗУЛЬТАТ" until real value is available
+          const actual = isPlaceholderActual(actualRaw) ? '—' : (actualRaw || '—');
           
           // Skip invalid rows
           if (!currency || !title || currency.length > 3) {
