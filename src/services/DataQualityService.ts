@@ -350,22 +350,31 @@ export class DataQualityService {
         }
       }
       
-      // 2. Check for past events (except for AI Results)
+      // 2. Check for past events (except for AI Results and except events with result — we need those for "result" notifications)
       if (!shouldSkip && event.timeISO && mode !== 'ai_results') {
         try {
           const eventTime = parseISO(event.timeISO);
           const diffMinutes = (nowUtc.getTime() - eventTime.getTime()) / (1000 * 60);
-          
-          // If event is more than 30 minutes in the past, skip it
+
+          const hasRealActual =
+            typeof event.actual === 'string' &&
+            !isEmpty(event.actual) &&
+            !isPlaceholderActual(event.actual);
+
           if (diffMinutes > VALIDATION_CONFIG.PAST_EVENT_THRESHOLD_MINUTES) {
-            skipped.push({
-              eventId,
-              source: (event.source as 'ForexFactory' | 'Myfxbook') || 'ForexFactory',
-              type: 'PAST_TOO_FAR',
-              message: `Event is too far in the past: ${diffMinutes.toFixed(0)} minutes ago`,
-              details: { timeISO: event.timeISO, diffMinutes },
-            });
-            shouldSkip = true;
+            // Do not skip past events that have real actual data — scheduler sends them as "result" notification
+            if (hasRealActual) {
+              // Keep in deliver list for result notification
+            } else {
+              skipped.push({
+                eventId,
+                source: (event.source as 'ForexFactory' | 'Myfxbook') || 'ForexFactory',
+                type: 'PAST_TOO_FAR',
+                message: `Event is too far in the past: ${diffMinutes.toFixed(0)} minutes ago`,
+                details: { timeISO: event.timeISO, diffMinutes },
+              });
+              shouldSkip = true;
+            }
           }
         } catch (error) {
           // If time parsing fails, skip this check

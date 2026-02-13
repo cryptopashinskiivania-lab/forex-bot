@@ -156,9 +156,9 @@ function shouldSendReminder(event: CalendarEvent, userId: number): boolean {
     // Calculate time difference in minutes
     const timeDiffMinutes = (eventTime.getTime() - now.getTime()) / (1000 * 60);
     
-    // Send reminder if we're between 13 and 17 minutes before the event
-    // Wider window (4 min) to catch cron runs every 3 minutes reliably
-    const shouldSend = timeDiffMinutes >= 13 && timeDiffMinutes <= 17;
+    // Send reminder if we're between 12 and 18 minutes before the event
+    // Window 6 min so with cron every 3 min we reliably hit at least one run
+    const shouldSend = timeDiffMinutes >= 12 && timeDiffMinutes <= 18;
     
     return shouldSend && !isQuietHours(userId);
   } catch (error) {
@@ -223,6 +223,228 @@ export class SchedulerService {
     return msg;
   }
 
+  /**
+   * Run the notification check once (events, reminders, results, RSS).
+   * Called by cron every 3 min and once on startup after delay.
+   */
+  private async runScheduledCheck(bot: Bot): Promise<void> {
+    console.log('[Scheduler] Running scheduled check...');
+
+    try {
+      const users = database.getUsers();
+
+      if (users.length === 0) {
+        console.log('[Scheduler] No registered users found — no notifications will be sent');
+        return;
+      }
+
+      console.log(`[Scheduler] Processing notifications for ${users.length} user(s)`);
+
+      const BATCH_SIZE = 40;
+      const BATCH_DELAY_MS = 150;
+
+      for (let i = 0; i < users.length; i += BATCH_SIZE) {
+        const chunk = users.slice(i, i + BATCH_SIZE);
+        await Promise.allSettled(
+          chunk.map(async (user) => {
+            try {
+              const userId = user.user_id;
+              const monitoredAssets = database.getMonitoredAssets(userId);
+              const isRssEnabled = database.isRssEnabled(userId);
+
+              const events = await aggregateCoreEvents(
+                this.calendarService,
+                this.myfxbookService,
+                userId,
+                false
+              );
+
+              const userEventsRaw = events.filter((e) => monitoredAssets.includes(e.currency));
+
+              const { deliver: userEvents } = this.dataQualityService.filterForDelivery(
+                userEventsRaw,
+                { mode: 'general', nowUtc: new Date() }
+              );
+
+              if (userEventsRaw.length === 0 || userEvents.length === 0) {
+                console.log(
+                  `[Scheduler] User ${userId}: ${events.length} total from calendar, ${userEventsRaw.length} for monitored assets, ${userEvents.length} after quality filter`
+                );
+              }
+
+              for (const event of userEvents) {
+                const time = event.timeISO || event.time;
+                const id = itemId(event.title, time);
+
+                if (event.timeISO && shouldSendReminder(event, userId)) {
+                  const reminderId = `reminder_${userId}_${id}`;
+                  if (!database.hasSent(reminderId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(
+                        text,
+                        event.source || 'ForexFactory'
+                      );
+                      const emoji = scoreEmoji(result.score);
+                      const header = '⏰ НАПОМИНАНИЕ (за 15 мин)';
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(reminderId);
+                      console.log(`[Scheduler] Reminder sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending reminder to user ${userId}:`, err);
+                    }
+                  }
+                }
+
+                if (event.isResult) {
+                  const resultId = `result_${userId}_${id}`;
+                  if (!database.hasSent(resultId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(
+                        text,
+                        event.source || 'ForexFactory'
+                      );
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(false, event.isResult);
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(resultId);
+                      console.log(`[Scheduler] Result sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending result to user ${userId}:`, err);
+                    }
+                  }
+                }
+
+                if (!event.timeISO && !isQuietHours(userId)) {
+                  const eventId = `event_${userId}_${id}`;
+                  if (!database.hasSent(eventId)) {
+                    try {
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      const result = await this.analysisService.analyzeNews(
+                        text,
+                        event.source || 'ForexFactory'
+                      );
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(false, false);
+                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        event.currency,
+                        event.title,
+                        event.source || 'ForexFactory',
+                        result.score,
+                        emoji,
+                        event.actual,
+                        event.forecast,
+                        result
+                      );
+                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                      database.markAsSent(eventId);
+                      console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending event to user ${userId}:`, err);
+                    }
+                  }
+                }
+              }
+
+              if (isRssEnabled && !isQuietHours(userId)) {
+                const rssItems = await this.rssService.getLatestNews().catch(() => []);
+
+                for (const item of rssItems) {
+                  const time = item.pubDate?.toISOString() ?? item.title;
+                  const rssId = `rss_${userId}_${itemId(item.title, time)}`;
+
+                  if (!database.hasSent(rssId)) {
+                    try {
+                      const text = `Breaking News: ${item.title}. Summary: ${item.summary}`;
+                      const result = await this.analysisService.analyzeNews(text, item.source);
+                      const emoji = scoreEmoji(result.score);
+                      const header = this.getHeader(true, false);
+
+                      let detectedCurrency = '';
+                      let flag = '📰';
+
+                      for (const asset of monitoredAssets) {
+                        if (
+                          item.title.toUpperCase().includes(asset) ||
+                          item.summary.toUpperCase().includes(asset)
+                        ) {
+                          detectedCurrency = asset;
+                          flag = CURRENCY_FLAGS[asset] || '📰';
+                          break;
+                        }
+                      }
+
+                      const displayCurrency = detectedCurrency || item.source;
+                      const msg = this.formatMessage(
+                        header,
+                        flag,
+                        displayCurrency,
+                        item.title,
+                        item.source,
+                        result.score,
+                        emoji,
+                        '',
+                        '',
+                        result
+                      );
+                      let full = msg;
+                      if (item.link) full += `\n\n🔗 ${item.link}`;
+                      await bot.api.sendMessage(userId, full, { parse_mode: undefined });
+                      database.markAsSent(rssId);
+                      console.log(`[Scheduler] RSS sent to user ${userId}: ${item.title}`);
+                    } catch (err) {
+                      console.error(`[Scheduler] Error sending RSS to user ${userId}:`, err);
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              console.error(
+                `[Scheduler] Error processing notifications for user ${user.user_id}:`,
+                error
+              );
+            }
+          })
+        );
+        if (i + BATCH_SIZE < users.length) {
+          await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
+        }
+      }
+    } catch (err) {
+      console.error('[Scheduler] Error in scheduled check:', err);
+    }
+  }
+
   start(bot: Bot): void {
     console.log('Starting SchedulerService with per-user timezone support...');
     console.log('[Scheduler] Multi-user mode: notifications will be sent to all registered users based on their settings');
@@ -233,6 +455,7 @@ export class SchedulerService {
       '0 * * * *',
       async () => {
         const now = new Date();
+        console.log(`[Scheduler] Daily digest cron fired at ${now.toISOString().slice(0, 16)} UTC`);
         try {
           const users = database.getUsers();
           if (users.length === 0) {
@@ -337,212 +560,21 @@ export class SchedulerService {
     this.cronTasks.push(dailyNewsTask);
 
     // Check for events and RSS every 3 minutes; use UTC for predictable behavior
-    const minuteCheckTask = cron.schedule('*/3 * * * *', async () => {
-      console.log('[Scheduler] Running scheduled check (every 3 minutes)...');
-
-      try {
-        // Get all registered users
-        const users = database.getUsers();
-        
-        if (users.length === 0) {
-          console.log('[Scheduler] No registered users found');
-          return;
-        }
-
-        const BATCH_SIZE = 40;
-        const BATCH_DELAY_MS = 150;
-
-        for (let i = 0; i < users.length; i += BATCH_SIZE) {
-          const chunk = users.slice(i, i + BATCH_SIZE);
-          await Promise.allSettled(
-            chunk.map(async (user) => {
-            try {
-              const userId = user.user_id;
-              const monitoredAssets = database.getMonitoredAssets(userId);
-              const isRssEnabled = database.isRssEnabled(userId);
-              
-              // Get events for this user (based on their news source preference)
-              const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, userId, false);
-              
-              // Filter events by user's monitored assets
-              const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
-              
-              // IMPORTANT: Apply data quality filter before processing
-              const { deliver: userEvents } = this.dataQualityService.filterForDelivery(
-                userEventsRaw,
-                { mode: 'general', nowUtc: new Date() }
-              );
-              
-              // Process calendar events
-              for (const event of userEvents) {
-                const time = event.timeISO || event.time;
-                const id = itemId(event.title, time);
-                
-                // Check for reminder (15 minutes before event)
-                // Note: filterForDelivery already filtered out past events, 
-                // but shouldSendReminder checks the specific 15-minute window
-                if (event.timeISO && shouldSendReminder(event, userId)) {
-                  const reminderId = `reminder_${userId}_${id}`;
-                  if (!database.hasSent(reminderId)) {
-                    try {
-                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
-                      const emoji = scoreEmoji(result.score);
-                      const header = '⏰ НАПОМИНАНИЕ (за 15 мин)';
-                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
-                      const msg = this.formatMessage(
-                        header,
-                        flag,
-                        event.currency,
-                        event.title,
-                        event.source || 'ForexFactory',
-                        result.score,
-                        emoji,
-                        event.actual,
-                        event.forecast,
-                        result
-                      );
-                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
-                      database.markAsSent(reminderId);
-                      console.log(`[Scheduler] Reminder sent to user ${userId}: ${event.title}`);
-                    } catch (err) {
-                      console.error(`[Scheduler] Error sending reminder to user ${userId}:`, err);
-                    }
-                  }
-                }
-                
-                // Check for result (if actual is available and not sent yet)
-                // Results are important, so send them even during quiet hours
-                if (event.isResult) {
-                  const resultId = `result_${userId}_${id}`;
-                  if (!database.hasSent(resultId)) {
-                    try {
-                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
-                      const emoji = scoreEmoji(result.score);
-                      const header = this.getHeader(false, event.isResult);
-                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
-                      const msg = this.formatMessage(
-                        header,
-                        flag,
-                        event.currency,
-                        event.title,
-                        event.source || 'ForexFactory',
-                        result.score,
-                        emoji,
-                        event.actual,
-                        event.forecast,
-                        result
-                      );
-                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
-                      database.markAsSent(resultId);
-                      console.log(`[Scheduler] Result sent to user ${userId}: ${event.title}`);
-                    } catch (err) {
-                      console.error(`[Scheduler] Error sending result to user ${userId}:`, err);
-                    }
-                  }
-                }
-                
-                // For events without valid timeISO (All Day, Tentative), process them immediately
-                // if they are high/medium impact and not in quiet hours
-                if (!event.timeISO && !isQuietHours(userId)) {
-                  const eventId = `event_${userId}_${id}`;
-                  if (!database.hasSent(eventId)) {
-                    try {
-                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                      const result = await this.analysisService.analyzeNews(text, event.source || 'ForexFactory');
-                      const emoji = scoreEmoji(result.score);
-                      const header = this.getHeader(false, false);
-                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
-                      const msg = this.formatMessage(
-                        header,
-                        flag,
-                        event.currency,
-                        event.title,
-                        event.source || 'ForexFactory',
-                        result.score,
-                        emoji,
-                        event.actual,
-                        event.forecast,
-                        result
-                      );
-                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
-                      database.markAsSent(eventId);
-                      console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
-                    } catch (err) {
-                      console.error(`[Scheduler] Error sending event to user ${userId}:`, err);
-                    }
-                  }
-                }
-              }
-              
-              // Process RSS if enabled for this user
-              if (isRssEnabled && !isQuietHours(userId)) {
-                const rssItems = await this.rssService.getLatestNews().catch(() => []);
-                
-                for (const item of rssItems) {
-                  const time = item.pubDate?.toISOString() ?? item.title;
-                  const rssId = `rss_${userId}_${itemId(item.title, time)}`;
-                  
-                  if (!database.hasSent(rssId)) {
-                    try {
-                      const text = `Breaking News: ${item.title}. Summary: ${item.summary}`;
-                      const result = await this.analysisService.analyzeNews(text, item.source);
-                      const emoji = scoreEmoji(result.score);
-                      const header = this.getHeader(true, false);
-                      
-                      // Try to extract currency from title/summary for better flag display
-                      let detectedCurrency = '';
-                      let flag = '📰';
-                      
-                      for (const asset of monitoredAssets) {
-                        if (item.title.toUpperCase().includes(asset) || item.summary.toUpperCase().includes(asset)) {
-                          detectedCurrency = asset;
-                          flag = CURRENCY_FLAGS[asset] || '📰';
-                          break;
-                        }
-                      }
-                      
-                      const displayCurrency = detectedCurrency || item.source;
-                      const msg = this.formatMessage(
-                        header,
-                        flag,
-                        displayCurrency,
-                        item.title,
-                        item.source,
-                        result.score,
-                        emoji,
-                        '',
-                        '',
-                        result
-                      );
-                      let full = msg;
-                      if (item.link) full += `\n\n🔗 ${item.link}`;
-                      await bot.api.sendMessage(userId, full, { parse_mode: undefined });
-                      database.markAsSent(rssId);
-                      console.log(`[Scheduler] RSS sent to user ${userId}: ${item.title}`);
-                    } catch (err) {
-                      console.error(`[Scheduler] Error sending RSS to user ${userId}:`, err);
-                    }
-                  }
-                }
-              }
-            } catch (error) {
-              console.error(`[Scheduler] Error processing notifications for user ${user.user_id}:`, error);
-            }
-          })
-          );
-          if (i + BATCH_SIZE < users.length) {
-            await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
-          }
-        }
-      } catch (err) {
-        console.error('[Scheduler] Error in scheduled check:', err);
-      }
-    }, { timezone: 'UTC' });
+    const minuteCheckTask = cron.schedule(
+      '*/3 * * * *',
+      () => this.runScheduledCheck(bot),
+      { timezone: 'UTC', noOverlap: true }
+    );
     this.cronTasks.push(minuteCheckTask);
 
-    console.log('SchedulerService started successfully');
+    // Run check once shortly after start so we see logs and any issues immediately
+    const startDelayMs = 15 * 1000;
+    setTimeout(() => {
+      console.log('[Scheduler] Running initial notification check (on startup)...');
+      void this.runScheduledCheck(bot);
+    }, startDelayMs);
+
+    console.log('SchedulerService started successfully (check runs every 3 min and once after 15s)');
   }
 
   /**
