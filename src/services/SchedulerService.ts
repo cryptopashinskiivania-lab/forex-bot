@@ -156,9 +156,9 @@ function shouldSendReminder(event: CalendarEvent, userId: number): boolean {
     // Calculate time difference in minutes
     const timeDiffMinutes = (eventTime.getTime() - now.getTime()) / (1000 * 60);
     
-    // Send reminder if we're between 14 and 16 minutes before the event
-    // This gives us a 2-minute window to catch the reminder
-    const shouldSend = timeDiffMinutes >= 14 && timeDiffMinutes <= 16;
+    // Send reminder if we're between 13 and 17 minutes before the event
+    // Wider window (4 min) to catch cron runs every 3 minutes reliably
+    const shouldSend = timeDiffMinutes >= 13 && timeDiffMinutes <= 17;
     
     return shouldSend && !isQuietHours(userId);
   } catch (error) {
@@ -227,23 +227,45 @@ export class SchedulerService {
     console.log('Starting SchedulerService with per-user timezone support...');
     console.log('[Scheduler] Multi-user mode: notifications will be sent to all registered users based on their settings');
 
-    // Run every hour; for each user send daily digest at 08:00 in that user's timezone
-    const dailyNewsTask = cron.schedule('0 * * * *', async () => {
-      const now = new Date();
-      try {
-        const users = database.getUsers();
-        if (users.length === 0) {
-          return;
-        }
-        for (const user of users) {
-          const userTz = database.getTimezone(user.user_id);
-          const localTime = toZonedTime(now, userTz);
-          const hour = localTime.getHours();
-          const minute = localTime.getMinutes();
-          if (hour !== 8 || minute !== 0) {
-            continue;
+    // Run every hour at :00 UTC; for each user send daily digest at 08:00 in that user's timezone
+    // timezone: 'UTC' ensures deterministic behavior regardless of server timezone
+    const dailyNewsTask = cron.schedule(
+      '0 * * * *',
+      async () => {
+        const now = new Date();
+        try {
+          const users = database.getUsers();
+          if (users.length === 0) {
+            console.log('[Scheduler] Daily digest: no users');
+            return;
           }
-          console.log(`[Scheduler] Running daily news at 08:00 for user ${user.user_id} (${userTz})...`);
+          let sentCount = 0;
+          let skippedCount = 0;
+          for (const user of users) {
+            let userTz: string;
+            try {
+              userTz = database.getTimezone(user.user_id);
+            } catch (tzErr) {
+              console.error(`[Scheduler] Failed to get timezone for user ${user.user_id}:`, tzErr);
+              skippedCount++;
+              continue;
+            }
+            let localTime: Date;
+            try {
+              localTime = toZonedTime(now, userTz);
+            } catch (tzErr) {
+              console.error(`[Scheduler] Invalid timezone ${userTz} for user ${user.user_id}:`, tzErr);
+              skippedCount++;
+              continue;
+            }
+            const hour = localTime.getHours();
+            const minute = localTime.getMinutes();
+            // Accept 08:00–08:04 to handle cron firing slightly late
+            if (hour !== 8 || minute > 4) {
+              skippedCount++;
+              continue;
+            }
+            console.log(`[Scheduler] Running daily news at 08:00 for user ${user.user_id} (${userTz})...`);
           try {
             const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id, false);
             const monitoredAssets = database.getMonitoredAssets(user.user_id);
@@ -266,7 +288,8 @@ export class SchedulerService {
             }
             if (userEvents.length === 0) {
               await bot.api.sendMessage(user.user_id, '📅 Сегодня нет событий с высоким/средним влиянием для ваших активов.')
-                .catch(err => console.error(`[Scheduler] Error sending to user ${user.user_id}:`, err));
+                .catch(err => console.error(`[Scheduler] Error sending empty digest to user ${user.user_id}:`, err));
+              sentCount++;
               continue;
             }
             const lines = userEvents.map((e, i) => {
@@ -276,7 +299,13 @@ export class SchedulerService {
               return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
             });
             const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
-            await bot.api.sendMessage(user.user_id, eventsText);
+            try {
+              await bot.api.sendMessage(user.user_id, eventsText);
+            } catch (sendErr) {
+              console.error(`[Scheduler] Error sending daily digest to user ${user.user_id}:`, sendErr);
+              continue;
+            }
+            sentCount++;
             try {
               const eventsForAnalysis = userEvents.map(e => {
                 const time24 = formatTime24(e, userTz);
@@ -287,7 +316,8 @@ export class SchedulerService {
                 return parts.join(' | ');
               }).join('\n');
               const analysis = await this.analysisService.analyzeDailySchedule(eventsForAnalysis);
-              await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
+              await bot.api.sendMessage(user.user_id, `📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' })
+                .catch(err => console.error(`[Scheduler] Error sending AI analysis to user ${user.user_id}:`, err));
             } catch (analysisError) {
               console.error(`[Scheduler] Error generating daily analysis for user ${user.user_id}:`, analysisError);
             }
@@ -295,13 +325,18 @@ export class SchedulerService {
             console.error(`[Scheduler] Error sending daily news to user ${user.user_id}:`, error);
           }
         }
+        if (sentCount > 0 || skippedCount > 0) {
+          console.log(`[Scheduler] Daily digest done: sent=${sentCount}, skipped=${skippedCount}`);
+        }
       } catch (error) {
         console.error('[Scheduler] Error in daily news:', error);
       }
-    });
+      },
+      { timezone: 'UTC', noOverlap: true }
+    );
     this.cronTasks.push(dailyNewsTask);
 
-    // Check for events and RSS every 3 minutes (optimized from every minute)
+    // Check for events and RSS every 3 minutes; use UTC for predictable behavior
     const minuteCheckTask = cron.schedule('*/3 * * * *', async () => {
       console.log('[Scheduler] Running scheduled check (every 3 minutes)...');
 
@@ -504,7 +539,7 @@ export class SchedulerService {
       } catch (err) {
         console.error('[Scheduler] Error in scheduled check:', err);
       }
-    });
+    }, { timezone: 'UTC' });
     this.cronTasks.push(minuteCheckTask);
 
     console.log('SchedulerService started successfully');

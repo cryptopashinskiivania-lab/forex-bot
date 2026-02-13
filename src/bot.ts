@@ -286,6 +286,54 @@ bot.command('test', async (ctx) => {
   }
 });
 
+// Handle /test_daily – simulate morning digest for current user (for debugging)
+bot.command('test_daily', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    const userId = ctx.from.id;
+    await ctx.reply('📊 Тест утреннего дайджеста...');
+    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
+    const monitoredAssets = database.getMonitoredAssets(userId);
+    const userEventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    const { deliver: userEvents, skipped } = dataQualityService.filterForDelivery(
+      userEventsRaw,
+      { mode: 'general', nowUtc: new Date() }
+    );
+    if (skipped.length > 0) {
+      console.log(`[test_daily] ${skipped.length} events skipped by DataQuality`);
+    }
+    if (userEvents.length === 0) {
+      await ctx.reply('📅 Сегодня нет событий с высоким/средним влиянием для ваших активов.');
+      return;
+    }
+    const userTz = database.getTimezone(userId);
+    const lines = userEvents.map((e, i) => {
+      const n = i + 1;
+      const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
+      const time24 = formatTime24(e, userTz);
+      return `${n}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
+    });
+    const eventsText = `📅 События за сегодня:\n\n${lines.join('\n\n')}`;
+    await ctx.reply(eventsText);
+    const eventsForAnalysis = userEvents.map(e => {
+      const time24 = formatTime24(e, userTz);
+      const parts = [`${time24} - [${e.currency}] ${e.title} (${e.impact})`];
+      if (e.forecast && e.forecast !== '—') parts.push(`Прогноз: ${e.forecast}`);
+      if (e.previous && e.previous !== '—') parts.push(`Предыдущее: ${e.previous}`);
+      if (e.actual && e.actual !== '—') parts.push(`Факт: ${e.actual}`);
+      return parts.join(' | ');
+    }).join('\n');
+    const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
+    await ctx.reply(`📊 Детальный анализ дня:\n\n${analysis}`, { parse_mode: 'Markdown' });
+  } catch (error) {
+    console.error('[test_daily] Error:', error);
+    await ctx.reply(`❌ Ошибка: ${error instanceof Error ? error.message : String(error)}`);
+  }
+});
+
 // Handle /daily command – fetch and display today's events with optional AI analysis
 bot.command('daily', async (ctx) => {
   console.log('[Bot] /daily command received');
