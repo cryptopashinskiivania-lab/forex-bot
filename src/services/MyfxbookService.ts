@@ -30,6 +30,18 @@ function isEmpty(s: string): boolean {
   return !t || t === '—' || t === '-' || t === '';
 }
 
+/** Returns true if the error is due to browser closed or navigation timeout (e.g. during pm2 reload). */
+function isBrowserClosedOrTimeout(error: unknown): boolean {
+  if (error instanceof Error) {
+    const msg = (error.message || '').toLowerCase();
+    if (msg.includes('target page, context or browser has been closed')) return true;
+    if (msg.includes('browser has been closed')) return true;
+    if (error.name === 'TimeoutError') return true;
+    if (msg.includes('timeout') && msg.includes('exceeded')) return true;
+  }
+  return false;
+}
+
 function isSpecialTimeString(timeStr: string): boolean {
   const t = timeStr.trim().toLowerCase();
   return (
@@ -190,14 +202,15 @@ export class MyfxbookService {
   }
 
   /**
-   * Fetch HTML using Playwright to bypass Cloudflare protection
+   * Fetch HTML using Playwright to bypass Cloudflare protection.
+   * On browser closed or timeout returns '' so caller gets no events without crashing.
    */
   private async fetchHTML(url: string): Promise<string> {
-    const browser = await this.getBrowser();
+    let context: Awaited<ReturnType<Browser['newContext']>> | null = null;
     let page: Page | null = null;
-
     try {
-      const context = await browser.newContext({
+      const browser = await this.getBrowser();
+      context = await browser.newContext({
         userAgent:
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         viewport: { width: 1920, height: 1080 },
@@ -208,52 +221,39 @@ export class MyfxbookService {
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         },
       });
-
       page = await context.newPage();
-
       console.log(`[MyfxbookService] Navigating to ${url}...`);
-      
-      // Navigate to page with reduced timeout
       await page.goto(url, {
         waitUntil: 'domcontentloaded',
-        timeout: 15000, // Reduced from 30s to 15s
+        timeout: 25000,
       });
-
-      // Wait for calendar data to load with reduced timeout
       console.log('[MyfxbookService] Waiting for calendar data...');
-      // Myfxbook might load data dynamically, so wait for either table or data elements
       await Promise.race([
-        page.waitForSelector('table', { timeout: 10000 }), // Reduced from 20s to 10s
+        page.waitForSelector('table', { timeout: 10000 }),
         page.waitForSelector('.calendar-row', { timeout: 10000 }),
-        page.waitForTimeout(3000), // Reduced fallback from 5s to 3s
+        page.waitForTimeout(3000),
       ]).catch(() => {
         console.warn('[MyfxbookService] Timeout waiting for calendar elements, continuing anyway...');
       });
-
-      // Reduced additional wait from 2s to 1s
       await page.waitForTimeout(1000);
-
-      // Get page content
       const html = await page.content();
       console.log('[MyfxbookService] Successfully fetched HTML');
-
-      // Close page and context
       await page.close();
       await context.close();
-
       return html;
     } catch (error) {
-      console.error('[MyfxbookService] Error fetching HTML:', error);
-      
-      // Cleanup on error
-      if (page) {
-        try {
-          await page.close();
-        } catch (e) {
-          // Ignore cleanup errors
-        }
+      if (isBrowserClosedOrTimeout(error)) {
+        this.browser = null;
+        console.warn('[MyfxbookService] Browser closed or timeout during fetch, returning no data');
+        return '';
       }
-      
+      console.error('[MyfxbookService] Error fetching HTML:', error);
+      if (page) {
+        try { await page.close(); } catch (_) { /* ignore */ }
+      }
+      if (context) {
+        try { await context.close(); } catch (_) { /* ignore */ }
+      }
       throw new Error(`Failed to fetch Myfxbook calendar: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
@@ -267,10 +267,22 @@ export class MyfxbookService {
     }
 
     console.log(`[MyfxbookService] Cache miss or expired for ${url}, fetching fresh data...`);
-    
+    let html: string;
     try {
-      const html = await this.fetchHTML(url);
-
+      html = await this.fetchHTML(url);
+    } catch (error) {
+      if (isBrowserClosedOrTimeout(error)) {
+        this.browser = null;
+        console.warn('[MyfxbookService] Browser closed or timeout in fetchEvents, returning no data');
+        return [];
+      }
+      throw error;
+    }
+    if (!html) {
+      console.warn('[MyfxbookService] Empty HTML (browser closed/timeout), returning no data');
+      return [];
+    }
+    try {
       const $ = cheerio.load(html);
       const events: CalendarEvent[] = [];
       

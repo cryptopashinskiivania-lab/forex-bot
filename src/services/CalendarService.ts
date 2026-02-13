@@ -42,6 +42,18 @@ function isEmpty(s: string): boolean {
   return !t || t === '—' || t === '-';
 }
 
+/** Returns true if the error is due to browser closed or navigation timeout (e.g. during pm2 reload). */
+function isBrowserClosedOrTimeout(error: unknown): boolean {
+  if (error instanceof Error) {
+    const msg = (error.message || '').toLowerCase();
+    if (msg.includes('target page, context or browser has been closed')) return true;
+    if (msg.includes('browser has been closed')) return true;
+    if (error.name === 'TimeoutError') return true;
+    if (msg.includes('timeout') && msg.includes('exceeded')) return true;
+  }
+  return false;
+}
+
 function isSpecialTimeString(timeStr: string): boolean {
   const t = timeStr.trim().toLowerCase();
   return (
@@ -198,22 +210,33 @@ export class CalendarService {
     
     // Detect timezone from ForexFactory
     console.log('[CalendarService] Detecting timezone from ForexFactory...');
-    const browser = await this.getBrowser();
-    const page = await browser.newPage({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      viewport: { width: 1920, height: 1080 },
-      locale: 'en-US',
-    });
-    
     try {
-      const timezone = await this.detectForexFactoryTimezone(page);
-      // Cache the result
-      this.detectedTimezone = timezone;
-      this.timezoneDetectionTime = now;
-      console.log(`[CalendarService] Timezone detected and cached: ${timezone}`);
-      return timezone;
-    } finally {
-      await page.close();
+      const browser = await this.getBrowser();
+      const page = await browser.newPage({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        viewport: { width: 1920, height: 1080 },
+        locale: 'en-US',
+      });
+      try {
+        const timezone = await this.detectForexFactoryTimezone(page);
+        this.detectedTimezone = timezone;
+        this.timezoneDetectionTime = now;
+        console.log(`[CalendarService] Timezone detected and cached: ${timezone}`);
+        return timezone;
+      } finally {
+        try {
+          await page.close();
+        } catch (e) {
+          if (isBrowserClosedOrTimeout(e)) this.browser = null;
+        }
+      }
+    } catch (error) {
+      if (isBrowserClosedOrTimeout(error)) {
+        this.browser = null;
+        console.warn('[CalendarService] Browser closed or timeout during timezone detection, using default');
+        return 'Europe/Kiev';
+      }
+      throw error;
     }
   }
 
@@ -280,32 +303,41 @@ export class CalendarService {
   /**
    * Fetch HTML using Playwright to bypass Cloudflare
    * Note: ForexFactory ignores browser timezone and uses user's session timezone
+   * On browser closed or timeout returns '' so caller can return [] without crashing.
    */
   private async fetchHTML(url: string): Promise<string> {
-    const browser = await this.getBrowser();
-    const page: Page = await browser.newPage({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      viewport: { width: 1920, height: 1080 },
-      locale: 'en-US',
-    });
-
     try {
-      console.log(`[CalendarService] Navigating to ${url}...`);
-      await page.goto(url, { 
-        waitUntil: 'domcontentloaded',
-        timeout: 30000 
+      const browser = await this.getBrowser();
+      const page: Page = await browser.newPage({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        viewport: { width: 1920, height: 1080 },
+        locale: 'en-US',
       });
-      
-      // Wait for the calendar table to load
-      console.log('[CalendarService] Waiting for calendar data...');
-      await page.waitForSelector('table.calendar__table', { timeout: 10000 });
-      
-      const html = await page.content();
-      console.log('[CalendarService] Successfully fetched HTML');
-      
-      return html;
-    } finally {
-      await page.close();
+      try {
+        console.log(`[CalendarService] Navigating to ${url}...`);
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+        console.log('[CalendarService] Waiting for calendar data...');
+        await page.waitForSelector('table.calendar__table', { timeout: 10000 });
+        const html = await page.content();
+        console.log('[CalendarService] Successfully fetched HTML');
+        return html;
+      } finally {
+        try {
+          await page.close();
+        } catch (e) {
+          if (isBrowserClosedOrTimeout(e)) this.browser = null;
+        }
+      }
+    } catch (error) {
+      if (isBrowserClosedOrTimeout(error)) {
+        this.browser = null;
+        console.warn('[CalendarService] Browser closed or timeout during fetch, returning no data');
+        return '';
+      }
+      throw error;
     }
   }
 
@@ -318,14 +350,24 @@ export class CalendarService {
     }
 
     console.log(`[CalendarService] Cache miss or expired for ${url}, fetching fresh data...`);
-    
-    // IMPORTANT: Detect ForexFactory timezone BEFORE fetching HTML
-    // ForexFactory shows times in user's configured timezone (from session/cookies)
-    const sourceTimezone = await this.getForexFactoryTimezone();
+    let sourceTimezone: string;
+    let html: string;
+    try {
+      sourceTimezone = await this.getForexFactoryTimezone();
+      html = await this.fetchHTML(url);
+    } catch (error) {
+      if (isBrowserClosedOrTimeout(error)) {
+        this.browser = null;
+        console.warn('[CalendarService] Browser closed or timeout in fetchEvents, returning no data');
+        return [];
+      }
+      throw error;
+    }
+    if (!html) {
+      console.warn('[CalendarService] Empty HTML (browser closed/timeout), returning no data');
+      return [];
+    }
     console.log(`[CalendarService] Using source timezone: ${sourceTimezone}`);
-    
-    const html = await this.fetchHTML(url);
-
     const $ = cheerio.load(html);
     const events: CalendarEvent[] = [];
     // Base date in detected source timezone
