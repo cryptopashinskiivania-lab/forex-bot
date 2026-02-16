@@ -240,8 +240,10 @@ export class SchedulerService {
 
       console.log(`[Scheduler] Processing notifications for ${users.length} user(s)`);
 
-      const BATCH_SIZE = 40;
-      const BATCH_DELAY_MS = 150;
+      // Process one user at a time: CalendarService/MyfxbookService use a single shared browser.
+      // Parallel calls caused "Target page, context or browser has been closed" (PM2 error log).
+      const BATCH_SIZE = 1;
+      const BATCH_DELAY_MS = 0;
 
       for (let i = 0; i < users.length; i += BATCH_SIZE) {
         const chunk = users.slice(i, i + BATCH_SIZE);
