@@ -10,7 +10,7 @@ import { RssService, RssNewsItem } from './RssService';
 import { DataQualityService } from './DataQualityService';
 import { env } from '../config/env';
 import { database } from '../db/database';
-import { aggregateCoreEvents } from '../utils/eventAggregation';
+import { fetchSharedCalendarToday, getEventsForUserFromShared } from '../utils/eventAggregation';
 import { isPlaceholderActual } from '../utils/calendarValue';
 
 const CURRENCY_FLAGS: Record<string, string> = {
@@ -240,10 +240,11 @@ export class SchedulerService {
 
       console.log(`[Scheduler] Processing notifications for ${users.length} user(s)`);
 
-      // Process one user at a time: CalendarService/MyfxbookService use a single shared browser.
-      // Parallel calls caused "Target page, context or browser has been closed" (PM2 error log).
-      const BATCH_SIZE = 1;
-      const BATCH_DELAY_MS = 0;
+      // Fetch calendar once per run (2 browser calls), then distribute to all users (no browser per user).
+      const shared = await fetchSharedCalendarToday(this.calendarService, this.myfxbookService);
+
+      const BATCH_SIZE = 40;
+      const BATCH_DELAY_MS = 150;
 
       for (let i = 0; i < users.length; i += BATCH_SIZE) {
         const chunk = users.slice(i, i + BATCH_SIZE);
@@ -254,12 +255,7 @@ export class SchedulerService {
               const monitoredAssets = database.getMonitoredAssets(userId);
               const isRssEnabled = database.isRssEnabled(userId);
 
-              const events = await aggregateCoreEvents(
-                this.calendarService,
-                this.myfxbookService,
-                userId,
-                false
-              );
+              const events = getEventsForUserFromShared(shared, userId);
 
               const userEventsRaw = events.filter((e) => monitoredAssets.includes(e.currency));
 
@@ -464,6 +460,7 @@ export class SchedulerService {
             console.log('[Scheduler] Daily digest: no users');
             return;
           }
+          const shared = await fetchSharedCalendarToday(this.calendarService, this.myfxbookService);
           let sentCount = 0;
           let skippedCount = 0;
           for (const user of users) {
@@ -492,7 +489,7 @@ export class SchedulerService {
             }
             console.log(`[Scheduler] Running daily news at 08:00 for user ${user.user_id} (${userTz})...`);
           try {
-            const events = await aggregateCoreEvents(this.calendarService, this.myfxbookService, user.user_id, false);
+            const events = getEventsForUserFromShared(shared, user.user_id);
             const monitoredAssets = database.getMonitoredAssets(user.user_id);
             const userEventsRaw = events.filter(e => monitoredAssets.includes(e.currency));
             const { deliver: userEvents, skipped } = this.dataQualityService.filterForDelivery(

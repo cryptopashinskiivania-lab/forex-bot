@@ -437,6 +437,14 @@ export class MyfxbookService {
   }
 
   /**
+   * Get today's events from the calendar page without timezone filter.
+   * Used by scheduler to fetch once and then filter per user in getEventsForUserFromShared.
+   */
+  async getEventsForTodayRaw(): Promise<CalendarEvent[]> {
+    return this.fetchEvents(CALENDAR_URL_TODAY);
+  }
+
+  /**
    * Get today's events. Optional userTimezone: if provided, "today" is in user's timezone (for multi-user bot).
    */
   async getEventsForToday(userTimezone?: string): Promise<CalendarEvent[]> {

@@ -43,6 +43,100 @@ function isEmpty(s: string): boolean {
   return !t || t === '—' || t === '-';
 }
 
+/** Shared calendar data: one fetch per source per run, then filter per user. */
+export interface SharedCalendarToday {
+  forexFactory: CalendarEvent[];
+  myfxbook: CalendarEvent[];
+}
+
+/**
+ * Filter events to those that fall on "today" or "tomorrow" in the given timezone.
+ */
+function filterEventsToUserDay(
+  events: CalendarEvent[],
+  userTz: string,
+  forTomorrow: boolean
+): CalendarEvent[] {
+  const dayStart = forTomorrow
+    ? dayjs.tz(dayjs(), userTz).add(1, 'day').startOf('day')
+    : dayjs.tz(dayjs(), userTz).startOf('day');
+  const dayEnd = forTomorrow
+    ? dayjs.tz(dayjs(), userTz).add(1, 'day').endOf('day')
+    : dayjs.tz(dayjs(), userTz).endOf('day');
+  return events.filter((event) => {
+    if (!event.timeISO) return true;
+    const t = dayjs(event.timeISO);
+    return (t.isAfter(dayStart) || t.isSame(dayStart)) && (t.isBefore(dayEnd) || t.isSame(dayEnd));
+  });
+}
+
+/**
+ * Fetch calendar data once per run (2 browser calls total).
+ * Used by scheduler so 400 users don't trigger 400 fetches.
+ */
+export async function fetchSharedCalendarToday(
+  calendarService: CalendarService,
+  myfxbookService: MyfxbookService
+): Promise<SharedCalendarToday> {
+  const [forexFactory, myfxbook] = await Promise.all([
+    calendarService.getEventsForToday().catch((err) => {
+      console.error('[EventAggregation] Error fetching ForexFactory for shared calendar:', err);
+      return [];
+    }),
+    myfxbookService.getEventsForTodayRaw().catch((err) => {
+      console.error('[EventAggregation] Error fetching Myfxbook for shared calendar:', err);
+      return [];
+    }),
+  ]);
+  if (process.env.LOG_LEVEL === 'debug') {
+    console.log(`[EventAggregation] Shared fetch: FF=${forexFactory.length}, Myfxbook=${myfxbook.length}`);
+  }
+  return { forexFactory, myfxbook };
+}
+
+/**
+ * Get events for one user from pre-fetched shared data (no browser calls).
+ * Filters by user timezone "today", news source preference, dedupes within source.
+ */
+export function getEventsForUserFromShared(
+  shared: SharedCalendarToday,
+  userId: number
+): CalendarEvent[] {
+  const newsSource = database.getNewsSource(userId);
+  const userTz = database.getTimezone(userId);
+
+  const ffFiltered = filterEventsToUserDay(shared.forexFactory, userTz, false);
+  const mbFiltered = filterEventsToUserDay(shared.myfxbook, userTz, false);
+
+  const fetchForexFactory = newsSource === 'ForexFactory' || newsSource === 'Both';
+  const fetchMyfxbook = newsSource === 'Myfxbook' || newsSource === 'Both';
+
+  const allEvents: CalendarEvent[] = [];
+  if (fetchForexFactory) allEvents.push(...ffFiltered);
+  if (fetchMyfxbook) allEvents.push(...mbFiltered);
+
+  const deduplicationMap = new Map<string, CalendarEvent>();
+  const seenKeys = new Set<string>();
+  for (const event of allEvents) {
+    const key = deduplicationKey(event);
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key);
+      deduplicationMap.set(key, event);
+    } else {
+      const existing = deduplicationMap.get(key);
+      if (existing) {
+        const existingHasData = !isPlaceholderActual(existing.actual) || !isEmpty(existing.forecast);
+        const currentHasData = !isPlaceholderActual(event.actual) || !isEmpty(event.forecast);
+        const shouldReplace =
+          (currentHasData && !existingHasData) ||
+          (event.impact === 'High' && existing.impact !== 'High');
+        if (shouldReplace) deduplicationMap.set(key, event);
+      }
+    }
+  }
+  return Array.from(deduplicationMap.values());
+}
+
 /**
  * Generate deduplication key based on source, time, currency AND title
  * Used to detect duplicate events WITHIN THE SAME source only
