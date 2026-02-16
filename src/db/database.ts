@@ -1,7 +1,10 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 
-const db = new Database(path.join(process.cwd(), 'bot.db'));
+// Use project root (src/db -> .. -> ..) so DB path does not depend on process.cwd() (PM2/backup-safe)
+const projectRoot = path.resolve(__dirname, '..', '..');
+const dbPath = path.join(projectRoot, 'bot.db');
+const db = new Database(dbPath);
 
 // Create tables if not exists
 db.exec(`
@@ -59,6 +62,8 @@ export interface User {
 }
 
 export const database = {
+  getDbPath: (): string => dbPath,
+
   // User management
   registerUser: (userId: number, username?: string, firstName?: string, lastName?: string): void => {
     db.prepare(`

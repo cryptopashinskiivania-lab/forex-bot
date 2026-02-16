@@ -124,6 +124,14 @@ const bot = new Bot(env.BOT_TOKEN);
 
 database.cleanup();
 
+// Startup diagnostic for notifications (cwd/DB path matter after PM2 or backup)
+console.log(
+  '[Startup] cwd=%s | db=%s | users=%d',
+  process.cwd(),
+  database.getDbPath(),
+  database.getUserCount()
+);
+
 // Initialize message queue (must be done before scheduler starts)
 initializeQueue(bot);
 

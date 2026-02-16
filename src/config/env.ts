@@ -1,7 +1,9 @@
 import dotenv from 'dotenv';
+import path from 'path';
 
-// Load environment variables
-dotenv.config();
+// Load .env from project root so it works regardless of process.cwd() (PM2/backup-safe)
+const projectRoot = path.resolve(__dirname, '..', '..');
+dotenv.config({ path: path.join(projectRoot, '.env') });
 
 interface EnvConfig {
   BOT_TOKEN: string;
