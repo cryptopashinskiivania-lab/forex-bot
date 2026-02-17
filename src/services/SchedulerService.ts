@@ -91,6 +91,57 @@ function hasRealActual(actual: string): boolean {
 }
 
 /**
+ * Log notification send failure with structured data for monitoring.
+ * Does NOT call database.markAsSent() — failed notifications remain unmarked for retry on next cron run.
+ * Special handling: Telegram "bot was blocked by the user" (403) is logged as warning and returns early.
+ */
+function logNotificationSendError(
+  notificationType: 'event' | 'reminder' | 'result' | 'rss' | 'daily',
+  userId: number,
+  eventId: string,
+  error: unknown,
+  context?: { title?: string; currency?: string }
+): void {
+  const errMsg = error instanceof Error ? error.message : String(error);
+
+  // Telegram 403 "bot was blocked by the user" — log as warning, return early to avoid spam
+  if (errMsg.toLowerCase().includes('bot was blocked by the user')) {
+    const payload = {
+      level: 'warning',
+      source: 'SchedulerService',
+      type: 'user_blocked_bot',
+      notificationType,
+      userId,
+      eventId,
+      ...(context?.title && { eventTitle: context.title }),
+      ...(context?.currency && { currency: context.currency }),
+      timestamp: new Date().toISOString(),
+    };
+    console.warn('[Scheduler] User blocked bot (notification skipped):', JSON.stringify(payload));
+    return;
+  }
+
+  const errStack = error instanceof Error ? error.stack : undefined;
+  const payload = {
+    level: 'error',
+    source: 'SchedulerService',
+    type: 'notification_send_failed',
+    notificationType,
+    userId,
+    eventId,
+    ...(context?.title && { eventTitle: context.title }),
+    ...(context?.currency && { currency: context.currency }),
+    errorMessage: errMsg,
+    stack: errStack,
+    timestamp: new Date().toISOString(),
+  };
+  console.error('[Scheduler] Notification send failed:', JSON.stringify(payload));
+  if (errStack) {
+    console.error('[Scheduler] Stack trace:', errStack);
+  }
+}
+
+/**
  * Format event time to 24-hour (HH:mm) in the given timezone
  */
 function formatTime24(event: CalendarEvent, timezone: string): string {
@@ -288,7 +339,10 @@ export class SchedulerService {
                     eventsSent++;
                     console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
                   } catch (err) {
-                    console.error(`[Scheduler] Error sending event to user ${userId}:`, err);
+                    logNotificationSendError('event', userId, eventId, err, {
+                      title: event.title,
+                      currency: event.currency,
+                    });
                   }
                   continue;
                 }
@@ -327,7 +381,10 @@ export class SchedulerService {
                         `[Scheduler] Reminder sent to user ${userId}: ${event.title} (in ${REMINDER_MINUTES_BEFORE} min)`
                       );
                     } catch (err) {
-                      console.error(`[Scheduler] Error sending reminder to user ${userId}:`, err);
+                      logNotificationSendError('reminder', userId, eventId, err, {
+                        title: event.title,
+                        currency: event.currency,
+                      });
                     }
                   }
                 }
@@ -368,7 +425,10 @@ export class SchedulerService {
                           `[Scheduler] Result sent to user ${userId}: ${event.title} (actual: ${event.actual})`
                         );
                       } catch (err) {
-                        console.error(`[Scheduler] Error sending result to user ${userId}:`, err);
+                        logNotificationSendError('result', userId, resultId, err, {
+                          title: event.title,
+                          currency: event.currency,
+                        });
                       }
                     }
                   }
@@ -423,7 +483,9 @@ export class SchedulerService {
                       rssSent++;
                       console.log(`[Scheduler] RSS sent to user ${userId}: ${item.title}`);
                     } catch (err) {
-                      console.error(`[Scheduler] Error sending RSS to user ${userId}:`, err);
+                      logNotificationSendError('rss', userId, rssId, err, {
+                        title: item.title,
+                      });
                     }
                   }
                 }
@@ -455,7 +517,9 @@ export class SchedulerService {
                     `[Scheduler] Daily (08:00, same as /daily) sent to user ${userId}`
                   );
                 } catch (err) {
-                  console.error(`[Scheduler] Error sending daily to user ${userId}:`, err);
+                  logNotificationSendError('daily', userId, dailySummaryId, err, {
+                    title: 'Daily Summary',
+                  });
                 }
               }
 

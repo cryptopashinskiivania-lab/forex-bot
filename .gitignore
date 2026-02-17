@@ -23,6 +23,7 @@ dist/
 
 # Logs
 *.log
+logs*.txt
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
