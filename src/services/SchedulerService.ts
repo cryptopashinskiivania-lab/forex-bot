@@ -2,7 +2,7 @@ import * as cron from 'node-cron';
 import crypto from 'crypto';
 import { Bot } from 'grammy';
 import { toZonedTime } from 'date-fns-tz';
-import { parseISO, format } from 'date-fns';
+import { parseISO, format, subMinutes, addMinutes } from 'date-fns';
 import { CalendarService, CalendarEvent } from './CalendarService';
 import { MyfxbookService } from './MyfxbookService';
 import { AnalysisService, AnalysisResult } from './AnalysisService';
@@ -34,6 +34,11 @@ function md5(str: string): string {
 function itemId(title: string, time: string): string {
   return md5(title + time);
 }
+
+/** За сколько минут до события с временем отправлять напоминание */
+const REMINDER_MINUTES_BEFORE = 15;
+/** Через сколько минут после времени события отправлять результат (чтобы календарь успел обновиться) */
+const RESULT_MINUTES_AFTER = 5;
 
 function getSentimentEmoji(sentiment: 'Pos' | 'Neg' | 'Neutral'): string {
   if (sentiment === 'Pos') return '🟢';
@@ -209,6 +214,9 @@ export class SchedulerService {
       console.log(`[Scheduler] Processing notifications for ${users.length} user(s)`);
 
       const shared = await fetchSharedCalendarToday(this.calendarService, this.myfxbookService);
+      console.log(
+        `[Scheduler] Shared calendar: ForexFactory=${shared.forexFactory.length} Myfxbook=${shared.myfxbook.length}`
+      );
 
       const BATCH_SIZE = 40;
       const BATCH_DELAY_MS = 150;
@@ -229,6 +237,9 @@ export class SchedulerService {
                 { mode: 'general', nowUtc: new Date() }
               );
 
+              const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
+              const quiet = isQuietHours(userId);
+
               let eventsSent = 0;
               let rssSent = 0;
 
@@ -241,10 +252,46 @@ export class SchedulerService {
               for (const event of userEvents) {
                 const time = event.timeISO || event.time;
                 const id = itemId(event.title, time);
+                const eventId = `event_${userId}_${id}`;
+                const alreadySent = database.hasSent(eventId);
 
-                if (!event.timeISO && !isQuietHours(userId)) {
-                  const eventId = `event_${userId}_${id}`;
-                  if (!database.hasSent(eventId)) {
+                if (!event.timeISO && !quiet && !alreadySent) {
+                  try {
+                    const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                    const result = await this.analysisService.analyzeNews(
+                      text,
+                      event.source || 'ForexFactory'
+                    );
+                    const emoji = scoreEmoji(result.score);
+                    const header = this.getHeader(false);
+                    const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                    const msg = this.formatMessage(
+                      header,
+                      flag,
+                      event.currency,
+                      event.title,
+                      event.source || 'ForexFactory',
+                      result.score,
+                      emoji,
+                      event.actual,
+                      event.forecast,
+                      result
+                    );
+                    await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                    database.markAsSent(eventId);
+                    eventsSent++;
+                    console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
+                  } catch (err) {
+                    console.error(`[Scheduler] Error sending event to user ${userId}:`, err);
+                  }
+                  continue;
+                }
+
+                if (event.timeISO && !quiet && !alreadySent) {
+                  const eventTime = parseISO(event.timeISO);
+                  const now = new Date();
+                  const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
+                  if (now >= reminderFrom && now <= eventTime) {
                     try {
                       const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
                       const result = await this.analysisService.analyzeNews(
@@ -269,15 +316,58 @@ export class SchedulerService {
                       await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
                       database.markAsSent(eventId);
                       eventsSent++;
-                      console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
+                      console.log(
+                        `[Scheduler] Reminder sent to user ${userId}: ${event.title} (in ${REMINDER_MINUTES_BEFORE} min)`
+                      );
                     } catch (err) {
-                      console.error(`[Scheduler] Error sending event to user ${userId}:`, err);
+                      console.error(`[Scheduler] Error sending reminder to user ${userId}:`, err);
+                    }
+                  }
+                }
+
+                if (event.timeISO && !quiet && hasRealActual(event.actual)) {
+                  const resultId = `result_${userId}_${id}`;
+                  if (!database.hasSent(resultId)) {
+                    const eventTime = parseISO(event.timeISO);
+                    const now = new Date();
+                    const resultFrom = addMinutes(eventTime, RESULT_MINUTES_AFTER);
+                    if (now >= resultFrom) {
+                      try {
+                        const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                        const analysisResult = await this.analysisService.analyzeNews(
+                          text,
+                          event.source || 'ForexFactory'
+                        );
+                        const emoji = scoreEmoji(analysisResult.score);
+                        const header = '📊 РЕЗУЛЬТАТ';
+                        const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                        const msg = this.formatMessage(
+                          header,
+                          flag,
+                          event.currency,
+                          event.title,
+                          event.source || 'ForexFactory',
+                          analysisResult.score,
+                          emoji,
+                          event.actual,
+                          event.forecast,
+                          analysisResult
+                        );
+                        await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                        database.markAsSent(resultId);
+                        eventsSent++;
+                        console.log(
+                          `[Scheduler] Result sent to user ${userId}: ${event.title} (actual: ${event.actual})`
+                        );
+                      } catch (err) {
+                        console.error(`[Scheduler] Error sending result to user ${userId}:`, err);
+                      }
                     }
                   }
                 }
               }
 
-              if (isRssEnabled && !isQuietHours(userId)) {
+              if (isRssEnabled && !quiet) {
                 const rssItems = await this.rssService.getLatestNews().catch(() => []);
 
                 for (const item of rssItems) {
@@ -332,9 +422,13 @@ export class SchedulerService {
               }
 
               const totalSent = eventsSent + rssSent;
-              if (totalSent > 0 || userEvents.length > 0) {
+              if (totalSent > 0) {
                 console.log(
                   `[Scheduler] User ${userId}: events=${userEvents.length} sent: events=${eventsSent} rss=${rssSent}`
+                );
+              } else if (userEvents.length > 0 || isRssEnabled) {
+                console.log(
+                  `[Scheduler] User ${userId}: events=${userEvents.length} (without time: ${eventsWithoutTime.length}) quiet=${quiet} sent=0`
                 );
               }
             } catch (error) {
@@ -349,6 +443,7 @@ export class SchedulerService {
           await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
         }
       }
+      console.log('[Scheduler] Scheduled check finished.');
     } catch (err) {
       console.error('[Scheduler] Error in scheduled check:', err);
     }
