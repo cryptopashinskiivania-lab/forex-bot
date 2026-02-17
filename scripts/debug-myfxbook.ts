@@ -1,9 +1,9 @@
-import { MyfxbookService } from '../src/services/MyfxbookService';
+import { MyfxbookRssService } from '../src/services/MyfxbookRssService';
 
 async function debugMyfxbook() {
-  console.log('=== Myfxbook Debug ===\n');
+  console.log('=== Myfxbook RSS Debug ===\n');
   
-  const service = new MyfxbookService();
+  const service = new MyfxbookRssService();
   
   try {
     console.log('Fetching Myfxbook events for today...\n');

@@ -1,7 +1,8 @@
 import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { InlineKeyboard } from 'grammy';
-import { CalendarEvent } from '../services/CalendarService';
+import { CalendarEvent } from '../types/calendar';
+import { stripRedundantCountryPrefix } from './eventTitleFormat';
 
 const ASSET_FLAGS: Record<string, string> = {
   USD: '🇺🇸',
@@ -81,7 +82,8 @@ export function buildDailyMessage(
       eventNumber++;
       const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
       const time24 = formatTime24(e, userTz);
-      return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
+      const title = stripRedundantCountryPrefix(e.currency, e.title);
+      return `${eventNumber}. ${impactEmoji} [${e.currency}] ${title}\n   🕐 ${time24}`;
     });
     eventsText += ffLines.join('\n\n') + '\n\n';
   }
@@ -92,7 +94,8 @@ export function buildDailyMessage(
       eventNumber++;
       const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
       const time24 = formatTime24(e, userTz);
-      return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
+      const title = stripRedundantCountryPrefix(e.currency, e.title);
+      return `${eventNumber}. ${impactEmoji} [${e.currency}] ${title}\n   🕐 ${time24}`;
     });
     eventsText += mbLines.join('\n\n');
   }

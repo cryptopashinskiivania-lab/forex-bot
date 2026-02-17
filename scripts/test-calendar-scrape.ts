@@ -1,16 +1,16 @@
 /**
- * Quick test: fetch ForexFactory calendar and log scraped events.
+ * Quick test: fetch ForexFactory calendar (CSV) and log events.
  * Run: npx ts-node scripts/test-calendar-scrape.ts
  */
-import { CalendarService } from '../src/services/CalendarService';
+import { ForexFactoryCsvService } from '../src/services/ForexFactoryCsvService';
 import { toZonedTime } from 'date-fns-tz';
 import { format, parseISO } from 'date-fns';
 
 async function main() {
-  const service = new CalendarService();
-  
+  const service = new ForexFactoryCsvService();
+
   try {
-    console.log('Fetching https://www.forexfactory.com/calendar?day=today ...\n');
+    console.log('Fetching https://nfs.faireconomy.media/ff_calendar_thisweek.csv (today filter)...\n');
     const events = await service.getEventsForToday();
     console.log(`Found ${events.length} events (USD/GBP/EUR/JPY/NZD/CAD/AUD/CHF, High/Medium impact):\n`);
     events.forEach((e, i) => {
@@ -31,11 +31,9 @@ async function main() {
     });
     
     console.log('\n=== Summary ===');
-    console.log('✅ Times are correctly parsed from America/New_York timezone (ForexFactory default)');
-    console.log('✅ UTC times are saved to database');
-    console.log('✅ Kyiv times are displayed to users');
+    console.log('✅ CSV parsed; times in America/New_York → UTC');
+    console.log('✅ High/Medium impact only; 3-min cache');
   } finally {
-    // Закрываем браузер и БД
     await service.close();
   }
 }

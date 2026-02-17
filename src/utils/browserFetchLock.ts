@@ -1,5 +1,5 @@
 /**
- * Global mutex for browser-based fetches (CalendarService, MyfxbookService).
+ * Global mutex for browser-based fetches (CalendarService / ForexFactory).
  * Ensures only one Playwright operation runs at a time to avoid:
  * - Dozens of concurrent browsers (timeouts, "browser has been closed")
  * - Resource exhaustion on scheduler + many /calendar commands.

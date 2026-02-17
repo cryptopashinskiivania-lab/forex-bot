@@ -1,12 +1,12 @@
 /**
  * Test Myfxbook parsing
  */
-import { MyfxbookService } from '../src/services/MyfxbookService';
+import { MyfxbookRssService } from '../src/services/MyfxbookRssService';
 import { toZonedTime } from 'date-fns-tz';
 import { format, parseISO } from 'date-fns';
 
 async function main() {
-  const service = new MyfxbookService();
+  const service = new MyfxbookRssService();
   
   try {
     console.log('Fetching Myfxbook calendar for today...\n');
@@ -29,7 +29,7 @@ async function main() {
     });
   } finally {
     await service.close();
-    console.log('✅ Browser closed');
+    console.log('✅ Done');
   }
 }
 

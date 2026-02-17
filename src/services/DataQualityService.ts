@@ -7,7 +7,7 @@
 
 import crypto from 'crypto';
 import { parseISO } from 'date-fns';
-import { CalendarEvent } from './CalendarService';
+import { CalendarEvent } from '../types/calendar';
 import {
   DataIssue,
   DataIssueType,
@@ -23,8 +23,10 @@ import { isPlaceholderActual } from '../utils/calendarValue';
 const VALIDATION_CONFIG = {
   // Time window for events: events should be within ±2 days from now
   MAX_DAYS_FROM_NOW: 2,
-  // Time threshold for "past too far" filter (in minutes)
-  PAST_EVENT_THRESHOLD_MINUTES: 30,
+  // Past threshold for scheduler: don't notify about events older than this (minutes)
+  PAST_THRESHOLD_SCHEDULER_MINUTES: 2 * 60, // 2 hours
+  // Past threshold for /daily, /tomorrow: show events up to this old (minutes)
+  PAST_THRESHOLD_DAILY_MINUTES: 24 * 60, // 24 hours
   // Valid impact values
   VALID_IMPACTS: ['High', 'Medium', 'Low'] as const,
   // Required fields for an event
@@ -311,6 +313,7 @@ export class DataQualityService {
    * 
    * @param events - Events to filter
    * @param options - Filter options
+   * @param options.forScheduler - If true (scheduler): drop events older than 2h. If false (/daily, /tomorrow): keep events up to 24h old.
    * @returns Object with events to deliver and skipped events
    */
   filterForDelivery(
@@ -318,9 +321,11 @@ export class DataQualityService {
     options: {
       mode?: 'reminder' | 'ai_forecast' | 'ai_results' | 'general';
       nowUtc?: Date;
+      /** true = scheduler (2h past cutoff), false = /daily /tomorrow (24h past cutoff). Only applies when mode is 'general'. */
+      forScheduler?: boolean;
     } = {}
   ): FilterResult<CalendarEvent> {
-    const { mode = 'general', nowUtc = new Date() } = options;
+    const { mode = 'general', nowUtc = new Date(), forScheduler = true } = options;
     const deliver: CalendarEvent[] = [];
     const skipped: DataIssue[] = [];
 
@@ -339,13 +344,15 @@ export class DataQualityService {
         if (mode === 'ai_results' && hasRealActualForTime) {
           // OK to include
         } else {
-          skipped.push({
+          const issue = {
             eventId,
             source: (event.source as 'ForexFactory' | 'Myfxbook') || 'ForexFactory',
-            type: 'NO_TIME',
+            type: 'NO_TIME' as const,
             message: `Event has no valid time: ${event.title}`,
             details: { event },
-          });
+          };
+          skipped.push(issue);
+          console.log(`[DataQualityService] Filtered out (NO_TIME): ${event.currency} "${event.title}" - ${issue.message}`);
           shouldSkip = true;
         }
       }
@@ -361,18 +368,26 @@ export class DataQualityService {
             !isEmpty(event.actual) &&
             !isPlaceholderActual(event.actual);
 
-          if (diffMinutes > VALIDATION_CONFIG.PAST_EVENT_THRESHOLD_MINUTES) {
+          const pastThresholdMinutes =
+            mode === 'general'
+              ? forScheduler
+                ? VALIDATION_CONFIG.PAST_THRESHOLD_SCHEDULER_MINUTES
+                : VALIDATION_CONFIG.PAST_THRESHOLD_DAILY_MINUTES
+              : VALIDATION_CONFIG.PAST_THRESHOLD_SCHEDULER_MINUTES; // non-general modes use scheduler threshold for any past check
+          if (diffMinutes > pastThresholdMinutes) {
             // Do not skip past events that have real actual data — scheduler sends them as "result" notification
             if (hasRealActual) {
               // Keep in deliver list for result notification
             } else {
-              skipped.push({
+              const issue = {
                 eventId,
                 source: (event.source as 'ForexFactory' | 'Myfxbook') || 'ForexFactory',
-                type: 'PAST_TOO_FAR',
+                type: 'PAST_TOO_FAR' as const,
                 message: `Event is too far in the past: ${diffMinutes.toFixed(0)} minutes ago`,
                 details: { timeISO: event.timeISO, diffMinutes },
-              });
+              };
+              skipped.push(issue);
+              console.log(`[DataQualityService] Filtered out (PAST_TOO_FAR): ${event.currency} "${event.title}" timeISO=${event.timeISO} - ${diffMinutes.toFixed(0)} min ago`);
               shouldSkip = true;
             }
           }
@@ -388,13 +403,15 @@ export class DataQualityService {
           try {
             const eventTime = parseISO(event.timeISO);
             if (eventTime.getTime() <= nowUtc.getTime()) {
-              skipped.push({
+              const issue = {
                 eventId,
                 source: (event.source as 'ForexFactory' | 'Myfxbook') || 'ForexFactory',
-                type: 'PAST_TOO_FAR',
+                type: 'PAST_TOO_FAR' as const,
                 message: `Event is not in future (AI Forecast requires future events)`,
                 details: { timeISO: event.timeISO },
-              });
+              };
+              skipped.push(issue);
+              console.log(`[DataQualityService] Filtered out (not in future, mode=ai_forecast): ${event.currency} "${event.title}" timeISO=${event.timeISO}`);
               shouldSkip = true;
             }
           } catch (error) {
@@ -408,17 +425,19 @@ export class DataQualityService {
         const hasRealActual = typeof event.actual === 'string' && !isEmpty(event.actual) && !isPlaceholderActual(event.actual);
         const hasForecast = !isEmpty(event.forecast);
         if (!hasRealActual || !hasForecast) {
-          skipped.push({
+          const issue = {
             eventId,
             source: (event.source as 'ForexFactory' | 'Myfxbook') || 'ForexFactory',
-            type: 'MISSING_REQUIRED_FIELD',
+            type: 'MISSING_REQUIRED_FIELD' as const,
             message: `Event missing actual or forecast data (AI Results requires both)`,
-            details: { 
+            details: {
               event,
               hasActual: hasRealActual,
               hasForecast,
             },
-          });
+          };
+          skipped.push(issue);
+          console.log(`[DataQualityService] Filtered out (AI Results: missing actual/forecast): ${event.currency} "${event.title}" hasActual=${hasRealActual} hasForecast=${hasForecast}`);
           shouldSkip = true;
         }
       }

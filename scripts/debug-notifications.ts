@@ -7,7 +7,7 @@ import 'dotenv/config';
 import { toZonedTime } from 'date-fns-tz';
 import { database } from '../src/db/database';
 import { CalendarService } from '../src/services/CalendarService';
-import { MyfxbookService } from '../src/services/MyfxbookService';
+import { MyfxbookRssService } from '../src/services/MyfxbookRssService';
 import { DataQualityService } from '../src/services/DataQualityService';
 import { aggregateCoreEvents } from '../src/utils/eventAggregation';
 
@@ -31,7 +31,7 @@ async function main() {
   }
 
   const calendarService = new CalendarService();
-  const myfxbookService = new MyfxbookService();
+  const myfxbookRssService = new MyfxbookRssService();
   const dataQualityService = new DataQualityService();
 
   try {
@@ -49,11 +49,12 @@ async function main() {
       console.log(`  Local time: ${hour}:${String(minute).padStart(2, '0')}`);
       console.log(`  Quiet hours (23-08): ${isQuietHours(userId)}`);
 
-      const events = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
+      const events = await aggregateCoreEvents(calendarService, myfxbookRssService, userId, false);
       const userEventsRaw = events.filter((e) => monitoredAssets.includes(e.currency));
       const { deliver: userEvents, skipped } = dataQualityService.filterForDelivery(userEventsRaw, {
         mode: 'general',
         nowUtc: now,
+        forScheduler: true,
       });
 
       console.log(`  Events: total=${events.length}, for assets=${userEventsRaw.length}, after filter=${userEvents.length}, skipped=${skipped.length}`);
@@ -75,7 +76,7 @@ async function main() {
     }
   } finally {
     await calendarService.close();
-    await myfxbookService.close();
+    await myfxbookRssService.close();
   }
   console.log('\n=== Done ===');
 }

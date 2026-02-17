@@ -1,5 +1,5 @@
 import { CalendarService } from '../src/services/CalendarService';
-import { MyfxbookService } from '../src/services/MyfxbookService';
+import { MyfxbookRssService } from '../src/services/MyfxbookRssService';
 import { aggregateCoreEvents } from '../src/utils/eventAggregation';
 import { database } from '../src/db/database';
 
@@ -15,11 +15,11 @@ async function debugAggregation() {
   database.setNewsSource(testUserId, 'Both'); // Use both sources
   
   const calendarService = new CalendarService();
-  const myfxbookService = new MyfxbookService();
+  const myfxbookRssService = new MyfxbookRssService();
   
   try {
     console.log('Fetching aggregated events...\n');
-    const events = await aggregateCoreEvents(calendarService, myfxbookService, testUserId, false);
+    const events = await aggregateCoreEvents(calendarService, myfxbookRssService, testUserId, false);
     
     console.log(`Total aggregated events: ${events.length}\n`);
     
@@ -53,7 +53,7 @@ async function debugAggregation() {
     console.error('Error:', error);
   } finally {
     await calendarService.close();
-    await myfxbookService.close();
+    await myfxbookRssService.close();
   }
 }
 

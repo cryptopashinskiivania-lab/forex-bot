@@ -3,8 +3,9 @@ import crypto from 'crypto';
 import { Bot } from 'grammy';
 import { toZonedTime } from 'date-fns-tz';
 import { parseISO, format, subMinutes, addMinutes } from 'date-fns';
-import { CalendarService, CalendarEvent } from './CalendarService';
-import { MyfxbookService } from './MyfxbookService';
+import { ForexFactoryCsvService } from './ForexFactoryCsvService';
+import { CalendarEvent } from '../types/calendar';
+import { MyfxbookRssService } from './MyfxbookRssService';
 import { AnalysisService, AnalysisResult } from './AnalysisService';
 import { RssService, RssNewsItem } from './RssService';
 import { DataQualityService } from './DataQualityService';
@@ -13,6 +14,7 @@ import { database } from '../db/database';
 import { fetchSharedCalendarToday, getEventsForUserFromShared } from '../utils/eventAggregation';
 import { isPlaceholderActual } from '../utils/calendarValue';
 import { buildDailyMessage, buildDailyKeyboard } from '../utils/dailyMessage';
+import { stripRedundantCountryPrefix } from '../utils/eventTitleFormat';
 
 const CURRENCY_FLAGS: Record<string, string> = {
   USD: '🇺🇸',
@@ -148,16 +150,16 @@ function isQuietHours(userId: number): boolean {
 }
 
 export class SchedulerService {
-  private calendarService: CalendarService;
-  private myfxbookService: MyfxbookService;
+  private forexFactoryService: ForexFactoryCsvService;
+  private myfxbookService: MyfxbookRssService;
   private analysisService: AnalysisService;
   private rssService: RssService;
   private dataQualityService: DataQualityService;
   private cronTasks: cron.ScheduledTask[] = [];
 
   constructor() {
-    this.calendarService = new CalendarService();
-    this.myfxbookService = new MyfxbookService();
+    this.forexFactoryService = new ForexFactoryCsvService();
+    this.myfxbookService = new MyfxbookRssService();
     this.analysisService = new AnalysisService();
     this.rssService = new RssService();
     this.dataQualityService = new DataQualityService();
@@ -216,7 +218,7 @@ export class SchedulerService {
 
       console.log(`[Scheduler] Processing notifications for ${users.length} user(s)`);
 
-      const shared = await fetchSharedCalendarToday(this.calendarService, this.myfxbookService);
+      const shared = await fetchSharedCalendarToday(this.forexFactoryService, this.myfxbookService);
       console.log(
         `[Scheduler] Shared calendar: ForexFactory=${shared.forexFactory.length} Myfxbook=${shared.myfxbook.length}`
       );
@@ -237,7 +239,7 @@ export class SchedulerService {
               const userEventsRaw = events.filter((e) => monitoredAssets.includes(e.currency));
               const { deliver: userEvents } = this.dataQualityService.filterForDelivery(
                 userEventsRaw,
-                { mode: 'general', nowUtc: new Date() }
+                { mode: 'general', nowUtc: new Date(), forScheduler: true }
               );
 
               const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
@@ -268,11 +270,12 @@ export class SchedulerService {
                     const emoji = scoreEmoji(result.score);
                     const header = this.getHeader(false);
                     const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                    const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
                     const msg = this.formatMessage(
                       header,
                       flag,
                       event.currency,
-                      event.title,
+                      displayTitle,
                       event.source || 'ForexFactory',
                       result.score,
                       emoji,
@@ -304,11 +307,12 @@ export class SchedulerService {
                       const emoji = scoreEmoji(result.score);
                       const header = this.getHeader(false);
                       const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                      const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
                       const msg = this.formatMessage(
                         header,
                         flag,
                         event.currency,
-                        event.title,
+                        displayTitle,
                         event.source || 'ForexFactory',
                         result.score,
                         emoji,
@@ -344,11 +348,12 @@ export class SchedulerService {
                         const emoji = scoreEmoji(analysisResult.score);
                         const header = '📊 РЕЗУЛЬТАТ';
                         const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                        const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
                         const msg = this.formatMessage(
                           header,
                           flag,
                           event.currency,
-                          event.title,
+                          displayTitle,
                           event.source || 'ForexFactory',
                           analysisResult.score,
                           emoji,
@@ -484,6 +489,7 @@ export class SchedulerService {
 
   start(bot: Bot): void {
     console.log('Starting SchedulerService with per-user timezone support...');
+    console.log('[Scheduler] MyFxBook calendar: using RSS feed (MyfxbookRssService)');
     console.log('[Scheduler] Multi-user mode: notifications (events, RSS) will be sent to all registered users based on their settings');
 
     // Check for events and RSS every 3 minutes; use UTC for predictable behavior
@@ -537,14 +543,14 @@ export class SchedulerService {
       lines.push(`\nUser ${userId}: tz=${tz} local=${localStr} тихий=${quiet}`);
     }
     try {
-      const shared = await fetchSharedCalendarToday(this.calendarService, this.myfxbookService);
+      const shared = await fetchSharedCalendarToday(this.forexFactoryService, this.myfxbookService);
       lines.push(`\nКалендарь: FF=${shared.forexFactory.length} Myfxbook=${shared.myfxbook.length}`);
       for (const user of users) {
         const userId = user.user_id;
         const events = getEventsForUserFromShared(shared, userId);
         const monitored = database.getMonitoredAssets(userId);
         const raw = events.filter((e) => monitored.includes(e.currency));
-        const { deliver: userEvents } = this.dataQualityService.filterForDelivery(raw, { mode: 'general', nowUtc: new Date() });
+        const { deliver: userEvents } = this.dataQualityService.filterForDelivery(raw, { mode: 'general', nowUtc: new Date(), forScheduler: true });
         const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
         lines.push(`\nUser ${userId}: событий после фильтров=${userEvents.length}, без времени (к отправке)=${eventsWithoutTime.length}`);
       }
@@ -566,8 +572,7 @@ export class SchedulerService {
     this.cronTasks = [];
     console.log('[Scheduler] All cron tasks stopped');
     
-    // Close both browsers (ForexFactory and Myfxbook now use Playwright)
-    await this.calendarService.close();
+    await this.forexFactoryService.close();
     await this.myfxbookService.close();
     console.log('[Scheduler] Services cleaned up');
   }

@@ -4,7 +4,7 @@
  */
 
 import { DataQualityService } from '../src/services/DataQualityService';
-import { CalendarEvent } from '../src/services/CalendarService';
+import { CalendarEvent } from '../src/types/calendar';
 
 // Simple test framework (no external dependencies)
 class TestRunner {
@@ -97,6 +97,7 @@ runner.test('should filter past events', () => {
   const { deliver, skipped } = dqs.filterForDelivery([pastEvent], {
     mode: 'general',
     nowUtc: new Date('2026-01-29T12:00:00Z'),
+    forScheduler: true,
   });
 
   expect(deliver.length).toBe(0);
@@ -339,6 +340,33 @@ runner.test('should filter non-future events in AI Forecast mode', () => {
   expect(deliver.length).toBe(0);
   expect(skipped.length).toBe(1);
   expect(skipped[0].type).toBe('PAST_TOO_FAR');
+});
+
+// Test 10b: /daily mode (forScheduler: false) delivers events up to 24h ago
+runner.test('should deliver event 3h ago when forScheduler is false', () => {
+  const dqs = new DataQualityService();
+  const event3hAgo: CalendarEvent = {
+    title: 'Event 3h Ago',
+    time: '09:00',
+    timeISO: '2026-01-29T09:00:00Z',
+    currency: 'USD',
+    impact: 'High',
+    source: 'ForexFactory',
+    forecast: '',
+    previous: '',
+    actual: '',
+    isResult: false,
+  };
+
+  const { deliver, skipped } = dqs.filterForDelivery([event3hAgo], {
+    mode: 'general',
+    nowUtc: new Date('2026-01-29T12:00:00Z'),
+    forScheduler: false,
+  });
+
+  expect(deliver.length).toBe(1);
+  expect(skipped.length).toBe(0);
+  expect(deliver[0].title).toBe('Event 3h Ago');
 });
 
 // Test 11: Check recommended fields

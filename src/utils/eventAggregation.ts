@@ -3,9 +3,16 @@ import { parseISO } from 'date-fns';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
-import { CalendarService, CalendarEvent } from '../services/CalendarService';
-import { MyfxbookService } from '../services/MyfxbookService';
+import { ForexFactoryCsvService } from '../services/ForexFactoryCsvService';
+import { CalendarEvent } from '../types/calendar';
 import { DataQualityService } from '../services/DataQualityService';
+
+/** Minimal interface for MyFxBook calendar (implemented by MyfxbookRssService). */
+export interface MyfxbookCalendarSource {
+  getEventsForTodayRaw(): Promise<CalendarEvent[]>;
+  getEventsForToday(userTimezone?: string): Promise<CalendarEvent[]>;
+  getEventsForTomorrow(userTimezone?: string): Promise<CalendarEvent[]>;
+}
 import { database } from '../db/database';
 import { isPlaceholderActual } from './calendarValue';
 
@@ -75,11 +82,11 @@ function filterEventsToUserDay(
  * Used by scheduler so 400 users don't trigger 400 fetches.
  */
 export async function fetchSharedCalendarToday(
-  calendarService: CalendarService,
-  myfxbookService: MyfxbookService
+  forexFactoryService: ForexFactoryCsvService,
+  myfxbookService: MyfxbookCalendarSource
 ): Promise<SharedCalendarToday> {
   const [forexFactory, myfxbook] = await Promise.all([
-    calendarService.getEventsForToday().catch((err) => {
+    forexFactoryService.getEventsForToday().catch((err) => {
       console.error('[EventAggregation] Error fetching ForexFactory for shared calendar:', err);
       return [];
     }),
@@ -90,6 +97,14 @@ export async function fetchSharedCalendarToday(
   ]);
   if (process.env.LOG_LEVEL === 'debug') {
     console.log(`[EventAggregation] Shared fetch: FF=${forexFactory.length}, Myfxbook=${myfxbook.length}`);
+  }
+  // Debug: log first 5 MyFxBook events (currency, title, time, timeISO) to diagnose filtering
+  if (myfxbook.length > 0) {
+    const sample = myfxbook.slice(0, 5);
+    console.log(`[EventAggregation] MyFxBook first ${sample.length} events:`);
+    sample.forEach((e, i) => {
+      console.log(`  [${i + 1}] currency=${e.currency} title="${e.title}" time=${e.time} timeISO=${e.timeISO ?? 'n/a'}`);
+    });
   }
   return { forexFactory, myfxbook };
 }
@@ -177,15 +192,15 @@ function deduplicationKey(event: CalendarEvent): string {
  * are displayed independently, even if they represent the same real-world event.
  * This is by design - each source is treated as an independent news provider.
  * 
- * @param calendarService - ForexFactory service instance
+ * @param forexFactoryService - ForexFactory CSV service instance
  * @param myfxbookService - Myfxbook service instance
  * @param userId - User ID to get news source preference
  * @param forTomorrow - If true, fetch tomorrow's events; otherwise today's
  * @returns Array of calendar events (deduplicated within each source)
  */
 export async function aggregateCoreEvents(
-  calendarService: CalendarService,
-  myfxbookService: MyfxbookService,
+  forexFactoryService: ForexFactoryCsvService,
+  myfxbookService: MyfxbookCalendarSource,
   userId: number,
   forTomorrow: boolean = false
 ): Promise<CalendarEvent[]> {
@@ -216,8 +231,8 @@ export async function aggregateCoreEvents(
 
     const forexFactoryEvents = fetchForexFactory
       ? await (forTomorrow
-          ? calendarService.getEventsForTomorrow()
-          : calendarService.getEventsForToday()
+          ? forexFactoryService.getEventsForTomorrow()
+          : forexFactoryService.getEventsForToday()
         ).catch(err => {
           console.error('[EventAggregation] Error fetching ForexFactory events:', err);
           return [];
@@ -318,7 +333,7 @@ export async function aggregateCoreEvents(
     console.error('[EventAggregation] Error aggregating Core events:', error);
     // Fallback to ForexFactory only if aggregation fails
     return forTomorrow
-      ? calendarService.getEventsForTomorrow().catch(() => [])
-      : calendarService.getEventsForToday().catch(() => []);
+      ? forexFactoryService.getEventsForTomorrow().catch(() => [])
+      : forexFactoryService.getEventsForToday().catch(() => []);
   }
 }

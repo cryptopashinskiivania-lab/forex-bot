@@ -2,8 +2,9 @@ import { Bot, InlineKeyboard } from 'grammy';
 import { env } from './config/env';
 import { database } from './db/database';
 import { AnalysisService } from './services/AnalysisService';
-import { CalendarService, CalendarEvent } from './services/CalendarService';
-import { MyfxbookService } from './services/MyfxbookService';
+import { ForexFactoryCsvService } from './services/ForexFactoryCsvService';
+import { CalendarEvent } from './types/calendar';
+import { MyfxbookRssService } from './services/MyfxbookRssService';
 import { SchedulerService } from './services/SchedulerService';
 import { DataQualityService } from './services/DataQualityService';
 import { initializeQueue } from './services/MessageQueue';
@@ -12,6 +13,7 @@ import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { aggregateCoreEvents } from './utils/eventAggregation';
 import { buildDailyMessage, buildDailyKeyboard } from './utils/dailyMessage';
+import { stripRedundantCountryPrefix } from './utils/eventTitleFormat';
 
 // User states for conversation flow (with TTL 30 min by last activity to limit memory)
 type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | null;
@@ -141,8 +143,8 @@ initializeAdminAlerts(bot);
 
 // Initialize services
 const analysisService = new AnalysisService();
-const calendarService = new CalendarService();
-const myfxbookService = new MyfxbookService();
+const forexFactoryService = new ForexFactoryCsvService();
+const myfxbookRssService = new MyfxbookRssService();
 const schedulerService = new SchedulerService();
 const dataQualityService = new DataQualityService();
 
@@ -329,12 +331,18 @@ bot.command('daily', async (ctx) => {
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📊 Загружаю события за сегодня...');
     console.log('[Bot] Fetching events...');
-    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
+    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
     console.log(`[Bot] Got ${allEvents.length} total events`);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
-    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    const currenciesInEvents = [...new Set(allEvents.map(e => e.currency))].sort();
+    const eventTimesPreview = allEvents.slice(0, 15).map(e => `${e.currency}:${(e.timeISO || e.time || '?').toString().slice(0, 16)}`).join('; ');
+    const timeSuffix = allEvents.length > 15 ? `; ...+${allEvents.length - 15} more` : '';
+    console.log(`[Bot] /daily: currencies in events=[${currenciesInEvents.join(', ')}] (${allEvents.length} total). time=[${eventTimesPreview}${timeSuffix}]. User ${userId} monitoring=[${monitoredAssets.join(', ')}]`);
+    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    // For /daily show events up to 24h ago (forScheduler: false); scheduler uses 2h (forScheduler: true)
+    const { deliver: events } = dataQualityService.filterForDelivery(eventsRaw, { mode: 'general', nowUtc: new Date(), forScheduler: false });
     console.log(`[Bot] Filtered to ${events.length} events for user ${userId} (monitoring: ${monitoredAssets.join(', ')})`);
 
     const userTz = database.getTimezone(userId);
@@ -360,7 +368,7 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
+    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
@@ -398,8 +406,9 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     const userTz = database.getTimezone(userId);
     const eventsForAnalysis = events.map(e => {
       const time24 = formatTime24(e, userTz);
+      const title = stripRedundantCountryPrefix(e.currency, e.title);
       const parts = [
-        `${time24} - [${e.currency}] ${e.title} (${e.impact})`
+        `${time24} - [${e.currency}] ${title} (${e.impact})`
       ];
       if (e.forecast && e.forecast !== '—') {
         parts.push(`Прогноз: ${e.forecast}`);
@@ -451,7 +460,7 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
+    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
@@ -490,7 +499,8 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
     const userTz = database.getTimezone(userId);
     const eventsForAnalysis = eventsWithResults.map(e => {
       const time24 = formatTime24(e, userTz);
-      return `${time24} - [${e.currency}] ${e.title} (${e.impact}) | Прогноз: ${e.forecast} | Факт: ${e.actual}`;
+      const title = stripRedundantCountryPrefix(e.currency, e.title);
+      return `${time24} - [${e.currency}] ${title} (${e.impact}) | Прогноз: ${e.forecast} | Факт: ${e.actual}`;
     }).join('\n');
 
     // Additional validation: check if prepared string is not empty
@@ -533,7 +543,7 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, true);
+    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, true);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
@@ -570,8 +580,9 @@ bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
     const userTz = database.getTimezone(userId);
     const eventsForAnalysis = events.map(e => {
       const time24 = formatTime24(e, userTz);
+      const title = stripRedundantCountryPrefix(e.currency, e.title);
       const parts = [
-        `${time24} - [${e.currency}] ${e.title} (${e.impact})`
+        `${time24} - [${e.currency}] ${title} (${e.impact})`
       ];
       if (e.forecast && e.forecast !== '—') {
         parts.push(`Прогноз: ${e.forecast}`);
@@ -619,7 +630,7 @@ bot.command('calendar', async (ctx) => {
       await ctx.reply('❌ Ошибка: не удалось определить пользователя');
       return;
     }
-    const events = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
+    const events = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
 
     if (events.length === 0) {
       await ctx.reply('Сегодня нет событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
@@ -630,7 +641,8 @@ bot.command('calendar', async (ctx) => {
     const lines = events.map((e, i) => {
       const n = i + 1;
       const time24 = formatTime24(e, userTz);
-      return `${n}. [${e.currency}] ${e.impact}\n   ${e.title}\n   🕐 ${time24}  •  F: ${e.forecast}  •  P: ${e.previous}`;
+      const title = stripRedundantCountryPrefix(e.currency, e.title);
+      return `${n}. [${e.currency}] ${e.impact}\n   ${title}\n   🕐 ${time24}  •  F: ${e.forecast}  •  P: ${e.previous}`;
     });
     const text = `📅 ForexFactory – Сегодня (Высокое/Среднее влияние, USD GBP EUR JPY NZD)\n\n${lines.join('\n\n')}`;
 
@@ -657,7 +669,7 @@ bot.command('tomorrow', async (ctx) => {
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📅 Загружаю календарь на завтра...');
     console.log('[Bot] Fetching events...');
-    const allEvents = await aggregateCoreEvents(calendarService, myfxbookService, userId, true);
+    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, true);
     console.log(`[Bot] Got ${allEvents.length} total events`);
     
     // Filter events by user's monitored assets
@@ -686,7 +698,8 @@ bot.command('tomorrow', async (ctx) => {
         eventNumber++;
         const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
         const time24 = formatTime24(e, userTz);
-        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
+        const title = stripRedundantCountryPrefix(e.currency, e.title);
+        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
       });
       eventsText += ffLines.join('\n\n') + '\n\n';
     }
@@ -697,7 +710,8 @@ bot.command('tomorrow', async (ctx) => {
         eventNumber++;
         const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
         const time24 = formatTime24(e, userTz);
-        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
+        const title = stripRedundantCountryPrefix(e.currency, e.title);
+        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
       });
       eventsText += mbLines.join('\n\n');
     }
@@ -820,14 +834,15 @@ async function processQuestion(ctx: any, question: string) {
         // Skip context if no userId
         return;
       }
-      const events = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
+      const events = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
       if (events.length > 0) {
         const userTz = database.getTimezone(userId);
         const eventsForContext = events
           .slice(0, 5)
           .map(e => {
             const time24 = formatTime24(e, userTz);
-            return `${time24} - [${e.currency}] ${e.title}${e.forecast && e.forecast !== '—' ? ` (Прогноз: ${e.forecast})` : ''}`;
+            const title = stripRedundantCountryPrefix(e.currency, e.title);
+            return `${time24} - [${e.currency}] ${title}${e.forecast && e.forecast !== '—' ? ` (Прогноз: ${e.forecast})` : ''}`;
           })
           .join('\n');
         context = `События на сегодня:\n${eventsForContext}`;
