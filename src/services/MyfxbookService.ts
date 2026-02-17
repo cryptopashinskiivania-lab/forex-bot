@@ -10,6 +10,7 @@ import { database } from '../db/database';
 import { DataQualityService } from './DataQualityService';
 import { sendCriticalDataAlert } from '../utils/adminAlerts';
 import { isPlaceholderActual } from '../utils/calendarValue';
+import { runWithBrowserLock } from '../utils/browserFetchLock';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -225,7 +226,7 @@ export class MyfxbookService {
       console.log(`[MyfxbookService] Navigating to ${url}...`);
       await page.goto(url, {
         waitUntil: 'domcontentloaded',
-        timeout: 25000,
+        timeout: 30000,
       });
       console.log('[MyfxbookService] Waiting for calendar data...');
       await Promise.race([
@@ -238,8 +239,6 @@ export class MyfxbookService {
       await page.waitForTimeout(1000);
       const html = await page.content();
       console.log('[MyfxbookService] Successfully fetched HTML');
-      await page.close();
-      await context.close();
       return html;
     } catch (error) {
       if (isBrowserClosedOrTimeout(error)) {
@@ -248,13 +247,24 @@ export class MyfxbookService {
         return '';
       }
       console.error('[MyfxbookService] Error fetching HTML:', error);
+      throw new Error(`Failed to fetch Myfxbook calendar: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
       if (page) {
-        try { await page.close(); } catch (_) { /* ignore */ }
+        try {
+          await page.close();
+        } catch (_) {
+          /* ignore */
+        }
+        page = null;
       }
       if (context) {
-        try { await context.close(); } catch (_) { /* ignore */ }
+        try {
+          await context.close();
+        } catch (_) {
+          /* ignore */
+        }
+        context = null;
       }
-      throw new Error(`Failed to fetch Myfxbook calendar: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -269,7 +279,7 @@ export class MyfxbookService {
     console.log(`[MyfxbookService] Cache miss or expired for ${url}, fetching fresh data...`);
     let html: string;
     try {
-      html = await this.fetchHTML(url);
+      html = await runWithBrowserLock(() => this.fetchHTML(url));
     } catch (error) {
       if (isBrowserClosedOrTimeout(error)) {
         this.browser = null;

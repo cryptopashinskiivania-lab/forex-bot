@@ -9,6 +9,7 @@ import { database } from '../db/database';
 import { DataQualityService } from './DataQualityService';
 import { sendCriticalDataAlert } from '../utils/adminAlerts';
 import { isPlaceholderActual } from '../utils/calendarValue';
+import { runWithBrowserLock } from '../utils/browserFetchLock';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -353,8 +354,13 @@ export class CalendarService {
     let sourceTimezone: string;
     let html: string;
     try {
-      sourceTimezone = await this.getForexFactoryTimezone();
-      html = await this.fetchHTML(url);
+      const result = await runWithBrowserLock(async () => {
+        const sourceTimezone = await this.getForexFactoryTimezone();
+        const html = await this.fetchHTML(url);
+        return { sourceTimezone, html };
+      });
+      sourceTimezone = result.sourceTimezone;
+      html = result.html;
     } catch (error) {
       if (isBrowserClosedOrTimeout(error)) {
         this.browser = null;

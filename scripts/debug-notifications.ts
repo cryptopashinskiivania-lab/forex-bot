@@ -1,9 +1,9 @@
 /**
- * Debug script: run notification pipeline (users → events → filter) and log why reminders/results/digest might not fire.
+ * Debug script: run notification pipeline (users → events → filter).
+ * Notifications: events without time, RSS (no digest/reminders/results).
  * Run: npx ts-node scripts/debug-notifications.ts
  */
 import 'dotenv/config';
-import { parseISO } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { database } from '../src/db/database';
 import { CalendarService } from '../src/services/CalendarService';
@@ -48,7 +48,6 @@ async function main() {
       console.log(`  Monitored assets: ${monitoredAssets.join(', ')}`);
       console.log(`  Local time: ${hour}:${String(minute).padStart(2, '0')}`);
       console.log(`  Quiet hours (23-08): ${isQuietHours(userId)}`);
-      console.log(`  Would get daily digest at 08:00? ${hour === 8 && minute <= 4 ? 'YES' : 'NO (need 08:00-08:04 local)'}`);
 
       const events = await aggregateCoreEvents(calendarService, myfxbookService, userId, false);
       const userEventsRaw = events.filter((e) => monitoredAssets.includes(e.currency));
@@ -67,19 +66,10 @@ async function main() {
         console.log(`  Skipped reasons: ${JSON.stringify(byType)}`);
       }
 
+      const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
+      console.log(`  Events without time (would be sent if not quiet): ${eventsWithoutTime.length}`);
       for (const e of userEvents.slice(0, 5)) {
-        let timeDiffMin: number | null = null;
-        if (e.timeISO) {
-          try {
-            const eventTime = parseISO(e.timeISO);
-            timeDiffMin = (eventTime.getTime() - now.getTime()) / (1000 * 60);
-          } catch {}
-        }
-        const inReminderWindow = timeDiffMin != null && timeDiffMin >= 13 && timeDiffMin <= 17;
-        console.log(
-          `  [${e.currency}] ${e.title}: timeISO=${e.timeISO ? 'yes' : 'no'}, isResult=${e.isResult}, ` +
-            `minToEvent=${timeDiffMin != null ? timeDiffMin.toFixed(0) : 'n/a'}, reminderWindow(13-17)=${inReminderWindow}`
-        );
+        console.log(`  [${e.currency}] ${e.title}: timeISO=${e.timeISO ? 'yes' : 'no'}`);
       }
       if (userEvents.length > 5) console.log(`  ... and ${userEvents.length - 5} more events`);
     }
