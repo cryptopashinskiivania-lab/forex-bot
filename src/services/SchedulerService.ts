@@ -12,6 +12,7 @@ import { env } from '../config/env';
 import { database } from '../db/database';
 import { fetchSharedCalendarToday, getEventsForUserFromShared } from '../utils/eventAggregation';
 import { isPlaceholderActual } from '../utils/calendarValue';
+import { buildDailyMessage, buildDailyKeyboard } from '../utils/dailyMessage';
 
 const CURRENCY_FLAGS: Record<string, string> = {
   USD: '🇺🇸',
@@ -39,6 +40,8 @@ function itemId(title: string, time: string): string {
 const REMINDER_MINUTES_BEFORE = 15;
 /** Через сколько минут после времени события отправлять результат (чтобы календарь успел обновиться) */
 const RESULT_MINUTES_AFTER = 5;
+/** Час отправки ежедневной сводки и расписания (по времени пользователя) */
+const DAILY_SUMMARY_HOUR = 8;
 
 function getSentimentEmoji(sentiment: 'Pos' | 'Neg' | 'Neutral'): string {
   if (sentiment === 'Pos') return '🟢';
@@ -418,6 +421,36 @@ export class SchedulerService {
                       console.error(`[Scheduler] Error sending RSS to user ${userId}:`, err);
                     }
                   }
+                }
+              }
+
+              const userTz = database.getTimezone(userId);
+              const nowInUserTz = toZonedTime(new Date(), userTz);
+              const todayDateStr = format(nowInUserTz, 'yyyy-MM-dd');
+              const dailySummaryId = `daily8_${userId}_${todayDateStr}`;
+              if (
+                !quiet &&
+                nowInUserTz.getHours() === DAILY_SUMMARY_HOUR &&
+                !database.hasSent(dailySummaryId)
+              ) {
+                const { text: dailyText } = buildDailyMessage(
+                  userEvents,
+                  userTz,
+                  monitoredAssets
+                );
+                const keyboard = buildDailyKeyboard();
+                try {
+                  await bot.api.sendMessage(userId, dailyText, {
+                    parse_mode: undefined,
+                    reply_markup: keyboard,
+                  });
+                  database.markAsSent(dailySummaryId);
+                  eventsSent++;
+                  console.log(
+                    `[Scheduler] Daily (08:00, same as /daily) sent to user ${userId}`
+                  );
+                } catch (err) {
+                  console.error(`[Scheduler] Error sending daily to user ${userId}:`, err);
                 }
               }
 

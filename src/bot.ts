@@ -11,6 +11,7 @@ import { initializeAdminAlerts } from './utils/adminAlerts';
 import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { aggregateCoreEvents } from './utils/eventAggregation';
+import { buildDailyMessage, buildDailyKeyboard } from './utils/dailyMessage';
 
 // User states for conversation flow (with TTL 30 min by last activity to limit memory)
 type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | null;
@@ -336,55 +337,10 @@ bot.command('daily', async (ctx) => {
     const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
     console.log(`[Bot] Filtered to ${events.length} events for user ${userId} (monitoring: ${monitoredAssets.join(', ')})`);
 
-    if (events.length === 0) {
-      const assetsText = monitoredAssets.length > 0 
-        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
-        : 'Нет активов';
-      await ctx.reply(`📅 Сегодня нет событий для ваших активов (${assetsText}).\n\nИзмените активы через /settings`);
-      return;
-    }
-
-    // Separate events by source
     const userTz = database.getTimezone(userId);
-    const forexFactoryEvents = events.filter(e => e.source === 'ForexFactory');
-    const myfxbookEvents = events.filter(e => e.source === 'Myfxbook');
-
-    let eventsText = '📅 События за сегодня:\n\n';
-    let eventNumber = 0;
-
-    // ForexFactory events
-    if (forexFactoryEvents.length > 0) {
-      eventsText += '━━━ 📰 ForexFactory ━━━\n\n';
-      const ffLines = forexFactoryEvents.map((e) => {
-        eventNumber++;
-        const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-        const time24 = formatTime24(e, userTz);
-        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
-      });
-      eventsText += ffLines.join('\n\n') + '\n\n';
-    }
-
-    // Myfxbook events
-    if (myfxbookEvents.length > 0) {
-      eventsText += '━━━ 📊 Myfxbook ━━━\n\n';
-      const mbLines = myfxbookEvents.map((e) => {
-        eventNumber++;
-        const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-        const time24 = formatTime24(e, userTz);
-        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${e.title}\n   🕐 ${time24}`;
-      });
-      eventsText += mbLines.join('\n\n');
-    }
-
-    // Create keyboard with AI Forecast and AI Results buttons
-    const keyboard = new InlineKeyboard();
-    keyboard.row(
-      { text: '🔮 AI Forecast', callback_data: 'daily_ai_forecast' },
-      { text: '📊 AI Results', callback_data: 'daily_ai_results' }
-    );
-
-    // Send list with button for optional AI analysis
-    await ctx.reply(eventsText, { reply_markup: keyboard });
+    const { text, empty } = buildDailyMessage(events, userTz, monitoredAssets);
+    const keyboard = buildDailyKeyboard();
+    await ctx.reply(text, { reply_markup: keyboard });
   } catch (error) {
     console.error('Error in daily command:', error);
     await ctx.reply(
