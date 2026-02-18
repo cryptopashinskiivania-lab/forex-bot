@@ -562,7 +562,7 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
 
 const MAX_EVENT_BUTTONS = 10;
 
-// Group details: show events table + buttons for AI analysis per event
+// Group details: short header + buttons for AI analysis per event
 bot.callbackQuery(/^group_details_(.+)$/, async (ctx) => {
   try {
     const groupId = ctx.match[1];
@@ -572,19 +572,8 @@ bot.callbackQuery(/^group_details_(.+)$/, async (ctx) => {
       return;
     }
     await ctx.answerCallbackQuery();
-    const header = `${escapeMarkdown(group.title)} (${group.time})`;
-    const rows: string[] = ['Event | Actual | Forecast', '—'];
-    const maxTitleLen = 25;
-    for (const e of group.events) {
-      const shortTitle = e.title.length > maxTitleLen ? e.title.slice(0, maxTitleLen - 3) + '...' : e.title;
-      const actual = (e.actual || '—').trim();
-      const forecast = (e.forecast || '—').trim();
-      rows.push(`${escapeMarkdown(shortTitle)} | ${escapeMarkdown(actual)} | ${escapeMarkdown(forecast)}`);
-    }
+    const header = `📊 ${escapeMarkdown(group.title)} (${group.events.length} events)`;
     const eventsSlice = group.events.slice(0, MAX_EVENT_BUTTONS);
-    const moreCount = group.events.length - MAX_EVENT_BUTTONS;
-    const moreText = moreCount > 0 ? `\n\n_… and ${moreCount} more_` : '';
-    const body = rows.join('\n') + moreText;
     const keyboard = new InlineKeyboard();
     for (let i = 0; i < eventsSlice.length; i += 2) {
       const a = eventsSlice[i];
@@ -601,7 +590,7 @@ bot.callbackQuery(/^group_details_(.+)$/, async (ctx) => {
       }
     }
     keyboard.row({ text: '🔙 Back to daily', callback_data: 'back_to_daily' });
-    await ctx.editMessageText(`${header}\n\n${body}`, {
+    await ctx.editMessageText(header, {
       reply_markup: keyboard,
       parse_mode: 'Markdown',
     });

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "nodemon",
     "build": "tsc",
-    "start": "node --max-old-space-size=2048 -r ts-node/register src/bot.ts",
+    "start": "node --max-old-space-size=3072 -r ts-node/register src/bot.ts",
     "test": "ts-node tests/DataQualityService.test.ts",
     "test:calendar": "ts-node scripts/test-calendar-scrape.ts",
     "test:cross-source": "ts-node scripts/test-cross-source-conflicts.ts",
