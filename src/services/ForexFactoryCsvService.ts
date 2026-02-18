@@ -8,7 +8,7 @@
 
 import axios from 'axios';
 import Papa from 'papaparse';
-import { fromZonedTime, toZonedTime } from 'date-fns-tz';
+import { fromZonedTime } from 'date-fns-tz';
 import { CalendarEvent } from '../types/calendar';
 import { DataQualityService } from './DataQualityService';
 import { database } from '../db/database';
@@ -186,35 +186,20 @@ export class ForexFactoryCsvService {
     return valid;
   }
 
-  private filterByDay(events: CalendarEvent[], forTomorrow: boolean): CalendarEvent[] {
-    const now = new Date();
-    const nyNow = toZonedTime(now, FF_TZ);
-    const targetDay = new Date(nyNow.getFullYear(), nyNow.getMonth(), nyNow.getDate());
-    if (forTomorrow) targetDay.setDate(targetDay.getDate() + 1);
-    const targetYear = targetDay.getFullYear();
-    const targetMonth = targetDay.getMonth();
-    const targetDate = targetDay.getDate();
-
-    return events.filter((e) => {
-      if (!e.timeISO) return true;
-      const eventUtc = new Date(e.timeISO);
-      const eventNy = toZonedTime(eventUtc, FF_TZ);
-      return (
-        eventNy.getFullYear() === targetYear &&
-        eventNy.getMonth() === targetMonth &&
-        eventNy.getDate() === targetDate
-      );
-    });
-  }
-
+  /**
+   * Return all events from the week CSV. Day filtering ("today" / "tomorrow")
+   * is done by the aggregation layer in the user's timezone, so users in any
+   * timezone see the correct events for their local day.
+   */
   async getEventsForToday(_userTimezone?: string): Promise<CalendarEvent[]> {
-    const events = await this.fetchAndParseCsv();
-    return this.filterByDay(events, false);
+    return this.fetchAndParseCsv();
   }
 
+  /**
+   * Same as getEventsForToday: full week. Aggregation filters by user's "tomorrow".
+   */
   async getEventsForTomorrow(_userTimezone?: string): Promise<CalendarEvent[]> {
-    const events = await this.fetchAndParseCsv();
-    return this.filterByDay(events, true);
+    return this.fetchAndParseCsv();
   }
 
   async close(): Promise<void> {
