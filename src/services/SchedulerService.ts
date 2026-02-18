@@ -42,6 +42,8 @@ function itemId(title: string, time: string): string {
 const REMINDER_MINUTES_BEFORE = 15;
 /** Через сколько минут после времени события отправлять результат (чтобы календарь успел обновиться) */
 const RESULT_MINUTES_AFTER = 5;
+/** Длительность окна отправки результатов (в минутах). ForexFactory может обновлять данные с задержкой до 30 мин. */
+const RESULT_WINDOW_DURATION = 60;
 /** Час отправки ежедневной сводки и расписания (по времени пользователя) */
 const DAILY_SUMMARY_HOUR = 8;
 
@@ -432,7 +434,7 @@ export class SchedulerService {
                     const eventTime = parseISO(event.timeISO);
                     const now = new Date();
                     const resultFrom = addMinutes(eventTime, RESULT_MINUTES_AFTER);
-                    const resultWindowEnd = addMinutes(eventTime, 20);
+                    const resultWindowEnd = addMinutes(eventTime, RESULT_WINDOW_DURATION);
                     if (now >= resultFrom && now < resultWindowEnd) {
                       try {
                         const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
