@@ -13,3 +13,11 @@ export function isPlaceholderActual(value: string): boolean {
   const t = (value || '').trim();
   return !t || t === '—' || t === '-' || PLACEHOLDER_ACTUAL.test(t);
 }
+
+/**
+ * Returns true if the event time is "Tentative" (no fixed time).
+ * Used so Tentative events are not grouped with others and are returned as singles.
+ */
+export function isTentativeTime(time: string): boolean {
+  return (time || '').trim().toLowerCase() === 'tentative';
+}

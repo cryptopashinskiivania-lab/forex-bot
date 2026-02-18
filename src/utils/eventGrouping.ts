@@ -1,5 +1,6 @@
 import dayjs from 'dayjs';
 import { CalendarEvent } from '../types/calendar';
+import { isPlaceholderActual, isTentativeTime } from './calendarValue';
 
 /**
  * Группа связанных событий календаря (одна валюта, одно время ±5 мин).
@@ -95,30 +96,53 @@ export function getEventThemeByTitle(title: string): string {
 }
 
 /**
- * Формирует короткое название группы по валюте и тематике.
+ * Returns true if the event has actual or forecast data (not placeholders).
  */
-export function generateGroupTitle(
-  currency: string,
-  theme: string,
-  _eventCount: number
-): string {
+function eventHasData(e: CalendarEvent): boolean {
+  const hasActual = !isPlaceholderActual(e.actual);
+  const hasForecast =
+    (e.forecast ?? '').trim() !== '' &&
+    (e.forecast ?? '').trim() !== '—' &&
+    (e.forecast ?? '').trim() !== '-';
+  return hasActual || hasForecast;
+}
+
+/**
+ * Impact order for sorting: High first, then Medium, then Low.
+ */
+const IMPACT_ORDER: Record<string, number> = {
+  High: 3,
+  Medium: 2,
+  Low: 1,
+};
+
+/**
+ * Picks the most important event in the group: High impact first,
+ * then events with actual/forecast data, then chronological order.
+ */
+export function getMostImportantEvent(events: CalendarEvent[]): CalendarEvent {
+  if (events.length === 0) throw new Error('getMostImportantEvent requires at least one event');
+  const sorted = [...events].sort((a, b) => {
+    const impactA = IMPACT_ORDER[a.impact] ?? 0;
+    const impactB = IMPACT_ORDER[b.impact] ?? 0;
+    if (impactB !== impactA) return impactB - impactA;
+    const dataA = eventHasData(a) ? 1 : 0;
+    const dataB = eventHasData(b) ? 1 : 0;
+    if (dataB !== dataA) return dataB - dataA;
+    const ta = getEventTimeMs(a);
+    const tb = getEventTimeMs(b);
+    return ta - tb;
+  });
+  return sorted[0];
+}
+
+/**
+ * Forms the group title from the most important event in the group.
+ */
+export function generateGroupTitle(events: CalendarEvent[], currency: string): string {
   const flag = CURRENCY_FLAGS[currency] ?? '';
-  const country = CURRENCY_TO_COUNTRY[currency] ?? currency;
-  switch (theme) {
-    case 'labor':
-      return `${flag} ${country} Labor Market Data`;
-    case 'trade':
-      return `${flag} ${country} Trade Balance Report`;
-    case 'inflation':
-      return `${flag} ${country} Inflation Report`;
-    case 'speech':
-      return `${flag} ${country} Policy Statements`;
-    case 'rate':
-      return `${flag} ${country} Monetary Policy`;
-    case 'mixed':
-    default:
-      return `${flag} ${country} Economic Data Package`;
-  }
+  const mainEvent = getMostImportantEvent(events);
+  return `${flag} ${mainEvent.title}`;
 }
 
 /** Минимальное количество событий для образования группы */
@@ -161,7 +185,7 @@ export function groupEvents(
     if (used.has(i)) continue;
     const base = sorted[i];
     const baseMs = getEventTimeMs(base);
-    if (baseMs === 0) {
+    if (baseMs === 0 || isTentativeTime(base.time)) {
       result.push(base);
       continue;
     }
@@ -171,7 +195,7 @@ export function groupEvents(
       const other = sorted[j];
       if (other.currency !== base.currency) continue;
       const otherMs = getEventTimeMs(other);
-      if (otherMs === 0) continue;
+      if (otherMs === 0 || isTentativeTime(other.time)) continue;
       if (Math.abs(otherMs - baseMs) <= TIME_THRESHOLD_MS) {
         candidates.push(j);
       }
@@ -180,7 +204,7 @@ export function groupEvents(
       const groupEventsList = candidates.map((idx) => sorted[idx]);
       candidates.forEach((idx) => used.add(idx));
       const theme = detectGroupTheme(groupEventsList);
-      const title = generateGroupTitle(base.currency, theme, groupEventsList.length);
+      const title = generateGroupTitle(groupEventsList, base.currency);
       const timeStr =
         base.time && /^\d{1,2}:\d{2}/.test(base.time.trim())
           ? base.time.trim().replace(/^(\d{1,2}):(\d{2}).*/, (_, h, m) =>

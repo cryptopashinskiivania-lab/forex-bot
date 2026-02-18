@@ -5,7 +5,7 @@ import { AnalysisService } from './services/AnalysisService';
 import { ForexFactoryCsvService } from './services/ForexFactoryCsvService';
 import { CalendarEvent } from './types/calendar';
 import { MyfxbookService } from './services/MyfxbookService';
-import { SchedulerService, getNotificationGroup } from './services/SchedulerService';
+import { SchedulerService, getNotificationGroup, setNotificationGroup } from './services/SchedulerService';
 import { DataQualityService } from './services/DataQualityService';
 import { initializeQueue } from './services/MessageQueue';
 import { initializeAdminAlerts } from './utils/adminAlerts';
@@ -149,8 +149,67 @@ const myfxbookService = new MyfxbookService();
 const schedulerService = new SchedulerService();
 const dataQualityService = new DataQualityService();
 
-/** Кэш групп для callback group_details / ai_single (очищается при перезапуске) */
+/** Кэш групп для callback group_details / ai_single (синхронизирован с notificationGroupEntries, 1h TTL) */
 const groupsCache = new Map<string, EventGroup>();
+
+const GROUPS_CACHE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * Возвращает группу по id из кэша уведомлений (1h TTL) или из локального groupsCache.
+ * Используется в group_details и ai_single для единого источника с TTL.
+ */
+function getCachedGroup(groupId: string): EventGroup | undefined {
+  const fromNotification = getNotificationGroup(groupId);
+  if (fromNotification) return fromNotification;
+  return groupsCache.get(groupId);
+}
+
+function cleanupExpiredGroupsCache(): void {
+  for (const groupId of groupsCache.keys()) {
+    if (getNotificationGroup(groupId) === undefined) {
+      groupsCache.delete(groupId);
+    }
+  }
+}
+
+setInterval(cleanupExpiredGroupsCache, GROUPS_CACHE_CLEANUP_INTERVAL_MS);
+
+/** Дневной лимит AI-запросов на пользователя (24h TTL) */
+const AI_QUOTA_PER_DAY = 20;
+const AI_QUOTA_TTL_MS = 24 * 60 * 60 * 1000;
+
+const userAiQuota = new Map<number, { count: number; resetAt: number }>();
+
+/**
+ * Проверяет, разрешён ли пользователю ещё один AI-запрос.
+ * При истечении окна (24h) счётчик обнуляется.
+ * @returns { allowed, resetInMs } — можно ли запрос и через сколько мс обнулится лимит
+ */
+function checkAiQuota(userId: number): { allowed: boolean; resetInMs: number } {
+  const entry = userAiQuota.get(userId);
+  const now = Date.now();
+  if (entry && now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + AI_QUOTA_TTL_MS;
+  }
+  if (!entry || entry.count < AI_QUOTA_PER_DAY) {
+    return { allowed: true, resetInMs: 0 };
+  }
+  return { allowed: false, resetInMs: Math.max(0, (entry.resetAt ?? now + AI_QUOTA_TTL_MS) - now) };
+}
+
+/**
+ * Увеличивает счётчик использований AI для пользователя (вызывать перед запросом к AI).
+ */
+function incrementAiQuota(userId: number): void {
+  let entry = userAiQuota.get(userId);
+  const now = Date.now();
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + AI_QUOTA_TTL_MS };
+    userAiQuota.set(userId, entry);
+  }
+  entry.count += 1;
+}
 
 /**
  * Format event time to 24-hour format (HH:mm) in the user's timezone
@@ -202,14 +261,17 @@ function escapeMarkdown(s: string): string {
 }
 
 /**
- * Получить контент /daily для пользователя: текст, клавиатура и заполнить groupsCache.
+ * Получить контент /daily или /tomorrow для пользователя: текст, клавиатура и заполнить groupsCache.
  */
-async function getDailyContentForUser(userId: number): Promise<{
+async function getDailyOrTomorrowContent(
+  userId: number,
+  forTomorrow: boolean
+): Promise<{
   text: string;
   keyboard: InlineKeyboard;
   grouped: Array<EventGroup | CalendarEvent>;
 }> {
-  const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
+  const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, forTomorrow);
   const monitoredAssets = database.getMonitoredAssets(userId);
   const eventsRaw = allEvents.filter((e) => monitoredAssets.includes(e.currency));
   const { deliver: events } = dataQualityService.filterForDelivery(eventsRaw, {
@@ -218,8 +280,12 @@ async function getDailyContentForUser(userId: number): Promise<{
     forScheduler: false,
   });
   const userTz = database.getTimezone(userId);
-  const { text, empty, grouped } = buildDailyMessage(events, userTz, monitoredAssets);
-  grouped.filter((g) => 'events' in g).forEach((g) => groupsCache.set((g as EventGroup).groupId, g as EventGroup));
+  const { text, empty, grouped } = buildDailyMessage(events, userTz, monitoredAssets, forTomorrow);
+  grouped.filter((g) => 'events' in g).forEach((g) => {
+    const eg = g as EventGroup;
+    groupsCache.set(eg.groupId, eg);
+    setNotificationGroup(eg.groupId, eg);
+  });
   const keyboard = buildDailyKeyboard(grouped);
   return { text, keyboard, grouped };
 }
@@ -234,6 +300,7 @@ function buildMainMenuKeyboard(): InlineKeyboard {
 // Команды по умолчанию (без /stats — она только для админа)
 const defaultCommands = [
   { command: 'daily', description: '📊 Сводка за сегодня' },
+  { command: 'tomorrow', description: '📅 События завтра' },
   { command: 'settings', description: '⚙️ Настройки' },
   { command: 'ask', description: '❓ Вопрос эксперту' },
   { command: 'id', description: '🆔 Мой ID' },
@@ -360,7 +427,7 @@ bot.command('daily', async (ctx) => {
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📊 Загружаю события за сегодня...');
     console.log('[Bot] Fetching events...');
-    const { text, keyboard } = await getDailyContentForUser(userId);
+    const { text, keyboard } = await getDailyOrTomorrowContent(userId, false);
     await ctx.reply(text, { reply_markup: keyboard });
   } catch (error) {
     console.error('Error in daily command:', error);
@@ -370,17 +437,45 @@ bot.command('daily', async (ctx) => {
   }
 });
 
-// Handle AI Forecast button callback
-bot.callbackQuery('daily_ai_forecast', async (ctx) => {
+// Handle /tomorrow command – fetch and display next day's calendar events
+bot.command('tomorrow', async (ctx) => {
+  console.log('[Bot] /tomorrow command received');
   try {
-    await ctx.answerCallbackQuery({ text: '🧠 Анализирую события...', show_alert: false });
-    
     if (!ctx.from) {
       await ctx.reply('❌ Ошибка: не удалось определить пользователя');
       return;
     }
-    
     const userId = ctx.from.id;
+    await ctx.reply('📅 Загружаю события на завтра...');
+    const { text, keyboard } = await getDailyOrTomorrowContent(userId, true);
+    await ctx.reply(text, { reply_markup: keyboard });
+  } catch (error) {
+    console.error('Error in tomorrow command:', error);
+    await ctx.reply(
+      `❌ Ошибка при загрузке календаря: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
+    );
+  }
+});
+
+// Handle AI Forecast button callback
+bot.callbackQuery('daily_ai_forecast', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: true });
+      return;
+    }
+    const userId = ctx.from.id;
+    const quota = checkAiQuota(userId);
+    if (!quota.allowed) {
+      const hours = Math.ceil(quota.resetInMs / (60 * 60 * 1000));
+      await ctx.answerCallbackQuery({
+        text: `⚠️ Превышен дневной лимит AI (20 запросов). Обнулится через ${hours} ч.`,
+        show_alert: true,
+      });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: '🧠 Анализирую события...', show_alert: false });
+    
     const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
     
     // Filter events by user's monitored assets
@@ -443,6 +538,7 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
 
     // Get detailed AI analysis
     try {
+      incrementAiQuota(userId);
       const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
       await ctx.reply(analysis, { parse_mode: 'Markdown' });
     } catch (analysisError) {
@@ -470,7 +566,7 @@ const MAX_EVENT_BUTTONS = 10;
 bot.callbackQuery(/^group_details_(.+)$/, async (ctx) => {
   try {
     const groupId = ctx.match[1];
-    const group = groupsCache.get(groupId);
+    const group = getCachedGroup(groupId);
     if (!group) {
       await ctx.answerCallbackQuery({ text: 'Group expired, use /daily again', show_alert: true });
       return;
@@ -518,9 +614,23 @@ bot.callbackQuery(/^group_details_(.+)$/, async (ctx) => {
 // Single event AI analysis with prev/next
 bot.callbackQuery(/^ai_single_(.+)_(\d+)$/, async (ctx) => {
   try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: 'Error', show_alert: true });
+      return;
+    }
+    const userId = ctx.from.id;
+    const quota = checkAiQuota(userId);
+    if (!quota.allowed) {
+      const hours = Math.ceil(quota.resetInMs / (60 * 60 * 1000));
+      await ctx.answerCallbackQuery({
+        text: `⚠️ Превышен дневной лимит AI (20 запросов). Обнулится через ${hours} ч.`,
+        show_alert: true,
+      });
+      return;
+    }
     const groupId = ctx.match[1];
     const eventIdx = parseInt(ctx.match[2], 10);
-    const group = groupsCache.get(groupId);
+    const group = getCachedGroup(groupId);
     if (!group) {
       await ctx.answerCallbackQuery({ text: 'Group expired, use /daily again', show_alert: true });
       return;
@@ -531,6 +641,7 @@ bot.callbackQuery(/^ai_single_(.+)_(\d+)$/, async (ctx) => {
       return;
     }
     await ctx.answerCallbackQuery({ text: '🧠 Analyzing...', show_alert: false });
+    incrementAiQuota(userId);
     const eventText = [
       `${event.title}.`,
       `Currency: ${event.currency}.`,
@@ -666,6 +777,20 @@ bot.callbackQuery(/^notify_ai_(.+)$/, async (ctx) => {
 // Notification group: single event AI (from notify_group_ / notify_ai_)
 bot.callbackQuery(/^notify_ai_single_(.+)_(\d+)$/, async (ctx) => {
   try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: 'Error', show_alert: true });
+      return;
+    }
+    const userId = ctx.from.id;
+    const quota = checkAiQuota(userId);
+    if (!quota.allowed) {
+      const hours = Math.ceil(quota.resetInMs / (60 * 60 * 1000));
+      await ctx.answerCallbackQuery({
+        text: `⚠️ Превышен дневной лимит AI (20 запросов). Обнулится через ${hours} ч.`,
+        show_alert: true,
+      });
+      return;
+    }
     const groupId = ctx.match[1];
     const eventIdx = parseInt(ctx.match[2], 10);
     const group = getNotificationGroup(groupId);
@@ -679,6 +804,7 @@ bot.callbackQuery(/^notify_ai_single_(.+)_(\d+)$/, async (ctx) => {
       return;
     }
     await ctx.answerCallbackQuery({ text: '🧠 Analyzing...', show_alert: false });
+    incrementAiQuota(userId);
     const eventText = [
       `${event.title}.`,
       `Currency: ${event.currency}.`,
@@ -732,7 +858,7 @@ bot.callbackQuery('back_to_daily', async (ctx) => {
       return;
     }
     const userId = ctx.from.id;
-    const { text, keyboard } = await getDailyContentForUser(userId);
+    const { text, keyboard } = await getDailyOrTomorrowContent(userId, false);
     await ctx.editMessageText(text, { reply_markup: keyboard });
     await ctx.answerCallbackQuery();
   } catch (err) {
@@ -748,8 +874,16 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
       await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: true });
       return;
     }
-    
     const userId = ctx.from.id;
+    const quota = checkAiQuota(userId);
+    if (!quota.allowed) {
+      const hours = Math.ceil(quota.resetInMs / (60 * 60 * 1000));
+      await ctx.answerCallbackQuery({
+        text: `⚠️ Превышен дневной лимит AI (20 запросов). Обнулится через ${hours} ч.`,
+        show_alert: true,
+      });
+      return;
+    }
     const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
     
     // Filter events by user's monitored assets
@@ -801,6 +935,7 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
 
     // Get AI analysis of results
     try {
+      incrementAiQuota(userId);
       const analysis = await analysisService.analyzeResults(eventsForAnalysis);
       await ctx.reply(analysis, { parse_mode: 'Markdown' });
     } catch (analysisError) {
@@ -1465,6 +1600,7 @@ bot.command('help', (ctx) => {
   const helpText = `ℹ️ **Помощь по командам:**
 
 📊 \`/daily\` - Сводка событий за сегодня с AI-анализом
+📅 \`/tomorrow\` - События на завтра
 ❓ \`/ask\` - Задать вопрос эксперту по Форекс
 ⚙️ \`/settings\` - Настройки отслеживаемых активов
 🆔 \`/id\` - Показать ваш Chat ID

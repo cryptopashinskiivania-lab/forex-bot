@@ -1,6 +1,12 @@
 import { parseISO, format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
+import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
 import { InlineKeyboard } from 'grammy';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 import { CalendarEvent } from '../types/calendar';
 import { stripRedundantCountryPrefix } from './eventTitleFormat';
 import { groupEvents, type EventGroup, getEventThemeByTitle } from './eventGrouping';
@@ -98,21 +104,25 @@ export interface BuildDailyResult {
 }
 
 /**
- * Строит текст сводки за сегодня в том же формате, что и команда /daily.
- * Используется и в /daily, и при автоматической отправке в 08:00.
+ * Строит текст сводки за сегодня/завтра в том же формате, что и команды /daily и /tomorrow.
+ * Используется и в /daily, и в /tomorrow, и при автоматической отправке в 08:00.
  */
 export function buildDailyMessage(
   events: CalendarEvent[],
   userTz: string,
-  monitoredAssets: string[]
+  monitoredAssets: string[],
+  forTomorrow: boolean = false
 ): BuildDailyResult {
+  const dateStr = dayjs.tz(dayjs(), userTz).add(forTomorrow ? 1 : 0, 'day').format('DD.MM.YYYY');
+  const dayLabel = forTomorrow ? 'Завтра' : 'Сегодня';
+
   if (events.length === 0) {
     const assetsText =
       monitoredAssets.length > 0
         ? monitoredAssets.map((a) => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
         : 'Нет активов';
     return {
-      text: `📅 Сегодня нет событий для ваших активов (${assetsText}).\n\nИзмените активы через /settings`,
+      text: `📅 ${dayLabel} (${dateStr}) нет событий для ваших активов (${assetsText}).\n\nИзмените активы через /settings`,
       empty: true,
       grouped: [],
     };
@@ -123,7 +133,7 @@ export function buildDailyMessage(
   const groupedFF = groupEvents(forexFactoryEvents);
   const groupedMB = groupEvents(myfxbookEvents);
 
-  let eventsText = '📅 События за сегодня:\n\n';
+  let eventsText = `📅 ${dayLabel} (${dateStr}):\n\n`;
   let eventNumber = 0;
 
   function formatItem(
@@ -135,8 +145,8 @@ export function buildDailyMessage(
       const group = item as EventGroup;
       const impactIcon = group.impact === 'High' ? '🔴' : '🟠';
       const time24 = formatTime24(group.events[0], userTz);
-      const summary = formatGroupSummary(group);
-      return `${eventNumber}. ${impactIcon} ${time24} — ${group.title} (${group.events.length} events)\n   ${summary}`;
+      const moreCount = group.events.length - 1;
+      return `${eventNumber}. ${impactIcon} ${time24} — ${group.title} (+ ${moreCount} more)`;
     }
     const e = item as CalendarEvent;
     const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
