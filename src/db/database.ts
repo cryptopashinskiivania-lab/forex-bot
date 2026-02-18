@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import path from 'path';
+import type { AnalysisResult } from '../services/AnalysisService';
 
 // Use project root (src/db -> .. -> ..) so DB path does not depend on process.cwd() (PM2/backup-safe)
 const projectRoot = path.resolve(__dirname, '..', '..');
@@ -48,6 +49,12 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_user_events_created ON user_events(created_at);
   CREATE INDEX IF NOT EXISTS idx_user_events_name_created ON user_events(event_name, created_at);
+  
+  CREATE TABLE IF NOT EXISTS ai_analysis_cache (
+    event_key TEXT PRIMARY KEY,
+    analysis TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 // Default monitored assets (major currencies only)
@@ -98,7 +105,8 @@ export const database = {
   cleanup: () => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     db.prepare('DELETE FROM sent_news WHERE created_at < ?').run(oneDayAgo);
-    
+    db.prepare('DELETE FROM ai_analysis_cache WHERE created_at < ?').run(oneDayAgo);
+
     // Also cleanup old data issues (keep only last 7 days)
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     db.prepare('DELETE FROM data_issues WHERE created_at < ?').run(sevenDaysAgo);
@@ -317,5 +325,18 @@ export const database = {
     const tzKey = 'user_timezone';
     db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
       .run(userId, tzKey, timezone);
-  }
+  },
+
+  getCachedAnalysis: (eventKey: string): AnalysisResult | null => {
+    const row = db.prepare(
+      'SELECT analysis FROM ai_analysis_cache WHERE event_key = ? AND created_at > ?'
+    ).get(eventKey, Date.now() - 24 * 60 * 60 * 1000) as { analysis: string } | undefined;
+    return row ? (JSON.parse(row.analysis) as AnalysisResult) : null;
+  },
+
+  setCachedAnalysis: (eventKey: string, result: AnalysisResult): void => {
+    db.prepare(
+      'INSERT OR REPLACE INTO ai_analysis_cache (event_key, analysis, created_at) VALUES (?, ?, ?)'
+    ).run(eventKey, JSON.stringify(result), Date.now());
+  },
 };

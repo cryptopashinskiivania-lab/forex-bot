@@ -291,7 +291,7 @@ export class SchedulerService {
 
   /**
    * Run the notification check once (events without time, RSS).
-   * Called by cron every 3 min and once on startup after delay.
+   * Called by cron every 10 min and once on startup after delay.
    */
   private async runScheduledCheck(bot: Bot): Promise<void> {
     console.log('[Scheduler] Running scheduled check...');
@@ -350,11 +350,19 @@ export class SchedulerService {
 
                 if (!event.timeISO && !quiet && !alreadySent) {
                   try {
-                    const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                    const result = await this.analysisService.analyzeNews(
-                      text,
-                      event.source || 'ForexFactory'
-                    );
+                    const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
+                    let result = database.getCachedAnalysis(eventKey);
+                    if (!result) {
+                      console.log(`[AI] Cache MISS: ${event.title}`);
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      result = await this.analysisService.analyzeNews(
+                        text,
+                        event.source || 'ForexFactory'
+                      );
+                      database.setCachedAnalysis(eventKey, result);
+                    } else {
+                      console.log(`[AI] Cache HIT: ${event.title}`);
+                    }
                     const emoji = scoreEmoji(result.score);
                     const header = this.getHeader(false);
                     const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
@@ -392,11 +400,19 @@ export class SchedulerService {
                   const reminderId = `reminder_${userId}_${id}`;
                   if (now >= reminderFrom && now < reminderWindowEnd && !database.hasSent(reminderId)) {
                     try {
-                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                      const result = await this.analysisService.analyzeNews(
-                        text,
-                        event.source || 'ForexFactory'
-                      );
+                      const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
+                      let result = database.getCachedAnalysis(eventKey);
+                      if (!result) {
+                        console.log(`[AI] Cache MISS: ${event.title}`);
+                        const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                        result = await this.analysisService.analyzeNews(
+                          text,
+                          event.source || 'ForexFactory'
+                        );
+                        database.setCachedAnalysis(eventKey, result);
+                      } else {
+                        console.log(`[AI] Cache HIT: ${event.title}`);
+                      }
                       const emoji = scoreEmoji(result.score);
                       const header = this.getHeader(false);
                       const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
@@ -437,11 +453,19 @@ export class SchedulerService {
                     const resultWindowEnd = addMinutes(eventTime, RESULT_WINDOW_DURATION);
                     if (now >= resultFrom && now < resultWindowEnd) {
                       try {
-                        const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                        const analysisResult = await this.analysisService.analyzeNews(
-                          text,
-                          event.source || 'ForexFactory'
-                        );
+                        const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
+                        let analysisResult = database.getCachedAnalysis(eventKey);
+                        if (!analysisResult) {
+                          console.log(`[AI] Cache MISS: ${event.title}`);
+                          const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                          analysisResult = await this.analysisService.analyzeNews(
+                            text,
+                            event.source || 'ForexFactory'
+                          );
+                          database.setCachedAnalysis(eventKey, analysisResult);
+                        } else {
+                          console.log(`[AI] Cache HIT: ${event.title}`);
+                        }
                         const emoji = scoreEmoji(analysisResult.score);
                         const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
                         const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
@@ -483,8 +507,16 @@ export class SchedulerService {
 
                   if (!database.hasSent(rssId)) {
                     try {
-                      const text = `Breaking News: ${item.title}. Summary: ${item.summary}`;
-                      const result = await this.analysisService.analyzeNews(text, item.source);
+                      const eventKey = md5(item.title + item.summary);
+                      let result = database.getCachedAnalysis(eventKey);
+                      if (!result) {
+                        console.log(`[AI] Cache MISS: ${item.title}`);
+                        const text = `Breaking News: ${item.title}. Summary: ${item.summary}`;
+                        result = await this.analysisService.analyzeNews(text, item.source);
+                        database.setCachedAnalysis(eventKey, result);
+                      } else {
+                        console.log(`[AI] Cache HIT: ${item.title}`);
+                      }
                       const emoji = scoreEmoji(result.score);
                       const header = this.getHeader(true);
 
@@ -537,7 +569,7 @@ export class SchedulerService {
               if (
                 !quiet &&
                 nowInUserTz.getHours() === DAILY_SUMMARY_HOUR &&
-                nowInUserTz.getMinutes() < 3 &&
+                nowInUserTz.getMinutes() < 10 &&
                 !database.hasSent(dailySummaryId)
               ) {
                 const { text: dailyText } = buildDailyMessage(
@@ -596,9 +628,9 @@ export class SchedulerService {
     console.log('[Scheduler] MyFxBook calendar: using RSS feed (MyfxbookRssService)');
     console.log('[Scheduler] Multi-user mode: notifications (events, RSS) will be sent to all registered users based on their settings');
 
-    // Check for events and RSS every 3 minutes; use UTC for predictable behavior
+    // Check every 10 min (was 3 min) - events update slowly on ForexFactory; use UTC for predictable behavior
     const minuteCheckTask = cron.schedule(
-      '*/3 * * * *',
+      '*/10 * * * *',
       () => this.runScheduledCheck(bot),
       { timezone: 'UTC', noOverlap: true }
     );
@@ -611,7 +643,7 @@ export class SchedulerService {
       void this.runScheduledCheck(bot);
     }, startDelayMs);
 
-    console.log('SchedulerService started successfully (notification check every 3 min and once after 15s)');
+    console.log('SchedulerService started successfully (notification check every 10 min and once after 15s)');
   }
 
   /**
