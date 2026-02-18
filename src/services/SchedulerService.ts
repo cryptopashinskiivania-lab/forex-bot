@@ -253,6 +253,41 @@ export class SchedulerService {
   }
 
   /**
+   * Форматирование сообщения с результатом события: заголовок РЕЗУЛЬТАТ,
+   * акцент на факт/прогноз/предыдущее и сравнение (AI-анализ без изменений).
+   */
+  private formatResultMessage(
+    flag: string,
+    currency: string,
+    title: string,
+    source: string,
+    score: number,
+    emoji: string,
+    actual: string,
+    forecast: string,
+    previous: string,
+    result: AnalysisResult
+  ): string {
+    const sentimentEmoji = getSentimentEmoji(result.sentiment);
+    const trendArrow = getTrendArrow(result.reasoning, result.sentiment);
+    const header = '📊 РЕЗУЛЬТАТ';
+    let msg = `${header} | ${flag} ${currency} | ${title}\n\n`;
+    msg += `📡 Источник: ${source}\n`;
+    msg += `🎯 Влияние: ${score}/10 ${emoji}\n`;
+    msg += `💚 Настроение: ${sentimentEmoji} ${result.sentiment === 'Pos' ? 'Позитивное' : result.sentiment === 'Neg' ? 'Негативное' : 'Нейтральное'} ${trendArrow}\n`;
+    const parts: string[] = [];
+    if (hasRealActual(actual)) parts.push(`Факт: ${actual}`);
+    if (!isEmpty(forecast)) parts.push(`Прогноз: ${forecast}`);
+    if (!isEmpty(previous)) parts.push(`Предыдущее: ${previous}`);
+    if (parts.length > 0) {
+      msg += `📊 ${parts.join(' | ')}\n`;
+    }
+    msg += `💡 Суть: ${result.summary}\n`;
+    msg += `🧠 Логика: ${result.reasoning}`;
+    return msg;
+  }
+
+  /**
    * Run the notification check once (events without time, RSS).
    * Called by cron every 3 min and once on startup after delay.
    */
@@ -351,7 +386,9 @@ export class SchedulerService {
                   const eventTime = parseISO(event.timeISO);
                   const now = new Date();
                   const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
-                  if (now >= reminderFrom && now <= eventTime) {
+                  const reminderWindowEnd = addMinutes(reminderFrom, 3);
+                  const reminderId = `reminder_${userId}_${id}`;
+                  if (now >= reminderFrom && now < reminderWindowEnd && !database.hasSent(reminderId)) {
                     try {
                       const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
                       const result = await this.analysisService.analyzeNews(
@@ -375,7 +412,7 @@ export class SchedulerService {
                         result
                       );
                       await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
-                      database.markAsSent(eventId);
+                      database.markAsSent(reminderId);
                       eventsSent++;
                       console.log(
                         `[Scheduler] Reminder sent to user ${userId}: ${event.title} (in ${REMINDER_MINUTES_BEFORE} min)`
@@ -395,7 +432,8 @@ export class SchedulerService {
                     const eventTime = parseISO(event.timeISO);
                     const now = new Date();
                     const resultFrom = addMinutes(eventTime, RESULT_MINUTES_AFTER);
-                    if (now >= resultFrom) {
+                    const resultWindowEnd = addMinutes(eventTime, 20);
+                    if (now >= resultFrom && now < resultWindowEnd) {
                       try {
                         const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
                         const analysisResult = await this.analysisService.analyzeNews(
@@ -403,11 +441,9 @@ export class SchedulerService {
                           event.source || 'ForexFactory'
                         );
                         const emoji = scoreEmoji(analysisResult.score);
-                        const header = '📊 РЕЗУЛЬТАТ';
                         const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
                         const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
-                        const msg = this.formatMessage(
-                          header,
+                        const msg = this.formatResultMessage(
                           flag,
                           event.currency,
                           displayTitle,
@@ -416,6 +452,7 @@ export class SchedulerService {
                           emoji,
                           event.actual,
                           event.forecast,
+                          event.previous ?? '',
                           analysisResult
                         );
                         await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
@@ -498,6 +535,7 @@ export class SchedulerService {
               if (
                 !quiet &&
                 nowInUserTz.getHours() === DAILY_SUMMARY_HOUR &&
+                nowInUserTz.getMinutes() < 3 &&
                 !database.hasSent(dailySummaryId)
               ) {
                 const { text: dailyText } = buildDailyMessage(
