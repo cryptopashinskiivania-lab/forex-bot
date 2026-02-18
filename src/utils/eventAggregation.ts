@@ -7,7 +7,7 @@ import { ForexFactoryCsvService } from '../services/ForexFactoryCsvService';
 import { CalendarEvent } from '../types/calendar';
 import { DataQualityService } from '../services/DataQualityService';
 
-/** Minimal interface for MyFxBook calendar (implemented by MyfxbookRssService). */
+/** Minimal interface for MyFxBook calendar (implemented by MyfxbookService). */
 export interface MyfxbookCalendarSource {
   getEventsForTodayRaw(): Promise<CalendarEvent[]>;
   getEventsForToday(userTimezone?: string): Promise<CalendarEvent[]>;

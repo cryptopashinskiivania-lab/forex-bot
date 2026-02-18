@@ -1,11 +1,11 @@
 import * as cron from 'node-cron';
 import crypto from 'crypto';
-import { Bot } from 'grammy';
+import { Bot, InlineKeyboard } from 'grammy';
 import { toZonedTime } from 'date-fns-tz';
 import { parseISO, format, subMinutes, addMinutes } from 'date-fns';
 import { ForexFactoryCsvService } from './ForexFactoryCsvService';
 import { CalendarEvent } from '../types/calendar';
-import { MyfxbookRssService } from './MyfxbookRssService';
+import { MyfxbookService } from './MyfxbookService';
 import { AnalysisService, AnalysisResult } from './AnalysisService';
 import { RssService, RssNewsItem } from './RssService';
 import { DataQualityService } from './DataQualityService';
@@ -15,6 +15,7 @@ import { fetchSharedCalendarToday, getEventsForUserFromShared } from '../utils/e
 import { isPlaceholderActual } from '../utils/calendarValue';
 import { buildDailyMessage, buildDailyKeyboard } from '../utils/dailyMessage';
 import { stripRedundantCountryPrefix } from '../utils/eventTitleFormat';
+import { groupEvents, type EventGroup, getEventThemeByTitle } from '../utils/eventGrouping';
 
 const CURRENCY_FLAGS: Record<string, string> = {
   USD: '🇺🇸',
@@ -29,6 +30,69 @@ const CURRENCY_FLAGS: Record<string, string> = {
   BTC: '₿',
   OIL: '🛢️',
 };
+
+/** TTL для кэша групп уведомлений (1 час) */
+const NOTIFICATION_GROUP_CACHE_TTL_MS = 60 * 60 * 1000;
+
+const notificationGroupEntries = new Map<string, { group: EventGroup; expires: number }>();
+
+export function setNotificationGroup(groupId: string, group: EventGroup): void {
+  notificationGroupEntries.set(groupId, {
+    group,
+    expires: Date.now() + NOTIFICATION_GROUP_CACHE_TTL_MS,
+  });
+}
+
+export function getNotificationGroup(groupId: string): EventGroup | undefined {
+  const entry = notificationGroupEntries.get(groupId);
+  if (!entry) return undefined;
+  if (Date.now() > entry.expires) {
+    notificationGroupEntries.delete(groupId);
+    return undefined;
+  }
+  return entry.group;
+}
+
+/** Иконки тем для саммари уведомления группы (как в eventGrouping / dailyMessage) */
+const THEME_ICONS: Record<string, string> = {
+  labor: '💼',
+  trade: '🚢',
+  inflation: '📈',
+  housing: '🏠',
+  pmi: '🏭',
+  other: '📊',
+};
+
+function formatGroupNotification(group: EventGroup, _userTz: string): string {
+  const lines: string[] = [];
+  lines.push(`🔔 ${group.title}`);
+  lines.push(`📊 ${group.events.length} events published (${group.time})`);
+  lines.push('');
+  const displayThemes = ['labor', 'trade', 'inflation', 'housing', 'pmi', 'other'];
+  const byTheme = new Map<string, number>();
+  for (const t of displayThemes) {
+    byTheme.set(t, 0);
+  }
+  for (const e of group.events) {
+    const theme = getEventThemeByTitle(e.title);
+    const key = displayThemes.includes(theme) ? theme : 'other';
+    byTheme.set(key, (byTheme.get(key) ?? 0) + 1);
+  }
+  for (const theme of displayThemes) {
+    const count = byTheme.get(theme) ?? 0;
+    if (count === 0) continue;
+    const icon = THEME_ICONS[theme] ?? THEME_ICONS.other;
+    lines.push(`${icon} ${theme}: ${count} events`);
+  }
+  return lines.join('\n');
+}
+
+function buildGroupNotificationKeyboard(groupId: string): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  keyboard.row({ text: '📋 View Results', callback_data: `notify_group_${groupId}` });
+  keyboard.row({ text: '🧠 AI Analysis', callback_data: `notify_ai_${groupId}` });
+  return keyboard;
+}
 
 function md5(str: string): string {
   return crypto.createHash('md5').update(str, 'utf8').digest('hex');
@@ -204,7 +268,7 @@ function isQuietHours(userId: number): boolean {
 
 export class SchedulerService {
   private forexFactoryService: ForexFactoryCsvService;
-  private myfxbookService: MyfxbookRssService;
+  private myfxbookService: MyfxbookService;
   private analysisService: AnalysisService;
   private rssService: RssService;
   private dataQualityService: DataQualityService;
@@ -212,7 +276,7 @@ export class SchedulerService {
 
   constructor() {
     this.forexFactoryService = new ForexFactoryCsvService();
-    this.myfxbookService = new MyfxbookRssService();
+    this.myfxbookService = new MyfxbookService();
     this.analysisService = new AnalysisService();
     this.rssService = new RssService();
     this.dataQualityService = new DataQualityService();
@@ -336,9 +400,13 @@ export class SchedulerService {
               );
 
               const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
+              const now = new Date();
+              const userTz = database.getTimezone(userId);
 
               let eventsSent = 0;
               let rssSent = 0;
+              let groupCount = 0;
+              let singleCount = 0;
 
               if (userEventsRaw.length === 0 || userEvents.length === 0) {
                 console.log(
@@ -346,13 +414,100 @@ export class SchedulerService {
                 );
               }
 
+              // События без времени — по одному (группировка не применяется)
               for (const event of userEvents) {
+                if (event.timeISO) continue;
                 const time = event.timeISO || event.time;
                 const id = itemId(event.title, time);
                 const eventId = `event_${userId}_${id}`;
-                const alreadySent = database.hasSent(eventId);
+                if (database.hasSent(eventId)) continue;
+                try {
+                  const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
+                  let result = database.getCachedAnalysis(eventKey);
+                  if (!result) {
+                    console.log(`[AI] Cache MISS: ${event.title}`);
+                    const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                    result = await this.analysisService.analyzeNews(
+                      text,
+                      event.source || 'ForexFactory'
+                    );
+                    database.setCachedAnalysis(eventKey, result);
+                  } else {
+                    console.log(`[AI] Cache HIT: ${event.title}`);
+                  }
+                  const emoji = scoreEmoji(result.score);
+                  const header = this.getHeader(false);
+                  const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                  const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
+                  const msg = this.formatMessage(
+                    header,
+                    flag,
+                    event.currency,
+                    displayTitle,
+                    event.source || 'ForexFactory',
+                    result.score,
+                    emoji,
+                    event.actual,
+                    event.forecast,
+                    result
+                  );
+                  await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                  database.markAsSent(eventId);
+                  eventsSent++;
+                  singleCount++;
+                  console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
+                } catch (err) {
+                  logNotificationSendError('event', userId, eventId, err, {
+                    title: event.title,
+                    currency: event.currency,
+                  });
+                }
+              }
 
-                if (!event.timeISO && !alreadySent) {
+              // Напоминания (15 мин до): группируем и отправляем группами или по одному
+              const reminderList = userEvents.filter((event) => {
+                if (!event.timeISO) return false;
+                const eventTime = parseISO(event.timeISO);
+                const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
+                const reminderWindowEnd = addMinutes(reminderFrom, 3);
+                if (now < reminderFrom || now >= reminderWindowEnd) return false;
+                const id = itemId(event.title, event.timeISO || event.time);
+                return !database.hasSent(`reminder_${userId}_${id}`);
+              });
+              const groupedReminders = groupEvents(reminderList);
+              for (const item of groupedReminders) {
+                if ('events' in item) {
+                  const group = item as EventGroup;
+                  if (database.hasSentGroup(group.groupId, 'reminder')) continue;
+                  try {
+                    const text = formatGroupNotification(group, userTz);
+                    const keyboard = buildGroupNotificationKeyboard(group.groupId);
+                    setNotificationGroup(group.groupId, group);
+                    await bot.api.sendMessage(userId, text, {
+                      parse_mode: undefined,
+                      reply_markup: keyboard,
+                    });
+                    database.markGroupAsSent(group.groupId, 'reminder');
+                    for (const e of group.events) {
+                      const rid = itemId(e.title, e.timeISO || e.time);
+                      database.markAsSent(`reminder_${userId}_${rid}`);
+                    }
+                    groupCount++;
+                    eventsSent += group.events.length;
+                    console.log(
+                      `[Scheduler] Group reminder sent to user ${userId}: ${group.title} (${group.events.length} events)`
+                    );
+                  } catch (err) {
+                    logNotificationSendError('reminder', userId, `group_${group.groupId}`, err, {
+                      title: group.title,
+                      currency: group.currency,
+                    });
+                  }
+                } else {
+                  const event = item as CalendarEvent;
+                  const id = itemId(event.title, event.timeISO || event.time);
+                  const reminderId = `reminder_${userId}_${id}`;
+                  if (database.hasSent(reminderId)) continue;
                   try {
                     const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
                     let result = database.getCachedAnalysis(eventKey);
@@ -384,122 +539,114 @@ export class SchedulerService {
                       result
                     );
                     await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
-                    database.markAsSent(eventId);
+                    database.markAsSent(reminderId);
                     eventsSent++;
-                    console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
+                    singleCount++;
+                    console.log(
+                      `[Scheduler] Reminder sent to user ${userId}: ${event.title} (in ${REMINDER_MINUTES_BEFORE} min)`
+                    );
                   } catch (err) {
-                    logNotificationSendError('event', userId, eventId, err, {
+                    logNotificationSendError('reminder', userId, reminderId, err, {
                       title: event.title,
                       currency: event.currency,
                     });
                   }
-                  continue;
                 }
+              }
 
-                if (event.timeISO && !alreadySent) {
-                  const eventTime = parseISO(event.timeISO);
-                  const now = new Date();
-                  const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
-                  const reminderWindowEnd = addMinutes(reminderFrom, 3);
-                  const reminderId = `reminder_${userId}_${id}`;
-                  if (now >= reminderFrom && now < reminderWindowEnd && !database.hasSent(reminderId)) {
-                    try {
-                      const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
-                      let result = database.getCachedAnalysis(eventKey);
-                      if (!result) {
-                        console.log(`[AI] Cache MISS: ${event.title}`);
-                        const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                        result = await this.analysisService.analyzeNews(
-                          text,
-                          event.source || 'ForexFactory'
-                        );
-                        database.setCachedAnalysis(eventKey, result);
-                      } else {
-                        console.log(`[AI] Cache HIT: ${event.title}`);
-                      }
-                      const emoji = scoreEmoji(result.score);
-                      const header = this.getHeader(false);
-                      const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
-                      const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
-                      const msg = this.formatMessage(
-                        header,
-                        flag,
-                        event.currency,
-                        displayTitle,
-                        event.source || 'ForexFactory',
-                        result.score,
-                        emoji,
-                        event.actual,
-                        event.forecast,
-                        result
-                      );
-                      await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
-                      database.markAsSent(reminderId);
-                      eventsSent++;
-                      console.log(
-                        `[Scheduler] Reminder sent to user ${userId}: ${event.title} (in ${REMINDER_MINUTES_BEFORE} min)`
-                      );
-                    } catch (err) {
-                      logNotificationSendError('reminder', userId, eventId, err, {
-                        title: event.title,
-                        currency: event.currency,
-                      });
+              // Результаты (после публикации): группируем и отправляем группами или по одному
+              const resultList = userEvents.filter((event) => {
+                if (!event.timeISO || !hasRealActual(event.actual)) return false;
+                const eventTime = parseISO(event.timeISO);
+                const resultFrom = addMinutes(eventTime, RESULT_MINUTES_AFTER);
+                const resultWindowEnd = addMinutes(eventTime, RESULT_WINDOW_DURATION);
+                if (now < resultFrom || now >= resultWindowEnd) return false;
+                const id = itemId(event.title, event.timeISO || event.time);
+                return !database.hasSent(`result_${userId}_${id}`);
+              });
+              const groupedResults = groupEvents(resultList);
+              for (const item of groupedResults) {
+                if ('events' in item) {
+                  const group = item as EventGroup;
+                  if (database.hasSentGroup(group.groupId, 'result')) continue;
+                  try {
+                    const text = formatGroupNotification(group, userTz);
+                    const keyboard = buildGroupNotificationKeyboard(group.groupId);
+                    setNotificationGroup(group.groupId, group);
+                    await bot.api.sendMessage(userId, text, {
+                      parse_mode: undefined,
+                      reply_markup: keyboard,
+                    });
+                    database.markGroupAsSent(group.groupId, 'result');
+                    for (const e of group.events) {
+                      const rid = itemId(e.title, e.timeISO || e.time);
+                      database.markAsSent(`result_${userId}_${rid}`);
                     }
+                    groupCount++;
+                    eventsSent += group.events.length;
+                    console.log(
+                      `[Scheduler] Group result sent to user ${userId}: ${group.title} (${group.events.length} events)`
+                    );
+                  } catch (err) {
+                    logNotificationSendError('result', userId, `group_${group.groupId}`, err, {
+                      title: group.title,
+                      currency: group.currency,
+                    });
                   }
-                }
-
-                if (event.timeISO && hasRealActual(event.actual)) {
+                } else {
+                  const event = item as CalendarEvent;
+                  const id = itemId(event.title, event.timeISO || event.time);
                   const resultId = `result_${userId}_${id}`;
-                  if (!database.hasSent(resultId)) {
-                    const eventTime = parseISO(event.timeISO);
-                    const now = new Date();
-                    const resultFrom = addMinutes(eventTime, RESULT_MINUTES_AFTER);
-                    const resultWindowEnd = addMinutes(eventTime, RESULT_WINDOW_DURATION);
-                    if (now >= resultFrom && now < resultWindowEnd) {
-                      try {
-                        const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
-                        let analysisResult = database.getCachedAnalysis(eventKey);
-                        if (!analysisResult) {
-                          console.log(`[AI] Cache MISS: ${event.title}`);
-                          const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                          analysisResult = await this.analysisService.analyzeNews(
-                            text,
-                            event.source || 'ForexFactory'
-                          );
-                          database.setCachedAnalysis(eventKey, analysisResult);
-                        } else {
-                          console.log(`[AI] Cache HIT: ${event.title}`);
-                        }
-                        const emoji = scoreEmoji(analysisResult.score);
-                        const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
-                        const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
-                        const msg = this.formatResultMessage(
-                          flag,
-                          event.currency,
-                          displayTitle,
-                          event.source || 'ForexFactory',
-                          analysisResult.score,
-                          emoji,
-                          event.actual,
-                          event.forecast,
-                          event.previous ?? '',
-                          analysisResult
-                        );
-                        await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
-                        database.markAsSent(resultId);
-                        eventsSent++;
-                        console.log(
-                          `[Scheduler] Result sent to user ${userId}: ${event.title} (actual: ${event.actual})`
-                        );
-                      } catch (err) {
-                        logNotificationSendError('result', userId, resultId, err, {
-                          title: event.title,
-                          currency: event.currency,
-                        });
-                      }
+                  if (database.hasSent(resultId)) continue;
+                  try {
+                    const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
+                    let analysisResult = database.getCachedAnalysis(eventKey);
+                    if (!analysisResult) {
+                      console.log(`[AI] Cache MISS: ${event.title}`);
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      analysisResult = await this.analysisService.analyzeNews(
+                        text,
+                        event.source || 'ForexFactory'
+                      );
+                      database.setCachedAnalysis(eventKey, analysisResult);
+                    } else {
+                      console.log(`[AI] Cache HIT: ${event.title}`);
                     }
+                    const emoji = scoreEmoji(analysisResult.score);
+                    const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                    const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
+                    const msg = this.formatResultMessage(
+                      flag,
+                      event.currency,
+                      displayTitle,
+                      event.source || 'ForexFactory',
+                      analysisResult.score,
+                      emoji,
+                      event.actual,
+                      event.forecast,
+                      event.previous ?? '',
+                      analysisResult
+                    );
+                    await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                    database.markAsSent(resultId);
+                    eventsSent++;
+                    singleCount++;
+                    console.log(
+                      `[Scheduler] Result sent to user ${userId}: ${event.title} (actual: ${event.actual})`
+                    );
+                  } catch (err) {
+                    logNotificationSendError('result', userId, resultId, err, {
+                      title: event.title,
+                      currency: event.currency,
+                    });
                   }
                 }
+              }
+
+              if (groupCount > 0 || singleCount > 0) {
+                console.log(
+                  `[Scheduler] Sent ${groupCount} group notifications and ${singleCount} individual`
+                );
               }
 
               if (isRssEnabled) {
@@ -566,7 +713,6 @@ export class SchedulerService {
                 }
               }
 
-              const userTz = database.getTimezone(userId);
               const nowInUserTz = toZonedTime(new Date(), userTz);
               const todayDateStr = format(nowInUserTz, 'yyyy-MM-dd');
               const dailySummaryId = `daily8_${userId}_${todayDateStr}`;
@@ -575,12 +721,12 @@ export class SchedulerService {
                 nowInUserTz.getMinutes() < 10 &&
                 !database.hasSent(dailySummaryId)
               ) {
-                const { text: dailyText } = buildDailyMessage(
+                const { text: dailyText, grouped: dailyGrouped } = buildDailyMessage(
                   userEvents,
                   userTz,
                   monitoredAssets
                 );
-                const keyboard = buildDailyKeyboard();
+                const keyboard = buildDailyKeyboard(dailyGrouped);
                 try {
                   await bot.api.sendMessage(userId, dailyText, {
                     parse_mode: undefined,
@@ -628,7 +774,7 @@ export class SchedulerService {
 
   start(bot: Bot): void {
     console.log('Starting SchedulerService with per-user timezone support...');
-    console.log('[Scheduler] MyFxBook calendar: using RSS feed (MyfxbookRssService)');
+    console.log('[Scheduler] MyFxBook calendar: using Playwright (MyfxbookService)');
     console.log('[Scheduler] Multi-user mode: notifications (events, RSS) will be sent to all registered users based on their settings');
 
     // Check every 10 min (was 3 min) - events update slowly on ForexFactory; use UTC for predictable behavior

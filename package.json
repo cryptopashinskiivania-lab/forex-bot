@@ -34,6 +34,7 @@
     "groq-sdk": "^0.37.0",
     "node-cron": "^4.2.1",
     "papaparse": "^5.5.3",
+    "playwright": "^1.49.0",
     "rss-parser": "^3.13.0"
   },
   "devDependencies": {

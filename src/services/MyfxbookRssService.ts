@@ -114,6 +114,32 @@ function normalizeValue(s: string): string {
 }
 
 /**
+ * Parse RSS pubDate to ISO string in UTC. MyFxBook feed is in GMT.
+ * If the string has no timezone (e.g. "2026-02-18T07:00:00" or "Wed, 18 Feb 2026 07:00:00"),
+ * JavaScript would interpret it as server local time; we treat it as GMT so calendar dates are consistent.
+ */
+function parsePubDateToUtcIso(pubDateStr: string | undefined): string | undefined {
+  if (!pubDateStr || typeof pubDateStr !== 'string') return undefined;
+  const s = pubDateStr.trim();
+  if (!s) return undefined;
+  const hasTimezone = /[Zz]|[+-]\d{2}:?\d{2}$|\s(GMT|UTC|EST|EDT|CET|CEST|PST|PDT|[A-Z]{3,4})$/i.test(s);
+  let dateStr = s;
+  if (!hasTimezone) {
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?$/i.test(s)) {
+      dateStr = s + 'Z';
+    } else if (/^[A-Za-z]{3},\s*\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{1,2}:\d{2}(:\d{2})?$/i.test(s)) {
+      dateStr = s + ' GMT';
+    }
+  }
+  try {
+    const d = new Date(dateStr);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Extract currency from title ("USD - Event Name") or from link path (e.g. /united-kingdom/ -> GBP).
  */
 function extractCurrency(title: string, link: string): string {
@@ -146,6 +172,24 @@ function parseImpactFromHtml(html: string): 'High' | 'Medium' | 'Low' {
 }
 
 /**
+ * Parse "Time left" from first column: "12345 seconds", "-40618 seconds", or "0 seconds".
+ * MyFxBook RSS uses this as seconds from feed reference time to the event; eventTime = referenceTime + timeLeftSeconds.
+ */
+function parseTimeLeftSeconds(description: string): number | null {
+  const $ = cheerio.load(description);
+  const rows = $('table tr');
+  if (rows.length < 2) return null;
+  const dataRow = rows.eq(1);
+  const cells = dataRow.find('td');
+  if (cells.length < 1) return null;
+  const raw = cells.eq(0).text().trim();
+  const match = raw.match(/^(-?\d+)\s*seconds?$/i);
+  if (!match) return null;
+  const sec = parseInt(match[1], 10);
+  return Number.isFinite(sec) ? sec : null;
+}
+
+/**
  * Parse table row from description HTML: columns are Time left, Impact, Previous, Consensus, Actual.
  */
 function parseTableFromDescription(description: string): {
@@ -153,6 +197,7 @@ function parseTableFromDescription(description: string): {
   previous: string;
   consensus: string;
   actual: string;
+  timeLeftSeconds: number | null;
 } {
   const impact: 'High' | 'Medium' | 'Low' = parseImpactFromHtml(description);
   let previous = '—';
@@ -171,7 +216,8 @@ function parseTableFromDescription(description: string): {
       actual = isPlaceholderActual(actualRaw) ? '—' : (actualRaw || '—');
     }
   }
-  return { impact, previous, consensus, actual };
+  const timeLeftSeconds = parseTimeLeftSeconds(description);
+  return { impact, previous, consensus, actual, timeLeftSeconds };
 }
 
 export class MyfxbookRssService {
@@ -211,6 +257,7 @@ export class MyfxbookRssService {
       }
 
       const events: CalendarEvent[] = [];
+      const fetchTimeMs = Date.now();
 
       for (const item of feed.items) {
         try {
@@ -222,14 +269,21 @@ export class MyfxbookRssService {
           const currency = extractCurrency(title, link);
           if (!currency || currency.length > 3) continue;
 
-          const pubDate = item.pubDate ? new Date(item.pubDate) : null;
-          const timeISO = pubDate && pubDate.getTime() ? pubDate.toISOString() : undefined;
-          const timeDisplay = pubDate
-            ? dayjs(pubDate).tz(MYFXBOOK_TZ).format('HH:mm')
-            : '—';
-
           const description = item.content || item.contentSnippet || item.description || '';
-          const { impact, previous, consensus, actual } = parseTableFromDescription(description);
+          const { impact, previous, consensus, actual, timeLeftSeconds } = parseTableFromDescription(description);
+
+          // Время события: приоритет у "Time left" (секунды от момента генерации фида), иначе pubDate.
+          // eventTime = fetchTime + timeLeftSeconds даёт правильную дату/время события (совпадает с календарём на сайте).
+          let timeISO: string | undefined;
+          if (timeLeftSeconds !== null && Number.isFinite(timeLeftSeconds)) {
+            const eventMs = fetchTimeMs + timeLeftSeconds * 1000;
+            timeISO = new Date(eventMs).toISOString();
+          } else {
+            timeISO = parsePubDateToUtcIso(item.pubDate);
+          }
+          const timeDisplay = timeISO
+            ? dayjs(timeISO).tz(MYFXBOOK_TZ).format('HH:mm')
+            : '—';
 
           if (impact !== 'High' && impact !== 'Medium') continue;
 
@@ -287,16 +341,19 @@ export class MyfxbookRssService {
   }
 
   /**
-   * Get today's events (raw, no timezone filter). Same API as MyfxbookService.
+   * Get events for shared calendar (raw: no user timezone filter).
+   * Returns today + tomorrow in GMT so that getEventsForUserFromShared can show
+   * "today" in any user TZ (e.g. user in Kyiv already has 19th while GMT is still 18th).
    */
   async getEventsForTodayRaw(): Promise<CalendarEvent[]> {
     const all = await this.fetchAllEvents();
-    const todayStart = dayjs().tz(MYFXBOOK_TZ).startOf('day');
-    const todayEnd = dayjs().tz(MYFXBOOK_TZ).endOf('day');
+    const now = dayjs().tz(MYFXBOOK_TZ);
+    const todayStart = now.startOf('day');
+    const tomorrowEnd = now.add(1, 'day').endOf('day');
     return all.filter((e) => {
       if (!e.timeISO) return true;
       const t = dayjs(e.timeISO);
-      return (t.isAfter(todayStart) || t.isSame(todayStart)) && (t.isBefore(todayEnd) || t.isSame(todayEnd));
+      return (t.isAfter(todayStart) || t.isSame(todayStart)) && (t.isBefore(tomorrowEnd) || t.isSame(tomorrowEnd));
     });
   }
 
@@ -313,7 +370,7 @@ export class MyfxbookRssService {
     const filtered = all.filter((event) => {
       if (!event.timeISO) return false;
       const eventDate = dayjs(event.timeISO).tz(tz);
-      return eventDate.isAfter(todayStart) && eventDate.isBefore(todayEnd);
+      return (eventDate.isSame(todayStart) || eventDate.isAfter(todayStart)) && (eventDate.isSame(todayEnd) || eventDate.isBefore(todayEnd));
     });
 
     if (process.env.LOG_LEVEL === 'debug') {
@@ -335,18 +392,35 @@ export class MyfxbookRssService {
     const tomorrowStart = nowLocal.add(1, 'day').startOf('day');
     const tomorrowEnd = nowLocal.add(1, 'day').endOf('day');
 
-    const filtered = all.filter((event) => {
-      if (!event.timeISO) return false;
-      const eventDate = dayjs(event.timeISO).tz(tz);
-      return eventDate.isAfter(tomorrowStart) && eventDate.isBefore(tomorrowEnd);
-    });
+    console.log(`[MyfxbookRssService] getEventsForTomorrow: tz=${tz}, range=${tomorrowStart.format('YYYY-MM-DD HH:mm')} to ${tomorrowEnd.format('YYYY-MM-DD HH:mm')}`);
+    console.log(`[MyfxbookRssService] Total events before filter: ${all.length}`);
 
-    if (process.env.LOG_LEVEL === 'debug') {
-      const filteredOut = all.length - filtered.length;
-      if (filteredOut > 0) {
-        console.log(`[MyfxbookRssService] Tomorrow (${tz}): ${filtered.length} events, ${filteredOut} filtered out`);
+    let noTimeISO = 0;
+    let outOfRange = 0;
+    let passed = 0;
+    const filtered = all.filter((event) => {
+      if (!event.timeISO) {
+        noTimeISO++;
+        return false;
       }
-    }
+      const eventDate = dayjs(event.timeISO).tz(tz);
+      const isInRange = (eventDate.isSame(tomorrowStart) || eventDate.isAfter(tomorrowStart)) && (eventDate.isSame(tomorrowEnd) || eventDate.isBefore(tomorrowEnd));
+      if (!isInRange) {
+        outOfRange++;
+        return false;
+      }
+      passed++;
+      return true;
+    });
+    console.log(`[MyfxbookRssService] Filter results: passed=${passed}, noTimeISO=${noTimeISO}, outOfRange=${outOfRange}`);
+    const sample = all.slice(0, 10).map(e => ({
+      currency: e.currency,
+      title: e.title.slice(0, 40),
+      timeISO: e.timeISO,
+      inRange: e.timeISO ? dayjs(e.timeISO).tz(tz).format('YYYY-MM-DD HH:mm') : 'NO_TIME'
+    }));
+    console.log('[MyfxbookRssService] First 10 events:', JSON.stringify(sample, null, 2));
+
     return filtered;
   }
 

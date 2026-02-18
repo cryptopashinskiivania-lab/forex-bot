@@ -4,8 +4,8 @@ import { database } from './db/database';
 import { AnalysisService } from './services/AnalysisService';
 import { ForexFactoryCsvService } from './services/ForexFactoryCsvService';
 import { CalendarEvent } from './types/calendar';
-import { MyfxbookRssService } from './services/MyfxbookRssService';
-import { SchedulerService } from './services/SchedulerService';
+import { MyfxbookService } from './services/MyfxbookService';
+import { SchedulerService, getNotificationGroup } from './services/SchedulerService';
 import { DataQualityService } from './services/DataQualityService';
 import { initializeQueue } from './services/MessageQueue';
 import { initializeAdminAlerts } from './utils/adminAlerts';
@@ -14,6 +14,7 @@ import { toZonedTime } from 'date-fns-tz';
 import { aggregateCoreEvents } from './utils/eventAggregation';
 import { buildDailyMessage, buildDailyKeyboard } from './utils/dailyMessage';
 import { stripRedundantCountryPrefix } from './utils/eventTitleFormat';
+import type { EventGroup } from './utils/eventGrouping';
 
 // User states for conversation flow (with TTL 30 min by last activity to limit memory)
 type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | null;
@@ -144,9 +145,12 @@ initializeAdminAlerts(bot);
 // Initialize services
 const analysisService = new AnalysisService();
 const forexFactoryService = new ForexFactoryCsvService();
-const myfxbookRssService = new MyfxbookRssService();
+const myfxbookService = new MyfxbookService();
 const schedulerService = new SchedulerService();
 const dataQualityService = new DataQualityService();
+
+/** Кэш групп для callback group_details / ai_single (очищается при перезапуске) */
+const groupsCache = new Map<string, EventGroup>();
 
 /**
  * Format event time to 24-hour format (HH:mm) in the user's timezone
@@ -192,6 +196,34 @@ function formatTime24(event: CalendarEvent, timezone: string): string {
   return timeStr;
 }
 
+/** Экранирование символов для Telegram Markdown */
+function escapeMarkdown(s: string): string {
+  return s.replace(/([_*\[\]`])/g, '\\$1');
+}
+
+/**
+ * Получить контент /daily для пользователя: текст, клавиатура и заполнить groupsCache.
+ */
+async function getDailyContentForUser(userId: number): Promise<{
+  text: string;
+  keyboard: InlineKeyboard;
+  grouped: Array<EventGroup | CalendarEvent>;
+}> {
+  const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
+  const monitoredAssets = database.getMonitoredAssets(userId);
+  const eventsRaw = allEvents.filter((e) => monitoredAssets.includes(e.currency));
+  const { deliver: events } = dataQualityService.filterForDelivery(eventsRaw, {
+    mode: 'general',
+    nowUtc: new Date(),
+    forScheduler: false,
+  });
+  const userTz = database.getTimezone(userId);
+  const { text, empty, grouped } = buildDailyMessage(events, userTz, monitoredAssets);
+  grouped.filter((g) => 'events' in g).forEach((g) => groupsCache.set((g as EventGroup).groupId, g as EventGroup));
+  const keyboard = buildDailyKeyboard(grouped);
+  return { text, keyboard, grouped };
+}
+
 // Helper function to build main menu keyboard
 function buildMainMenuKeyboard(): InlineKeyboard {
   const keyboard = new InlineKeyboard();
@@ -202,7 +234,6 @@ function buildMainMenuKeyboard(): InlineKeyboard {
 // Команды по умолчанию (без /stats — она только для админа)
 const defaultCommands = [
   { command: 'daily', description: '📊 Сводка за сегодня' },
-  { command: 'tomorrow', description: '📅 Календарь на завтра' },
   { command: 'settings', description: '⚙️ Настройки' },
   { command: 'ask', description: '❓ Вопрос эксперту' },
   { command: 'id', description: '🆔 Мой ID' },
@@ -325,29 +356,11 @@ bot.command('daily', async (ctx) => {
       await ctx.reply('❌ Ошибка: не удалось определить пользователя');
       return;
     }
-    
     const userId = ctx.from.id;
-    
     console.log('[Bot] Sending "loading" message...');
     await ctx.reply('📊 Загружаю события за сегодня...');
     console.log('[Bot] Fetching events...');
-    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
-    console.log(`[Bot] Got ${allEvents.length} total events`);
-    
-    // Filter events by user's monitored assets
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const currenciesInEvents = [...new Set(allEvents.map(e => e.currency))].sort();
-    const eventTimesPreview = allEvents.slice(0, 15).map(e => `${e.currency}:${(e.timeISO || e.time || '?').toString().slice(0, 16)}`).join('; ');
-    const timeSuffix = allEvents.length > 15 ? `; ...+${allEvents.length - 15} more` : '';
-    console.log(`[Bot] /daily: currencies in events=[${currenciesInEvents.join(', ')}] (${allEvents.length} total). time=[${eventTimesPreview}${timeSuffix}]. User ${userId} monitoring=[${monitoredAssets.join(', ')}]`);
-    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
-    // For /daily show events up to 24h ago (forScheduler: false); scheduler uses 2h (forScheduler: true)
-    const { deliver: events } = dataQualityService.filterForDelivery(eventsRaw, { mode: 'general', nowUtc: new Date(), forScheduler: false });
-    console.log(`[Bot] Filtered to ${events.length} events for user ${userId} (monitoring: ${monitoredAssets.join(', ')})`);
-
-    const userTz = database.getTimezone(userId);
-    const { text, empty } = buildDailyMessage(events, userTz, monitoredAssets);
-    const keyboard = buildDailyKeyboard();
+    const { text, keyboard } = await getDailyContentForUser(userId);
     await ctx.reply(text, { reply_markup: keyboard });
   } catch (error) {
     console.error('Error in daily command:', error);
@@ -368,7 +381,7 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
+    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
@@ -451,6 +464,283 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
   }
 });
 
+const MAX_EVENT_BUTTONS = 10;
+
+// Group details: show events table + buttons for AI analysis per event
+bot.callbackQuery(/^group_details_(.+)$/, async (ctx) => {
+  try {
+    const groupId = ctx.match[1];
+    const group = groupsCache.get(groupId);
+    if (!group) {
+      await ctx.answerCallbackQuery({ text: 'Group expired, use /daily again', show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    const header = `${escapeMarkdown(group.title)} (${group.time})`;
+    const rows: string[] = ['Event | Actual | Forecast', '—'];
+    const maxTitleLen = 25;
+    for (const e of group.events) {
+      const shortTitle = e.title.length > maxTitleLen ? e.title.slice(0, maxTitleLen - 3) + '...' : e.title;
+      const actual = (e.actual || '—').trim();
+      const forecast = (e.forecast || '—').trim();
+      rows.push(`${escapeMarkdown(shortTitle)} | ${escapeMarkdown(actual)} | ${escapeMarkdown(forecast)}`);
+    }
+    const eventsSlice = group.events.slice(0, MAX_EVENT_BUTTONS);
+    const moreCount = group.events.length - MAX_EVENT_BUTTONS;
+    const moreText = moreCount > 0 ? `\n\n_… and ${moreCount} more_` : '';
+    const body = rows.join('\n') + moreText;
+    const keyboard = new InlineKeyboard();
+    for (let i = 0; i < eventsSlice.length; i += 2) {
+      const a = eventsSlice[i];
+      const labelA = `${i + 1}. ${a.title.length > 18 ? a.title.slice(0, 15) + '...' : a.title}`;
+      if (i + 1 < eventsSlice.length) {
+        const b = eventsSlice[i + 1];
+        const labelB = `${i + 2}. ${b.title.length > 18 ? b.title.slice(0, 15) + '...' : b.title}`;
+        keyboard.row(
+          { text: labelA, callback_data: `ai_single_${groupId}_${i}` },
+          { text: labelB, callback_data: `ai_single_${groupId}_${i + 1}` }
+        );
+      } else {
+        keyboard.row({ text: labelA, callback_data: `ai_single_${groupId}_${i}` });
+      }
+    }
+    keyboard.row({ text: '🔙 Back to daily', callback_data: 'back_to_daily' });
+    await ctx.editMessageText(`${header}\n\n${body}`, {
+      reply_markup: keyboard,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('Error in group_details callback:', err);
+    await ctx.answerCallbackQuery({ text: 'Error loading group', show_alert: true }).catch(() => {});
+  }
+});
+
+// Single event AI analysis with prev/next
+bot.callbackQuery(/^ai_single_(.+)_(\d+)$/, async (ctx) => {
+  try {
+    const groupId = ctx.match[1];
+    const eventIdx = parseInt(ctx.match[2], 10);
+    const group = groupsCache.get(groupId);
+    if (!group) {
+      await ctx.answerCallbackQuery({ text: 'Group expired, use /daily again', show_alert: true });
+      return;
+    }
+    const event = group.events[eventIdx];
+    if (!event) {
+      await ctx.answerCallbackQuery({ text: 'Event not found', show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: '🧠 Analyzing...', show_alert: false });
+    const eventText = [
+      `${event.title}.`,
+      `Currency: ${event.currency}.`,
+      `Impact: ${event.impact}.`,
+      `Actual: ${event.actual || '—'}.`,
+      `Forecast: ${event.forecast || '—'}.`,
+      `Previous: ${event.previous || '—'}.`,
+    ].join(' ');
+    const analysis = await analysisService.analyzeNews(eventText, event.source);
+    const sentimentEmoji = analysis.sentiment === 'Pos' ? '📈' : analysis.sentiment === 'Neg' ? '📉' : '➡️';
+    const lines = [
+      `🧠 AI Analysis: ${escapeMarkdown(event.title)}`,
+      '',
+      `📊 Impact Score: ${analysis.score}/10 ${sentimentEmoji}`,
+      `📝 Summary: ${escapeMarkdown(analysis.summary)}`,
+      `💱 Affected Pairs: ${(analysis.affected_pairs || []).join(', ')}`,
+      `🧠 Reasoning: ${escapeMarkdown(analysis.reasoning)}`,
+    ];
+    const keyboard = new InlineKeyboard();
+    const prevNext: { text: string; callback_data: string }[] = [];
+    if (eventIdx > 0) {
+      prevNext.push({ text: '◀️ Prev event', callback_data: `ai_single_${groupId}_${eventIdx - 1}` });
+    }
+    if (eventIdx < group.events.length - 1) {
+      prevNext.push({ text: 'Next event ▶️', callback_data: `ai_single_${groupId}_${eventIdx + 1}` });
+    }
+    if (prevNext.length > 0) {
+      keyboard.row(...prevNext);
+    }
+    keyboard.row({ text: '🔙 Back to group', callback_data: `group_details_${groupId}` });
+    await ctx.editMessageText(lines.join('\n'), {
+      reply_markup: keyboard,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('Error in ai_single callback:', err);
+    const msg = err instanceof Error ? err.message : String(err);
+    const isLimit = /tokens per day|TPD|rate limit|429/i.test(msg);
+    await ctx.answerCallbackQuery({
+      text: isLimit ? 'AI limit reached, try later' : 'Analysis failed',
+      show_alert: true,
+    }).catch(() => {});
+  }
+});
+
+// Notification group: View Results (from scheduler group notification)
+bot.callbackQuery(/^notify_group_(.+)$/, async (ctx) => {
+  try {
+    const groupId = ctx.match[1];
+    const group = getNotificationGroup(groupId);
+    if (!group) {
+      await ctx.answerCallbackQuery({ text: 'Notification expired, use /daily to view current events', show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    const header = `${escapeMarkdown(group.title)} (${group.time})`;
+    const rows: string[] = ['Event | Actual | Forecast', '—'];
+    const maxTitleLen = 25;
+    for (const e of group.events) {
+      const shortTitle = e.title.length > maxTitleLen ? e.title.slice(0, maxTitleLen - 3) + '...' : e.title;
+      const actual = (e.actual || '—').trim();
+      const forecast = (e.forecast || '—').trim();
+      rows.push(`${escapeMarkdown(shortTitle)} | ${escapeMarkdown(actual)} | ${escapeMarkdown(forecast)}`);
+    }
+    const eventsSlice = group.events.slice(0, MAX_EVENT_BUTTONS);
+    const moreCount = group.events.length - MAX_EVENT_BUTTONS;
+    const moreText = moreCount > 0 ? `\n\n_… and ${moreCount} more_` : '';
+    const body = rows.join('\n') + moreText;
+    const keyboard = new InlineKeyboard();
+    for (let i = 0; i < eventsSlice.length; i += 2) {
+      const a = eventsSlice[i];
+      const labelA = `${i + 1}. ${a.title.length > 18 ? a.title.slice(0, 15) + '...' : a.title}`;
+      if (i + 1 < eventsSlice.length) {
+        const b = eventsSlice[i + 1];
+        const labelB = `${i + 2}. ${b.title.length > 18 ? b.title.slice(0, 15) + '...' : b.title}`;
+        keyboard.row(
+          { text: labelA, callback_data: `notify_ai_single_${groupId}_${i}` },
+          { text: labelB, callback_data: `notify_ai_single_${groupId}_${i + 1}` }
+        );
+      } else {
+        keyboard.row({ text: labelA, callback_data: `notify_ai_single_${groupId}_${i}` });
+      }
+    }
+    await ctx.editMessageText(`${header}\n\n${body}`, {
+      reply_markup: keyboard,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('Error in notify_group_ callback:', err);
+    await ctx.answerCallbackQuery({ text: 'Error loading group', show_alert: true }).catch(() => {});
+  }
+});
+
+// Notification group: AI Analysis — show list of events to choose for AI
+bot.callbackQuery(/^notify_ai_(.+)$/, async (ctx) => {
+  try {
+    const groupId = ctx.match[1];
+    const group = getNotificationGroup(groupId);
+    if (!group) {
+      await ctx.answerCallbackQuery({ text: 'Notification expired, use /daily to view current events', show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    const header = `🧠 AI Analysis: ${escapeMarkdown(group.title)} (${group.time})\n\nChoose an event:`;
+    const keyboard = new InlineKeyboard();
+    const eventsSlice = group.events.slice(0, MAX_EVENT_BUTTONS);
+    for (let i = 0; i < eventsSlice.length; i += 2) {
+      const a = eventsSlice[i];
+      const labelA = `${i + 1}. ${a.title.length > 18 ? a.title.slice(0, 15) + '...' : a.title}`;
+      if (i + 1 < eventsSlice.length) {
+        const b = eventsSlice[i + 1];
+        const labelB = `${i + 2}. ${b.title.length > 18 ? b.title.slice(0, 15) + '...' : b.title}`;
+        keyboard.row(
+          { text: labelA, callback_data: `notify_ai_single_${groupId}_${i}` },
+          { text: labelB, callback_data: `notify_ai_single_${groupId}_${i + 1}` }
+        );
+      } else {
+        keyboard.row({ text: labelA, callback_data: `notify_ai_single_${groupId}_${i}` });
+      }
+    }
+    const moreCount = group.events.length - MAX_EVENT_BUTTONS;
+    const moreText = moreCount > 0 ? `\n\n_… and ${moreCount} more_` : '';
+    await ctx.editMessageText(header + moreText, {
+      reply_markup: keyboard,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('Error in notify_ai_ callback:', err);
+    await ctx.answerCallbackQuery({ text: 'Error loading group', show_alert: true }).catch(() => {});
+  }
+});
+
+// Notification group: single event AI (from notify_group_ / notify_ai_)
+bot.callbackQuery(/^notify_ai_single_(.+)_(\d+)$/, async (ctx) => {
+  try {
+    const groupId = ctx.match[1];
+    const eventIdx = parseInt(ctx.match[2], 10);
+    const group = getNotificationGroup(groupId);
+    if (!group) {
+      await ctx.answerCallbackQuery({ text: 'Notification expired, use /daily to view current events', show_alert: true });
+      return;
+    }
+    const event = group.events[eventIdx];
+    if (!event) {
+      await ctx.answerCallbackQuery({ text: 'Event not found', show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: '🧠 Analyzing...', show_alert: false });
+    const eventText = [
+      `${event.title}.`,
+      `Currency: ${event.currency}.`,
+      `Impact: ${event.impact}.`,
+      `Actual: ${event.actual || '—'}.`,
+      `Forecast: ${event.forecast || '—'}.`,
+      `Previous: ${event.previous || '—'}.`,
+    ].join(' ');
+    const analysis = await analysisService.analyzeNews(eventText, event.source);
+    const sentimentEmoji = analysis.sentiment === 'Pos' ? '📈' : analysis.sentiment === 'Neg' ? '📉' : '➡️';
+    const lines = [
+      `🧠 AI Analysis: ${escapeMarkdown(event.title)}`,
+      '',
+      `📊 Impact Score: ${analysis.score}/10 ${sentimentEmoji}`,
+      `📝 Summary: ${escapeMarkdown(analysis.summary)}`,
+      `💱 Affected Pairs: ${(analysis.affected_pairs || []).join(', ')}`,
+      `🧠 Reasoning: ${escapeMarkdown(analysis.reasoning)}`,
+    ];
+    const keyboard = new InlineKeyboard();
+    const prevNext: { text: string; callback_data: string }[] = [];
+    if (eventIdx > 0) {
+      prevNext.push({ text: '◀️ Prev event', callback_data: `notify_ai_single_${groupId}_${eventIdx - 1}` });
+    }
+    if (eventIdx < group.events.length - 1) {
+      prevNext.push({ text: 'Next event ▶️', callback_data: `notify_ai_single_${groupId}_${eventIdx + 1}` });
+    }
+    if (prevNext.length > 0) {
+      keyboard.row(...prevNext);
+    }
+    keyboard.row({ text: '🔙 Back to group', callback_data: `notify_group_${groupId}` });
+    await ctx.editMessageText(lines.join('\n'), {
+      reply_markup: keyboard,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('Error in notify_ai_single_ callback:', err);
+    const msg = err instanceof Error ? err.message : String(err);
+    const isLimit = /tokens per day|TPD|rate limit|429/i.test(msg);
+    await ctx.answerCallbackQuery({
+      text: isLimit ? 'AI limit reached, try later' : 'Analysis failed',
+      show_alert: true,
+    }).catch(() => {});
+  }
+});
+
+// Back to daily: regenerate daily message and edit
+bot.callbackQuery('back_to_daily', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: 'Error', show_alert: true });
+      return;
+    }
+    const userId = ctx.from.id;
+    const { text, keyboard } = await getDailyContentForUser(userId);
+    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await ctx.answerCallbackQuery();
+  } catch (err) {
+    console.error('Error in back_to_daily callback:', err);
+    await ctx.answerCallbackQuery({ text: 'Error loading daily', show_alert: true }).catch(() => {});
+  }
+});
+
 // Handle AI Results button callback
 bot.callbackQuery('daily_ai_results', async (ctx) => {
   try {
@@ -460,7 +750,7 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
+    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
@@ -532,95 +822,6 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
   }
 });
 
-// Handle AI Forecast button callback for /tomorrow command
-bot.callbackQuery('tomorrow_ai_forecast', async (ctx) => {
-  try {
-    await ctx.answerCallbackQuery({ text: '🧠 Анализирую события на завтра...', show_alert: false });
-    
-    if (!ctx.from) {
-      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
-      return;
-    }
-    
-    const userId = ctx.from.id;
-    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, true);
-    
-    // Filter events by user's monitored assets
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
-    
-    // IMPORTANT: Apply data quality filter for AI Forecast (tomorrow)
-    const { deliver: events, skipped } = dataQualityService.filterForDelivery(
-      eventsRaw,
-      { mode: 'ai_forecast', nowUtc: new Date() }
-    );
-    
-    if (skipped.length > 0) {
-      console.log(`[Bot] Tomorrow AI Forecast: ${skipped.length} events skipped due to quality issues`);
-      // Log skipped issues to database for quality monitoring
-      skipped.forEach(issue => {
-        database.logDataIssue(
-          issue.eventId,
-          issue.source,
-          issue.type,
-          issue.message,
-          issue.details
-        );
-      });
-    }
-    
-    if (events.length === 0) {
-      const assetsText = monitoredAssets.length > 0 
-        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
-        : 'Нет активов';
-      await ctx.reply(`📅 Нет событий для анализа по вашим активам (${assetsText}).\n\nИзмените активы через /settings`);
-      return;
-    }
-
-    const userTz = database.getTimezone(userId);
-    const eventsForAnalysis = events.map(e => {
-      const time24 = formatTime24(e, userTz);
-      const title = stripRedundantCountryPrefix(e.currency, e.title);
-      const parts = [
-        `${time24} - [${e.currency}] ${title} (${e.impact})`
-      ];
-      if (e.forecast && e.forecast !== '—') {
-        parts.push(`Прогноз: ${e.forecast}`);
-      }
-      if (e.previous && e.previous !== '—') {
-        parts.push(`Предыдущее: ${e.previous}`);
-      }
-      return parts.join(' | ');
-    }).join('\n');
-
-    if (!eventsForAnalysis.trim()) {
-      await ctx.reply('⚠️ Не удалось подготовить данные для анализа.');
-      return;
-    }
-
-    // Get detailed AI analysis for tomorrow
-    try {
-      const analysis = await analysisService.analyzeDailySchedule(eventsForAnalysis);
-      await ctx.reply(analysis, { parse_mode: 'Markdown' });
-    } catch (analysisError) {
-      const errMsg = analysisError instanceof Error ? analysisError.message : String(analysisError);
-      console.error('[Bot] Tomorrow AI Forecast error:', errMsg, analysisError);
-      const isDailyLimit = /tokens per day|TPD|rate limit reached/i.test(errMsg);
-      const isRateLimit = /429|rate limit|too many requests/i.test(errMsg);
-      await ctx.reply(
-        isDailyLimit
-          ? '⚠️ Исчерпан дневной лимит запросов к AI (Groq). Попробуйте завтра или обновите тариф: console.groq.com'
-          : isRateLimit
-            ? '⚠️ Превышен лимит запросов к AI. Подождите 1–2 минуты и попробуйте снова.'
-            : '⚠️ Не удалось сгенерировать анализ. Попробуйте позже.'
-      );
-    }
-  } catch (error) {
-    console.error('Error in tomorrow AI forecast callback:', error);
-    await ctx.reply('❌ Ошибка при генерации анализа.');
-  }
-});
-
 // Handle /calendar command (kept for backward compatibility)
 bot.command('calendar', async (ctx) => {
   try {
@@ -630,7 +831,7 @@ bot.command('calendar', async (ctx) => {
       await ctx.reply('❌ Ошибка: не удалось определить пользователя');
       return;
     }
-    const events = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
+    const events = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
 
     if (events.length === 0) {
       await ctx.reply('Сегодня нет событий с высоким/средним влиянием для USD, GBP, EUR, JPY, NZD.');
@@ -651,79 +852,6 @@ bot.command('calendar', async (ctx) => {
     console.error('Error in calendar command:', error);
     await ctx.reply(
       `Ошибка при загрузке календаря: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
-    );
-  }
-});
-
-// Handle /tomorrow command – fetch and display tomorrow's events
-bot.command('tomorrow', async (ctx) => {
-  console.log('[Bot] /tomorrow command received');
-  try {
-    if (!ctx.from) {
-      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
-      return;
-    }
-    
-    const userId = ctx.from.id;
-    
-    console.log('[Bot] Sending "loading" message...');
-    await ctx.reply('📅 Загружаю календарь на завтра...');
-    console.log('[Bot] Fetching events...');
-    const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, true);
-    console.log(`[Bot] Got ${allEvents.length} total events`);
-    
-    // Filter events by user's monitored assets
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const events = allEvents.filter(e => monitoredAssets.includes(e.currency));
-    console.log(`[Bot] Filtered to ${events.length} events for user ${userId} (monitoring: ${monitoredAssets.join(', ')})`);
-
-    if (events.length === 0) {
-      const assetsText = monitoredAssets.length > 0 
-        ? monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ')
-        : 'Нет активов';
-      await ctx.reply(`📅 Завтра нет событий для ваших активов (${assetsText}).\n\nИзмените активы через /settings`);
-      return;
-    }
-
-    const userTz = database.getTimezone(userId);
-    const forexFactoryEvents = events.filter(e => e.source === 'ForexFactory');
-    const myfxbookEvents = events.filter(e => e.source === 'Myfxbook');
-
-    let eventsText = '📅 Календарь на завтра:\n\n';
-    let eventNumber = 0;
-
-    if (forexFactoryEvents.length > 0) {
-      eventsText += '━━━ 📰 ForexFactory ━━━\n\n';
-      const ffLines = forexFactoryEvents.map((e) => {
-        eventNumber++;
-        const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-        const time24 = formatTime24(e, userTz);
-        const title = stripRedundantCountryPrefix(e.currency, e.title);
-        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
-      });
-      eventsText += ffLines.join('\n\n') + '\n\n';
-    }
-
-    if (myfxbookEvents.length > 0) {
-      eventsText += '━━━ 📊 Myfxbook ━━━\n\n';
-      const mbLines = myfxbookEvents.map((e) => {
-        eventNumber++;
-        const impactEmoji = e.impact === 'High' ? '🔴' : '🟠';
-        const time24 = formatTime24(e, userTz);
-        const title = stripRedundantCountryPrefix(e.currency, e.title);
-        return `${eventNumber}. ${impactEmoji} [${e.currency}] ${title}\n   🕐 ${time24}  •  Прогноз: ${e.forecast}  •  Предыдущее: ${e.previous}`;
-      });
-      eventsText += mbLines.join('\n\n');
-    }
-
-    const keyboard = new InlineKeyboard();
-    keyboard.row({ text: '🔮 AI Forecast', callback_data: 'tomorrow_ai_forecast' });
-
-    await ctx.reply(eventsText, { reply_markup: keyboard });
-  } catch (error) {
-    console.error('Error in tomorrow command:', error);
-    await ctx.reply(
-      `❌ Ошибка при загрузке календаря: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
     );
   }
 });
@@ -766,14 +894,12 @@ function formatFeatureLabel(name: string): string {
   const labels: Record<string, string> = {
     start: '/start',
     daily: '/daily',
-    tomorrow: '/tomorrow',
     settings: '/settings',
     ask: '/ask',
     help: '/help',
     id: '/id',
     daily_ai_forecast: 'AI Forecast (сегодня)',
     daily_ai_results: 'AI Results (сегодня)',
-    tomorrow_ai_forecast: 'AI Forecast (завтра)',
     ask_question: 'Вопросы к AI',
     toggle_asset: 'Настройка активов',
     settings_toggle_rss: 'RSS',
@@ -835,7 +961,7 @@ async function processQuestion(ctx: any, question: string) {
         await ctx.reply('❌ Не удалось определить пользователя.').catch(() => {});
         return;
       }
-      const events = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);
+      const events = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
       if (events.length > 0) {
         const userTz = database.getTimezone(userId);
         const eventsForContext = events
@@ -1339,7 +1465,6 @@ bot.command('help', (ctx) => {
   const helpText = `ℹ️ **Помощь по командам:**
 
 📊 \`/daily\` - Сводка событий за сегодня с AI-анализом
-📅 \`/tomorrow\` - Календарь запланированных событий на завтра
 ❓ \`/ask\` - Задать вопрос эксперту по Форекс
 ⚙️ \`/settings\` - Настройки отслеживаемых активов
 🆔 \`/id\` - Показать ваш Chat ID

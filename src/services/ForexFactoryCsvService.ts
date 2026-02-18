@@ -15,7 +15,8 @@ import { database } from '../db/database';
 
 const CSV_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.csv';
 const FF_TZ = 'America/New_York';
-const CACHE_TTL_MS = 60 * 60 * 1000; // 60 minutes (CSV updates hourly; rate limit ~5 min)
+// 60 min — кэш снижает частоту запросов и нагрузку при частых вызовах от scheduler/пользователей
+const CACHE_TTL_MS = 60 * 60 * 1000;
 
 function isRateLimitError(err: unknown): err is { response: { status: number; headers?: Record<string, string> } } {
   return (
@@ -163,25 +164,33 @@ export class ForexFactoryCsvService {
   }
 
   private async fetchAndParseCsv(): Promise<CalendarEvent[]> {
+    const startTime = Date.now();
+    const startMem = process.memoryUsage().heapUsed;
+
     if (this.cache && this.cache.expires > Date.now()) {
       return this.cache.data;
     }
-    const start = Date.now();
+
     let csvText: string;
     try {
       csvText = await this.fetchCsv();
     } catch (err) {
       if (isRateLimitError(err)) {
-        console.warn('[ForexFactoryCsv] Rate limited (429). Using cache or empty. Bot continues with MyFxBook RSS.');
+        console.warn('[ForexFactoryCsv] Rate limited (429). Using cache or empty.');
         if (this.cache) return this.cache.data;
         return [];
       }
       throw err;
     }
+
     const valid = this.parseCsvToEvents(csvText);
     this.cache = { data: valid, expires: Date.now() + CACHE_TTL_MS };
+
+    const endMem = process.memoryUsage().heapUsed;
+    const duration = Date.now() - startTime;
+    const memDelta = ((endMem - startMem) / 1024 / 1024).toFixed(2);
     console.log(
-      `[ForexFactoryCsv] Fetched ${valid.length} events in ${Date.now() - start}ms (cached 60 min)`
+      `[ForexFactoryCsv] Parsed ${valid.length} events in ${duration}ms, RAM delta: ${memDelta}MB`
     );
     return valid;
   }

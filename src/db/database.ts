@@ -101,7 +101,16 @@ export const database = {
   markAsSent: (id: string) => {
     db.prepare('INSERT OR IGNORE INTO sent_news (id, created_at) VALUES (?, ?)').run(id, Date.now());
   },
-  
+
+  /** type: 'reminder' | 'result' — различаем групповое напоминание и групповой результат */
+  hasSentGroup: (groupId: string, type: 'reminder' | 'result'): boolean => {
+    return database.hasSent(`group_${type}_${groupId}`);
+  },
+
+  markGroupAsSent: (groupId: string, type: 'reminder' | 'result'): void => {
+    database.markAsSent(`group_${type}_${groupId}`);
+  },
+
   cleanup: () => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     db.prepare('DELETE FROM sent_news WHERE created_at < ?').run(oneDayAgo);
