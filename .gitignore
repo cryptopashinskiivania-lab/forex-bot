@@ -20,6 +20,7 @@ backups/
 
 # Build output
 dist/
+src/db/database.js
 
 # Logs
 *.log
