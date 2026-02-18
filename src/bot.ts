@@ -831,7 +831,8 @@ async function processQuestion(ctx: any, question: string) {
     let context: string | undefined;
     try {
       if (!userId) {
-        // Skip context if no userId
+        if (ctx.chat) deleteUserState(ctx.chat.id);
+        await ctx.reply('❌ Не удалось определить пользователя.').catch(() => {});
         return;
       }
       const events = await aggregateCoreEvents(forexFactoryService, myfxbookRssService, userId, false);

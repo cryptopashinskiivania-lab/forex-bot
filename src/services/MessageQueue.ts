@@ -55,14 +55,16 @@ async function processQueue(): Promise<void> {
   isProcessingQueue = true;
   const message = messageQueue.shift();
 
-  if (message) {
-    try {
+  try {
+    if (message) {
       await botInstance.api.sendMessage(message.chatId, message.text, message.options);
-      console.log(`[Queue] Message sent to chat ${message.chatId}. Remaining in queue: ${messageQueue.length}`);
-    } catch (error) {
-      console.error(`[Queue] Error sending message to chat ${message.chatId}:`, error);
+      if (process.env.LOG_LEVEL === 'debug') {
+        console.log(`[Queue] Message sent to chat ${message.chatId}. Remaining in queue: ${messageQueue.length}`);
+      }
     }
+  } catch (error) {
+    console.error(`[Queue] Error sending message to chat ${message?.chatId}:`, error);
+  } finally {
+    isProcessingQueue = false;
   }
-
-  isProcessingQueue = false;
 }

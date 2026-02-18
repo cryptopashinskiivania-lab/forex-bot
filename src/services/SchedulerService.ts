@@ -320,6 +320,11 @@ export class SchedulerService {
           chunk.map(async (user) => {
             try {
               const userId = user.user_id;
+              const quiet = isQuietHours(userId);
+              if (quiet) {
+                console.log(`[Scheduler] User ${userId}: skipped (quiet hours)`);
+                return;
+              }
               const monitoredAssets = database.getMonitoredAssets(userId);
               const isRssEnabled = database.isRssEnabled(userId);
 
@@ -331,7 +336,6 @@ export class SchedulerService {
               );
 
               const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
-              const quiet = isQuietHours(userId);
 
               let eventsSent = 0;
               let rssSent = 0;
@@ -348,7 +352,7 @@ export class SchedulerService {
                 const eventId = `event_${userId}_${id}`;
                 const alreadySent = database.hasSent(eventId);
 
-                if (!event.timeISO && !quiet && !alreadySent) {
+                if (!event.timeISO && !alreadySent) {
                   try {
                     const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
                     let result = database.getCachedAnalysis(eventKey);
@@ -392,7 +396,7 @@ export class SchedulerService {
                   continue;
                 }
 
-                if (event.timeISO && !quiet && !alreadySent) {
+                if (event.timeISO && !alreadySent) {
                   const eventTime = parseISO(event.timeISO);
                   const now = new Date();
                   const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
@@ -444,7 +448,7 @@ export class SchedulerService {
                   }
                 }
 
-                if (event.timeISO && !quiet && hasRealActual(event.actual)) {
+                if (event.timeISO && hasRealActual(event.actual)) {
                   const resultId = `result_${userId}_${id}`;
                   if (!database.hasSent(resultId)) {
                     const eventTime = parseISO(event.timeISO);
@@ -498,7 +502,7 @@ export class SchedulerService {
                 }
               }
 
-              if (isRssEnabled && !quiet) {
+              if (isRssEnabled) {
                 const rssItems = await this.rssService.getLatestNews().catch(() => []);
 
                 for (const item of rssItems) {
@@ -567,7 +571,6 @@ export class SchedulerService {
               const todayDateStr = format(nowInUserTz, 'yyyy-MM-dd');
               const dailySummaryId = `daily8_${userId}_${todayDateStr}`;
               if (
-                !quiet &&
                 nowInUserTz.getHours() === DAILY_SUMMARY_HOUR &&
                 nowInUserTz.getMinutes() < 10 &&
                 !database.hasSent(dailySummaryId)
