@@ -25,7 +25,7 @@ RSS is parsed with `rss-parser`; only High/Medium impact events are kept. No Pla
 | **Reliability** | 99%+ (no Cloudflare) |
 | **Cache** | 60 minutes (CSV updates hourly) |
 
-CSV columns: Title, Country, Date, Time, Impact, Forecast, Previous, URL. Date (MM-DD-YYYY) and Time (h:mma) are parsed in America/New_York and converted to ISO. Only High/Medium impact events are returned. DataQualityService validates before caching. On 429 (rate limit), service waits per Retry-After then retries once; if still rate limited, returns cached data or empty array.
+CSV columns: Title, Country, Date, Time, Impact, Forecast, Previous, URL. Date (MM-DD-YYYY) and Time (h:mma) are in **UTC** (nfs.faireconomy.media), parsed and converted to ISO. Only High/Medium impact events are returned. DataQualityService validates before caching. On 429 (rate limit), service waits per Retry-After then retries once; if still rate limited, returns cached data or empty array.
 
 ---
 

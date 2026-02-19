@@ -3,9 +3,12 @@
  * Fetches https://nfs.faireconomy.media/ff_calendar_thisweek.csv
  * (Title, Country, Date, Time, Impact, Forecast, Previous, URL).
  * 60-minute cache (CSV updates hourly; requests more frequent than 5 min can get 429).
- * High/Medium impact only, America/New_York timezone.
+ * High/Medium impact only.
+ *
+ * ВАЖНО: Время в CSV от faireconomy.media задано в UTC (не Eastern).
+ * Проверено по релизам: Unemployment Claims 8:30 EST = 13:30 UTC (в CSV "1:30pm"),
+ * Pending Home Sales 10:00 EST = 15:00 UTC (в CSV "3:00pm"), FOMC Minutes 14:00 EST = 19:00 UTC (в CSV "7:00pm").
  */
-
 import axios from 'axios';
 import Papa from 'papaparse';
 import { fromZonedTime } from 'date-fns-tz';
@@ -14,7 +17,8 @@ import { DataQualityService } from './DataQualityService';
 import { database } from '../db/database';
 
 const CSV_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.csv';
-const FF_TZ = 'America/New_York';
+/** Время в CSV — UTC (nfs.faireconomy.media), не America/New_York. */
+const CSV_TIMEZONE = 'UTC';
 // 60 min — кэш снижает частоту запросов и нагрузку при частых вызовах от scheduler/пользователей
 const CACHE_TTL_MS = 60 * 60 * 1000;
 
@@ -57,7 +61,7 @@ function isSpecialTimeString(timeStr: string): boolean {
 }
 
 /**
- * Parse Date (MM-DD-YYYY) and Time (h:mma e.g. "3:30pm") in America/New_York to ISO string.
+ * Parse Date (MM-DD-YYYY) and Time (h:mma e.g. "3:30pm") in CSV_TIMEZONE (UTC) to ISO string.
  */
 function parseDateTimeToISO(dateStr: string, timeStr: string): string | undefined {
   const d = (dateStr || '').trim();
@@ -79,7 +83,7 @@ function parseDateTimeToISO(dateStr: string, timeStr: string): string | undefine
   const timePart = `${hours.toString().padStart(2, '0')}:${minutes}:00`;
   const localStr = `${datePart} ${timePart}`;
   try {
-    const utcDate = fromZonedTime(localStr, FF_TZ);
+    const utcDate = fromZonedTime(localStr, CSV_TIMEZONE);
     const iso = utcDate.toISOString();
     if (utcDate.getFullYear() >= 2000 && utcDate.getFullYear() <= 2100) return iso;
   } catch {
