@@ -7,7 +7,7 @@
     "dev": "nodemon",
     "build": "tsc",
     "start": "node --max-old-space-size=3072 -r ts-node/register src/bot.ts",
-    "test": "ts-node tests/DataQualityService.test.ts",
+    "test": "ts-node tests/DataQualityService.test.ts && ts-node tests/eventGrouping.test.ts && ts-node tests/schedulerMutex.test.ts",
     "test:view-issues": "ts-node scripts/view-data-issues.ts",
     "quality:report": "ts-node scripts/daily-quality-report.ts"
   },

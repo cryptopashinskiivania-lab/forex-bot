@@ -83,6 +83,22 @@ export const database = {
     return db.prepare('SELECT * FROM users').all() as User[];
   },
 
+  /** Все пользователи из таблицы users (для /stats админа). */
+  getAllUsers: (): User[] => {
+    return db.prepare('SELECT * FROM users').all() as User[];
+  },
+
+  /** Количество отправленных уведомлений (за период в днях или всего). */
+  getSentNotificationsCount: (periodDays?: number): number => {
+    if (periodDays != null) {
+      const cutoff = Date.now() - periodDays * 24 * 60 * 60 * 1000;
+      const row = db.prepare('SELECT COUNT(*) as c FROM sent_news WHERE created_at >= ?').get(cutoff) as { c: number };
+      return row?.c ?? 0;
+    }
+    const row = db.prepare('SELECT COUNT(*) as c FROM sent_news').get() as { c: number };
+    return row?.c ?? 0;
+  },
+
   getUserCount: (): number => {
     const row = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
     return row?.count ?? 0;
@@ -134,6 +150,26 @@ export const database = {
     } catch (err) {
       console.warn('[DB] logUserEvent failed:', err instanceof Error ? err.message : err);
     }
+  },
+
+  /** Статистика пользователя: активность и топ событий за период (для /stats). */
+  getUserStats: (
+    userId: number,
+    periodDays: number
+  ): { activityCount: number; topEvents: Array<{ event_name: string; count: number }> } => {
+    const cutoff = Date.now() - periodDays * 24 * 60 * 60 * 1000;
+    const countRow = db
+      .prepare('SELECT COUNT(*) as c FROM user_events WHERE user_id = ? AND created_at >= ?')
+      .get(userId, cutoff) as { c: number } | undefined;
+    const activityCount = countRow?.c ?? 0;
+    const topRows = db
+      .prepare(
+        `SELECT event_name, COUNT(*) as count FROM user_events 
+         WHERE user_id = ? AND created_at >= ? 
+         GROUP BY event_name ORDER BY count DESC LIMIT 5`
+      )
+      .all(userId, cutoff) as Array<{ event_name: string; count: number }>;
+    return { activityCount, topEvents: topRows };
   },
 
   getAnalyticsStats: (periodDays: number): {

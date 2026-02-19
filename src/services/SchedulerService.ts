@@ -273,6 +273,7 @@ export class SchedulerService {
   private rssService: RssService;
   private dataQualityService: DataQualityService;
   private cronTasks: cron.ScheduledTask[] = [];
+  private isRunning = false;
 
   constructor() {
     this.forexFactoryService = new ForexFactoryCsvService();
@@ -358,9 +359,20 @@ export class SchedulerService {
    * Called by cron every 10 min and once on startup after delay.
    */
   private async runScheduledCheck(bot: Bot): Promise<void> {
-    console.log('[Scheduler] Running scheduled check...');
-
+    if (this.isRunning) {
+      console.warn('[Scheduler] Previous check still running, skipping...');
+      return;
+    }
+    this.isRunning = true;
     try {
+      console.log('[Scheduler] Running scheduled check...');
+
+      // В тестах: задержка, чтобы второй вызов успел увидеть isRunning === true (см. tests/schedulerMutex.test.ts)
+      const mutexDelayMs = process.env.TEST_SCHEDULER_MUTEX_DELAY_MS;
+      if (mutexDelayMs) {
+        await new Promise((r) => setTimeout(r, Number(mutexDelayMs)));
+      }
+
       const users = database.getUsers();
 
       if (users.length === 0) {
@@ -769,6 +781,8 @@ export class SchedulerService {
       console.log('[Scheduler] Scheduled check finished.');
     } catch (err) {
       console.error('[Scheduler] Error in scheduled check:', err);
+    } finally {
+      this.isRunning = false;
     }
   }
 
@@ -777,9 +791,9 @@ export class SchedulerService {
     console.log('[Scheduler] MyFxBook calendar: using Playwright (MyfxbookService)');
     console.log('[Scheduler] Multi-user mode: notifications (events, RSS) will be sent to all registered users based on their settings');
 
-    // Check every 10 min (was 3 min) - events update slowly on ForexFactory; use UTC for predictable behavior
+    // Check every 2 min so the 3-minute "15 min before news" reminder window is hit reliably (10 min was missing the window)
     const minuteCheckTask = cron.schedule(
-      '*/10 * * * *',
+      '*/2 * * * *',
       () => this.runScheduledCheck(bot),
       { timezone: 'UTC', noOverlap: true }
     );
@@ -792,7 +806,7 @@ export class SchedulerService {
       void this.runScheduledCheck(bot);
     }, startDelayMs);
 
-    console.log('SchedulerService started successfully (notification check every 10 min and once after 15s)');
+    console.log('SchedulerService started successfully (notification check every 2 min and once after 15s)');
   }
 
   /**
@@ -830,14 +844,27 @@ export class SchedulerService {
     try {
       const shared = await fetchSharedCalendarToday(this.forexFactoryService, this.myfxbookService);
       lines.push(`\nКалендарь: FF=${shared.forexFactory.length} Myfxbook=${shared.myfxbook.length}`);
+      const nowUtc = new Date();
       for (const user of users) {
         const userId = user.user_id;
         const events = getEventsForUserFromShared(shared, userId);
         const monitored = database.getMonitoredAssets(userId);
         const raw = events.filter((e) => monitored.includes(e.currency));
-        const { deliver: userEvents } = this.dataQualityService.filterForDelivery(raw, { mode: 'general', nowUtc: new Date(), forScheduler: true });
+        const { deliver: userEvents } = this.dataQualityService.filterForDelivery(raw, { mode: 'general', nowUtc, forScheduler: true });
         const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
         lines.push(`\nUser ${userId}: событий после фильтров=${userEvents.length}, без времени (к отправке)=${eventsWithoutTime.length}`);
+        // Напоминания за 15 мин: сколько событий с timeISO и сколько попадают в текущее 3-мин окно
+        const withTime = userEvents.filter((e) => e.timeISO);
+        let inWindow = 0;
+        for (const e of withTime) {
+          const eventTime = parseISO(e.timeISO!);
+          const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
+          const reminderWindowEnd = addMinutes(reminderFrom, 3);
+          if (nowUtc >= reminderFrom && nowUtc < reminderWindowEnd && !database.hasSent(`reminder_${userId}_${itemId(e.title, e.timeISO || e.time)}`)) {
+            inWindow++;
+          }
+        }
+        lines.push(`  Напоминания: событий с временем=${withTime.length}, в окне 15мин-до (сейчас)=${inWindow}`);
       }
     } catch (err) {
       lines.push(`\nОшибка при получении календаря: ${err instanceof Error ? err.message : String(err)}`);

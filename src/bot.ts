@@ -297,13 +297,11 @@ function buildMainMenuKeyboard(): InlineKeyboard {
   return keyboard;
 }
 
-// Команды по умолчанию (без /stats — она только для админа)
+// Команды для обычных пользователей (без /stats)
 const defaultCommands = [
   { command: 'daily', description: '📊 Сводка за сегодня' },
   { command: 'tomorrow', description: '📅 События завтра' },
   { command: 'settings', description: '⚙️ Настройки' },
-  { command: 'ask', description: '❓ Вопрос эксперту' },
-  { command: 'id', description: '🆔 Мой ID' },
   { command: 'help', description: 'ℹ️ Помощь' },
 ];
 
@@ -311,11 +309,11 @@ bot.api.setMyCommands(defaultCommands).catch((err) => {
   console.warn('[Bot] setMyCommands failed (e.g. rate limit):', err instanceof Error ? err.message : err);
 });
 
-// Для админа — тот же список плюс /stats (видна только в чате админа)
+// Для админа — те же команды плюс /stats (видна только в чате админа)
 if (env.ADMIN_CHAT_ID) {
   const adminCommands = [
     ...defaultCommands,
-    { command: 'stats', description: '📊 Статистика (админ)' },
+    { command: 'stats', description: 'Статистика бота' },
   ];
   bot.api
     .setMyCommands(adminCommands, { scope: { type: 'chat', chat_id: Number(env.ADMIN_CHAT_ID) } })
@@ -457,7 +455,7 @@ bot.command('tomorrow', async (ctx) => {
   }
 });
 
-// Handle AI Forecast button callback
+// Handle AI Forecast: анализ по всем актуальным новостям дня (Groq)
 bot.callbackQuery('daily_ai_forecast', async (ctx) => {
   try {
     if (!ctx.from) {
@@ -482,10 +480,10 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     const monitoredAssets = database.getMonitoredAssets(userId);
     const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
     
-    // IMPORTANT: Apply data quality filter for AI Forecast
+    // AI Forecast: анализ по всем актуальным новостям дня (включая уже вышедшие) — Groq агент
     const { deliver: events, skipped } = dataQualityService.filterForDelivery(
       eventsRaw,
-      { mode: 'ai_forecast', nowUtc: new Date() }
+      { mode: 'general', nowUtc: new Date(), forScheduler: false }
     );
     
     if (skipped.length > 0) {
@@ -856,7 +854,7 @@ bot.callbackQuery('back_to_daily', async (ctx) => {
   }
 });
 
-// Handle AI Results button callback
+// Handle AI Results: анализ уже вышедших новостей (Groq)
 bot.callbackQuery('daily_ai_results', async (ctx) => {
   try {
     if (!ctx.from) {
@@ -985,32 +983,41 @@ bot.command('id', (ctx) => {
   ctx.reply(`🆔 Ваш Chat ID: \`${ctx.chat.id}\``, { parse_mode: 'Markdown' });
 });
 
-// Handle /stats command – аналитика (только для администратора)
-bot.command('stats', (ctx) => {
-  const isAdmin = env.ADMIN_CHAT_ID && String(ctx.from?.id) === env.ADMIN_CHAT_ID;
-  if (!isAdmin) {
-    ctx.reply('Доступ только для администратора.');
-    return;
-  }
-  const stats = database.getAnalyticsStats(30);
-  const featureLines = stats.featureUsage
-    .slice(0, 15)
-    .map((f) => {
-      const label = formatFeatureLabel(f.event_name);
-      return `  ${label}: ${f.count}`;
-    })
-    .join('\n');
-  const text = `📊 **Статистика бота**
+// Handle /stats command – только для админа, статистика бота
+bot.command('stats', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+      return;
+    }
+    const adminChatId = env.ADMIN_CHAT_ID ? parseInt(env.ADMIN_CHAT_ID, 10) : null;
+    if (adminChatId === null || ctx.from.id !== adminChatId) {
+      await ctx.reply('❌ Команда доступна только администратору');
+      return;
+    }
+
+    const allUsers = database.getAllUsers();
+    const totalUsers = allUsers.length;
+    const analytics = database.getAnalyticsStats(30);
+    const notifications24h = database.getSentNotificationsCount(1);
+    const notificationsTotal = database.getSentNotificationsCount();
+
+    const text = `📊 **Статистика бота**
 
 👥 **Пользователи**
-  Всего: ${stats.totalUsers}
-  Активных за 24ч: ${stats.dau}
-  Активных за 7 дней: ${stats.wau}
-  Активных за 30 дней: ${stats.mau}
+  Всего: ${totalUsers}
+  Активных за 24ч: ${analytics.dau}
+  Активных за 7 дней: ${analytics.wau}
+  Активных за 30 дней: ${analytics.mau}
 
-📈 **Использование функций** (за 30 дней)
-${featureLines || '  Нет данных'}`;
-  ctx.reply(text, { parse_mode: 'Markdown' });
+📬 **Уведомления**
+  За 24ч: ${notifications24h}
+  Всего: ${notificationsTotal}`;
+    await ctx.reply(text, { parse_mode: 'Markdown' });
+  } catch (error) {
+    console.error('Error in stats command:', error);
+    await ctx.reply(`❌ Ошибка при загрузке статистики: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`);
+  }
 });
 
 function formatFeatureLabel(name: string): string {

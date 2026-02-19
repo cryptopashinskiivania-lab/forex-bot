@@ -217,7 +217,7 @@ export function groupEvents(
       const impacts = groupEventsList.map((e) => e.impact);
       const impact: 'High' | 'Medium' | 'Low' =
         impacts.some((x) => x === 'High') ? 'High' : impacts.some((x) => x === 'Medium') ? 'Medium' : 'Low';
-      const hasResults = groupEventsList.some((e) => e.isResult);
+      const hasResults = groupEventsList.some((e) => !isPlaceholderActual(e.actual));
       result.push({
         groupId,
         time: timeStr,
