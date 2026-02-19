@@ -102,8 +102,10 @@ function itemId(title: string, time: string): string {
   return md5(title + time);
 }
 
-/** За сколько минут до события с временем отправлять напоминание */
+/** За сколько минут до события с временем отправлять напоминание (целевое время) */
 const REMINDER_MINUTES_BEFORE = 15;
+/** Длительность окна отправки напоминания (мин): от (REMINDER_MINUTES_BEFORE) до (REMINDER_MINUTES_BEFORE - REMINDER_WINDOW_MINUTES) минут до события. Чтобы кроны (каждые 2 мин) гарантированно попадали в окно. */
+const REMINDER_WINDOW_MINUTES = 10;
 /** Через сколько минут после времени события отправлять результат (чтобы календарь успел обновиться) */
 const RESULT_MINUTES_AFTER = 5;
 /** Длительность окна отправки результатов (в минутах). ForexFactory может обновлять данные с задержкой до 30 мин. */
@@ -476,12 +478,12 @@ export class SchedulerService {
                 }
               }
 
-              // Напоминания (15 мин до): группируем и отправляем группами или по одному
+              // Напоминания (15 мин до): окно 10 мин (от 15 до 5 мин до события), чтобы не пропустить при проверке каждые 2 мин
               const reminderList = userEvents.filter((event) => {
                 if (!event.timeISO) return false;
                 const eventTime = parseISO(event.timeISO);
                 const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
-                const reminderWindowEnd = addMinutes(reminderFrom, 3);
+                const reminderWindowEnd = subMinutes(eventTime, REMINDER_MINUTES_BEFORE - REMINDER_WINDOW_MINUTES);
                 if (now < reminderFrom || now >= reminderWindowEnd) return false;
                 const id = itemId(event.title, event.timeISO || event.time);
                 return !database.hasSent(`reminder_${userId}_${id}`);
@@ -791,7 +793,7 @@ export class SchedulerService {
     console.log('[Scheduler] MyFxBook calendar: using Playwright (MyfxbookService)');
     console.log('[Scheduler] Multi-user mode: notifications (events, RSS) will be sent to all registered users based on their settings');
 
-    // Check every 2 min so the 3-minute "15 min before news" reminder window is hit reliably (10 min was missing the window)
+    // Check every 2 min so the 10-minute "15 min before news" reminder window (15–5 min before) is hit reliably
     const minuteCheckTask = cron.schedule(
       '*/2 * * * *',
       () => this.runScheduledCheck(bot),
@@ -853,18 +855,40 @@ export class SchedulerService {
         const { deliver: userEvents } = this.dataQualityService.filterForDelivery(raw, { mode: 'general', nowUtc, forScheduler: true });
         const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
         lines.push(`\nUser ${userId}: событий после фильтров=${userEvents.length}, без времени (к отправке)=${eventsWithoutTime.length}`);
-        // Напоминания за 15 мин: сколько событий с timeISO и сколько попадают в текущее 3-мин окно
+        // Напоминания за 15 мин: окно 10 мин (15–5 мин до события), сколько событий попадают и не отправлены
         const withTime = userEvents.filter((e) => e.timeISO);
         let inWindow = 0;
         for (const e of withTime) {
           const eventTime = parseISO(e.timeISO!);
           const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
-          const reminderWindowEnd = addMinutes(reminderFrom, 3);
+          const reminderWindowEnd = subMinutes(eventTime, REMINDER_MINUTES_BEFORE - REMINDER_WINDOW_MINUTES);
           if (nowUtc >= reminderFrom && nowUtc < reminderWindowEnd && !database.hasSent(`reminder_${userId}_${itemId(e.title, e.timeISO || e.time)}`)) {
             inWindow++;
           }
         }
-        lines.push(`  Напоминания: событий с временем=${withTime.length}, в окне 15мин-до (сейчас)=${inWindow}`);
+        lines.push(`  Напоминания: событий с временем=${withTime.length}, в окне 15–5 мин до (сейчас)=${inWindow}`);
+        // Группы, по которым напоминание ещё не пришло (в окне, но не отправлено)
+        const reminderListDiag = userEvents.filter((e) => {
+          if (!e.timeISO) return false;
+          const eventTime = parseISO(e.timeISO);
+          const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
+          const reminderWindowEnd = subMinutes(eventTime, REMINDER_MINUTES_BEFORE - REMINDER_WINDOW_MINUTES);
+          return nowUtc >= reminderFrom && nowUtc < reminderWindowEnd && !database.hasSent(`reminder_${userId}_${itemId(e.title, e.timeISO || e.time)}`);
+        });
+        const groupedDiag = groupEvents(reminderListDiag);
+        const groupsWithoutReminder: string[] = [];
+        for (const item of groupedDiag) {
+          if ('events' in item) {
+            const g = item as EventGroup;
+            if (!database.hasSentGroup(g.groupId, 'reminder')) groupsWithoutReminder.push(`${g.currency} ${g.time} (${g.events.length} событий)`);
+          } else {
+            const ev = item as CalendarEvent;
+            groupsWithoutReminder.push(`${ev.currency} ${ev.time} — ${ev.title}`);
+          }
+        }
+        if (groupsWithoutReminder.length > 0) {
+          lines.push(`  Группы/события без напоминания (в текущем окне): ${groupsWithoutReminder.join('; ')}`);
+        }
       }
     } catch (err) {
       lines.push(`\nОшибка при получении календаря: ${err instanceof Error ? err.message : String(err)}`);
