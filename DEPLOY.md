@@ -12,14 +12,23 @@ git push origin main
 
 ### На сервере
 
+**Обычное обновление** (git pull):
+
 ```bash
 cd /path/to/forex-news-bot   # или cd forex-bot — как у вас называется папка
 bash scripts/deploy-update.sh
 ```
 
+**Полная синхронизация с GitHub** (если на сервере не видно изменений — привести код в точности к origin/main):
+
+```bash
+cd /path/to/forex-news-bot
+bash scripts/deploy-update-full.sh
+```
+
 Скрипт выполняет:
 1. Резервную копию БД и .env
-2. `git pull`
+2. `git fetch` + `git reset --hard origin/main` (код как в репозитории)
 3. `npm install`
 4. `pm2 reload ecosystem.config.js`
 
