@@ -355,27 +355,24 @@ export const database = {
       .run(userId, sourceKey, source);
   },
 
-  // News impact filter: which events to show (High = red, Medium = yellow). Applies to both ForexFactory and Myfxbook.
-  getNewsImpactFilter: (userId: number): 'high_only' | 'medium_only' | 'both' => {
-    const impactKey = 'news_impact_filter';
+  getNewsImpactFilter: (userId: number): 'high' | 'medium' | 'both' => {
+    const key = 'news_impact_filter';
     const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
-      .get(userId, impactKey) as { value: string } | undefined;
-
+      .get(userId, key) as { value: string } | undefined;
     if (!row || !row.value) {
-      return 'both';
+      return 'high';
     }
-
-    const value = row.value as string;
-    if (value === 'high_only' || value === 'medium_only' || value === 'both') {
-      return value;
+    const normalized = String(row.value).trim().toLowerCase();
+    if (normalized === 'high' || normalized === 'medium' || normalized === 'both') {
+      return normalized;
     }
-    return 'both';
+    return 'high';
   },
 
-  setNewsImpactFilter: (userId: number, filter: 'high_only' | 'medium_only' | 'both'): void => {
-    const impactKey = 'news_impact_filter';
+  setNewsImpactFilter: (userId: number, filter: 'high' | 'medium' | 'both'): void => {
+    const key = 'news_impact_filter';
     db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
-      .run(userId, impactKey, filter);
+      .run(userId, key, filter);
   },
 
   // User timezone (IANA, e.g. Europe/Kyiv). Used for quiet hours and time display.

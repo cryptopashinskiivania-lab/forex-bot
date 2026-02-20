@@ -408,10 +408,16 @@ export class SchedulerService {
 
               const events = getEventsForUserFromShared(shared, userId);
               const userEventsRaw = events.filter((e) => monitoredAssets.includes(e.currency));
-              const { deliver: userEvents } = this.dataQualityService.filterForDelivery(
+              const { deliver: userEventsAfterQuality } = this.dataQualityService.filterForDelivery(
                 userEventsRaw,
                 { mode: 'general', nowUtc: new Date(), forScheduler: true }
               );
+              const impactFilter = database.getNewsImpactFilter(userId);
+              const userEvents = userEventsAfterQuality.filter((e) => {
+                if (impactFilter === 'high') return e.impact === 'High';
+                if (impactFilter === 'medium') return e.impact === 'Medium';
+                return e.impact === 'High' || e.impact === 'Medium';
+              });
 
               const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
               const now = new Date();
@@ -852,7 +858,13 @@ export class SchedulerService {
         const events = getEventsForUserFromShared(shared, userId);
         const monitored = database.getMonitoredAssets(userId);
         const raw = events.filter((e) => monitored.includes(e.currency));
-        const { deliver: userEvents } = this.dataQualityService.filterForDelivery(raw, { mode: 'general', nowUtc, forScheduler: true });
+        const { deliver: afterQuality } = this.dataQualityService.filterForDelivery(raw, { mode: 'general', nowUtc, forScheduler: true });
+        const impactFilter = database.getNewsImpactFilter(userId);
+        const userEvents = afterQuality.filter((e) => {
+          if (impactFilter === 'high') return e.impact === 'High';
+          if (impactFilter === 'medium') return e.impact === 'Medium';
+          return e.impact === 'High' || e.impact === 'Medium';
+        });
         const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
         lines.push(`\nUser ${userId}: событий после фильтров=${userEvents.length}, без времени (к отправке)=${eventsWithoutTime.length}`);
         // Напоминания за 15 мин: окно 10 мин (15–5 мин до события), сколько событий попадают и не отправлены
