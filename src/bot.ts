@@ -16,20 +16,6 @@ import { buildDailyMessage, buildDailyKeyboard } from './utils/dailyMessage';
 import { stripRedundantCountryPrefix } from './utils/eventTitleFormat';
 import type { EventGroup } from './utils/eventGrouping';
 
-/** Safe wrappers for impact filter (work even if database module was cached without these methods). */
-type ImpactFilter = 'high' | 'medium' | 'both';
-function getNewsImpactFilterSafe(userId: number): ImpactFilter {
-  if (typeof database.getNewsImpactFilter === 'function') {
-    return database.getNewsImpactFilter(userId);
-  }
-  return 'high';
-}
-function setNewsImpactFilterSafe(userId: number, filter: ImpactFilter): void {
-  if (typeof database.setNewsImpactFilter === 'function') {
-    database.setNewsImpactFilter(userId, filter);
-  }
-}
-
 // User states for conversation flow (with TTL 30 min by last activity to limit memory)
 type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | null;
 const USER_STATE_TTL_MS = 30 * 60 * 1000;
@@ -288,16 +274,10 @@ async function getDailyOrTomorrowContent(
   const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, forTomorrow);
   const monitoredAssets = database.getMonitoredAssets(userId);
   const eventsRaw = allEvents.filter((e) => monitoredAssets.includes(e.currency));
-  const { deliver: eventsAfterQuality } = dataQualityService.filterForDelivery(eventsRaw, {
+  const { deliver: events } = dataQualityService.filterForDelivery(eventsRaw, {
     mode: 'general',
     nowUtc: new Date(),
     forScheduler: false,
-  });
-  const impactFilter = getNewsImpactFilterSafe(userId);
-  const events = eventsAfterQuality.filter((e) => {
-    if (impactFilter === 'high') return e.impact === 'High';
-    if (impactFilter === 'medium') return e.impact === 'Medium';
-    return e.impact === 'High' || e.impact === 'Medium';
   });
   const userTz = database.getTimezone(userId);
   const { text, empty, grouped } = buildDailyMessage(events, userTz, monitoredAssets, forTomorrow);
@@ -495,10 +475,11 @@ bot.callbackQuery('daily_ai_forecast', async (ctx) => {
     await ctx.answerCallbackQuery({ text: '🧠 Анализирую события...', show_alert: false });
     
     const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
+    const allEventsByImpact = filterEventsByUserImpact(allEvents, userId);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
-    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    const eventsRaw = allEventsByImpact.filter(e => monitoredAssets.includes(e.currency));
     
     // AI Forecast: анализ по всем актуальным новостям дня (включая уже вышедшие) — Groq агент
     const { deliver: events, skipped } = dataQualityService.filterForDelivery(
@@ -892,10 +873,11 @@ bot.callbackQuery('daily_ai_results', async (ctx) => {
       return;
     }
     const allEvents = await aggregateCoreEvents(forexFactoryService, myfxbookService, userId, false);
+    const allEventsByImpact = filterEventsByUserImpact(allEvents, userId);
     
     // Filter events by user's monitored assets
     const monitoredAssets = database.getMonitoredAssets(userId);
-    const eventsRaw = allEvents.filter(e => monitoredAssets.includes(e.currency));
+    const eventsRaw = allEventsByImpact.filter(e => monitoredAssets.includes(e.currency));
     
     // IMPORTANT: Apply data quality filter for AI Results
     const { deliver: eventsWithResults, skipped } = dataQualityService.filterForDelivery(
@@ -1056,11 +1038,8 @@ function formatFeatureLabel(name: string): string {
     settings_toggle_rss: 'RSS',
     settings_toggle_quiet_hours: 'Тихий режим',
     settings_news_source: 'Источник новостей',
-    settings_impact_filter: 'Фильтр новостей',
+    settings_news_impact: 'Фильтр важности',
     settings_timezone: 'Часовой пояс',
-    impact_high: 'Фильтр: только высокие',
-    impact_medium: 'Фильтр: только средние',
-    impact_both: 'Фильтр: все важные',
     source_forexfactory: 'Источник: ForexFactory',
     source_myfxbook: 'Источник: Myfxbook',
     source_both: 'Источник: оба',
@@ -1170,20 +1149,28 @@ const ASSET_FLAGS: Record<string, string> = {
 // Available assets for monitoring
 const AVAILABLE_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'NZD', 'CHF', 'XAU', 'BTC', 'OIL'];
 
-// Helper function to build settings message text (used by /settings and when returning from submenus)
-function buildSettingsText(userId: number): string {
+/** Apply user impact filter so AI Forecast/Results respect "only red" / "only yellow" / both. */
+function filterEventsByUserImpact(events: CalendarEvent[], userId: number): CalendarEvent[] {
+  const filter = database.getNewsImpactFilter(userId);
+  if (filter === 'both') return events;
+  if (filter === 'high_only') return events.filter((e) => e.impact === 'High');
+  return events.filter((e) => e.impact === 'Medium');
+}
+
+// Helper to build settings message text (single source of truth for settings summary)
+function buildSettingsMessage(userId: number): string {
   const monitoredAssets = database.getMonitoredAssets(userId);
   const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
   const newsSource = database.getNewsSource(userId);
   const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : newsSource === 'Myfxbook' ? 'Myfxbook' : 'Оба источника';
-  const impactFilter = getNewsImpactFilterSafe(userId);
-  const impactLabel = impactFilter === 'high' ? 'Только высокие' : impactFilter === 'medium' ? 'Только средние' : 'Все важные (High + Medium)';
+  const impactFilter = database.getNewsImpactFilter(userId);
+  const impactName = impactFilter === 'high_only' ? 'Красные' : impactFilter === 'medium_only' ? 'Жёлтые' : 'Оба';
   return `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
 **Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
 **Источник новостей:** ${sourceName}
-**Фильтр новостей:** ${impactLabel}
+**Фильтр важности:** ${impactName}
 **Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
 
 Нажмите на кнопку, чтобы изменить настройку:`;
@@ -1222,12 +1209,12 @@ function buildSettingsKeyboard(userId: number): InlineKeyboard {
                      '🔄 Оба источника';
   keyboard.row({ text: `📡 Источник новостей: ${sourceText}`, callback_data: 'settings_news_source' });
 
-  // Add News Impact Filter button
-  const impactFilter = getNewsImpactFilterSafe(userId);
-  const impactButtonText = impactFilter === 'high' ? '🎯 Фильтр новостей: 🔴 Только высокие' :
-    impactFilter === 'medium' ? '🎯 Фильтр новостей: 🟡 Только средние' :
-    '🎯 Фильтр новостей: 🔴🟡 Все важные';
-  keyboard.row({ text: impactButtonText, callback_data: 'settings_impact_filter' });
+  // Add News Impact filter button (red / yellow / both)
+  const impactFilter = database.getNewsImpactFilter(userId);
+  const impactText = impactFilter === 'high_only' ? '🔴 Красные' : 
+                     impactFilter === 'medium_only' ? '🟡 Жёлтые' : 
+                     '🔴🟡 Оба';
+  keyboard.row({ text: `📌 Фильтр важности: ${impactText}`, callback_data: 'settings_news_impact' });
 
   // Add Timezone selection button
   const userTz = database.getTimezone(userId);
@@ -1255,7 +1242,7 @@ bot.command('settings', async (ctx) => {
     
     const userId = ctx.from.id;
     const keyboard = buildSettingsKeyboard(userId);
-    const message = buildSettingsText(userId);
+    const message = buildSettingsMessage(userId);
     
     await ctx.reply(message, { 
       parse_mode: 'Markdown',
@@ -1288,10 +1275,9 @@ bot.callbackQuery(/^toggle_(.+)$/, async (ctx) => {
     const status = isNowEnabled ? 'включен' : 'выключен';
     const flag = ASSET_FLAGS[asset] || '';
     
+    // Update the message with new keyboard
     const keyboard = buildSettingsKeyboard(userId);
-    const message = buildSettingsText(userId);
-    
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1320,10 +1306,9 @@ bot.callbackQuery('settings_toggle_rss', async (ctx) => {
     const isNowEnabled = database.toggleRss(userId);
     const status = isNowEnabled ? 'включены' : 'выключены';
     
+    // Update the message with new keyboard
     const keyboard = buildSettingsKeyboard(userId);
-    const message = buildSettingsText(userId);
-    
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1352,10 +1337,9 @@ bot.callbackQuery('settings_toggle_quiet_hours', async (ctx) => {
     const isNowEnabled = database.toggleQuietHours(userId);
     const status = isNowEnabled ? 'включен' : 'выключен';
     
+    // Update the message with new keyboard
     const keyboard = buildSettingsKeyboard(userId);
-    const message = buildSettingsText(userId);
-    
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1400,69 +1384,28 @@ bot.callbackQuery('settings_news_source', async (ctx) => {
   }
 });
 
-// Handle News Impact Filter selection button – show submenu
-bot.callbackQuery('settings_impact_filter', async (ctx) => {
+// Handle News Impact filter button – show submenu (Оба, Красные, Жёлтые)
+bot.callbackQuery('settings_news_impact', async (ctx) => {
   try {
     if (!ctx.from) {
       await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
       return;
     }
     const userId = ctx.from.id;
-    const currentFilter = getNewsImpactFilterSafe(userId);
+    const currentFilter = database.getNewsImpactFilter(userId);
     const keyboard = new InlineKeyboard();
-    keyboard.row({
-      text: currentFilter === 'high' ? '✅ 🔴 Только высокие (High)' : '🔴 Только высокие (High)',
-      callback_data: 'impact_high',
-    });
-    keyboard.row({
-      text: currentFilter === 'medium' ? '✅ 🟡 Только средние (Medium)' : '🟡 Только средние (Medium)',
-      callback_data: 'impact_medium',
-    });
-    keyboard.row({
-      text: currentFilter === 'both' ? '✅ 🔴🟡 Все важные (High + Medium)' : '🔴🟡 Все важные (High + Medium)',
-      callback_data: 'impact_both',
-    });
+    keyboard.row({ text: currentFilter === 'both' ? '✅ 🔴🟡 Оба' : '🔴🟡 Оба', callback_data: 'impact_both' });
+    keyboard.row({ text: currentFilter === 'high_only' ? '✅ 🔴 Красные' : '🔴 Красные', callback_data: 'impact_high' });
+    keyboard.row({ text: currentFilter === 'medium_only' ? '✅ 🟡 Жёлтые' : '🟡 Жёлтые', callback_data: 'impact_medium' });
     keyboard.row({ text: '◀️ Назад', callback_data: 'settings_back' });
     await ctx.editMessageText(
-      '🎯 **Фильтр новостей по важности**\n\nВыберите, какие события получать в уведомлениях (и в /daily). Низкая важность (Low) не показывается.',
+      '📌 **Фильтр важности новостей**\n\nПоказывать только события выбранной важности (для обоих источников — ForexFactory и Myfxbook).\n\n🔴 **Красные** — высокий impact\n🟡 **Жёлтые** — средний impact\n🔴🟡 **Оба** — красные и жёлтые',
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
     await ctx.answerCallbackQuery();
   } catch (error) {
-    console.error('Error showing impact filter menu:', error);
+    console.error('Error showing news impact menu:', error);
     await ctx.answerCallbackQuery({ text: '❌ Ошибка при открытии меню', show_alert: false });
-  }
-});
-
-// Handle impact filter selection: impact_high, impact_medium, impact_both
-bot.callbackQuery(/^impact_(high|medium|both)$/, async (ctx) => {
-  try {
-    if (!ctx.from) {
-      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
-      return;
-    }
-    const userId = ctx.from.id;
-    const filter = ctx.match[1] as ImpactFilter;
-    try {
-      if (typeof database.setNewsImpactFilter === 'function') {
-        database.setNewsImpactFilter(userId, filter);
-      } else {
-        setNewsImpactFilterSafe(userId, filter);
-      }
-    } catch (err) {
-      console.error('Error saving impact filter:', err);
-    }
-    const label = filter === 'high' ? 'Только высокие' : filter === 'medium' ? 'Только средние' : 'Все важные (High + Medium)';
-    await ctx.answerCallbackQuery({ text: `Фильтр новостей: ${label}`, show_alert: false });
-    const keyboard = buildSettingsKeyboard(userId);
-    const message = buildSettingsText(userId);
-    await ctx.editMessageText(message, {
-      parse_mode: 'Markdown',
-      reply_markup: keyboard,
-    });
-  } catch (error) {
-    console.error('Error setting impact filter:', error);
-    await ctx.answerCallbackQuery({ text: '❌ Ошибка при сохранении', show_alert: false });
   }
 });
 
@@ -1531,8 +1474,7 @@ bot.callbackQuery(/^tz_\d+$/, async (ctx) => {
     const label = getTimezoneDisplayName(iana);
     await ctx.answerCallbackQuery({ text: `Часовой пояс: ${label}`, show_alert: false });
     const keyboard = buildSettingsKeyboard(userId);
-    const message = buildSettingsText(userId);
-    await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard });
+    await ctx.editMessageText(buildSettingsMessage(userId), { parse_mode: 'Markdown', reply_markup: keyboard });
   } catch (error) {
     console.error('Error setting timezone:', error);
     await ctx.answerCallbackQuery({ text: '❌ Ошибка при сохранении', show_alert: false });
@@ -1566,9 +1508,10 @@ bot.callbackQuery(/^source_(forexfactory|myfxbook|both)$/, async (ctx) => {
     
     database.setNewsSource(userId, sourceValue);
     await ctx.answerCallbackQuery({ text: `Источник: ${sourceName}`, show_alert: false });
+    
+    // Return to settings menu
     const keyboard = buildSettingsKeyboard(userId);
-    const message = buildSettingsText(userId);
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1578,7 +1521,32 @@ bot.callbackQuery(/^source_(forexfactory|myfxbook|both)$/, async (ctx) => {
   }
 });
 
-// Handle back button from submenus (news source, impact filter, timezone)
+// Handle impact filter selection (impact_both, impact_high, impact_medium)
+bot.callbackQuery(/^impact_(both|high|medium)$/, async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const impact = ctx.match[1];
+    const filterValue: 'high_only' | 'medium_only' | 'both' =
+      impact === 'high' ? 'high_only' : impact === 'medium' ? 'medium_only' : 'both';
+    const impactName = filterValue === 'high_only' ? 'Красные' : filterValue === 'medium_only' ? 'Жёлтые' : 'Оба';
+    database.setNewsImpactFilter(userId, filterValue);
+    await ctx.answerCallbackQuery({ text: `Фильтр важности: ${impactName}`, show_alert: false });
+    const keyboard = buildSettingsKeyboard(userId);
+    await ctx.editMessageText(buildSettingsMessage(userId), {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+  } catch (error) {
+    console.error('Error handling impact filter selection:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при обновлении', show_alert: false });
+  }
+});
+
+// Handle back button from news source / impact / timezone menu
 bot.callbackQuery('settings_back', async (ctx) => {
   try {
     if (!ctx.from) {
@@ -1587,8 +1555,7 @@ bot.callbackQuery('settings_back', async (ctx) => {
     }
     const userId = ctx.from.id;
     const keyboard = buildSettingsKeyboard(userId);
-    const message = buildSettingsText(userId);
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1655,9 +1622,7 @@ bot.on('message:text', async (ctx) => {
       database.setTimezone(userId, iana);
       const label = getTimezoneDisplayName(iana);
       const keyboard = buildSettingsKeyboard(userId);
-      const message = `✅ Часовой пояс сохранён: **${label}**
-
-${buildSettingsText(userId)}`;
+      const message = `✅ Часовой пояс сохранён: **${label}**\n\n${buildSettingsMessage(userId)}`;
       await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard });
     } else {
       await ctx.reply('❌ Не удалось определить часовой пояс. Введите город (Москва, Киев) или IANA (Europe/Moscow).');

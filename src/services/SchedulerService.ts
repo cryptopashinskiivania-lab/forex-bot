@@ -414,8 +414,8 @@ export class SchedulerService {
               );
               const impactFilter = database.getNewsImpactFilter(userId);
               const userEvents = userEventsAfterQuality.filter((e) => {
-                if (impactFilter === 'high') return e.impact === 'High';
-                if (impactFilter === 'medium') return e.impact === 'Medium';
+                if (impactFilter === 'high_only') return e.impact === 'High';
+                if (impactFilter === 'medium_only') return e.impact === 'Medium';
                 return e.impact === 'High' || e.impact === 'Medium';
               });
 
@@ -861,8 +861,8 @@ export class SchedulerService {
         const { deliver: afterQuality } = this.dataQualityService.filterForDelivery(raw, { mode: 'general', nowUtc, forScheduler: true });
         const impactFilter = database.getNewsImpactFilter(userId);
         const userEvents = afterQuality.filter((e) => {
-          if (impactFilter === 'high') return e.impact === 'High';
-          if (impactFilter === 'medium') return e.impact === 'Medium';
+          if (impactFilter === 'high_only') return e.impact === 'High';
+          if (impactFilter === 'medium_only') return e.impact === 'Medium';
           return e.impact === 'High' || e.impact === 'Medium';
         });
         const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
