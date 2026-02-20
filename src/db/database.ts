@@ -331,7 +331,30 @@ export const database = {
       .run(userId, quietHoursKey, newState.toString());
     return newState;
   },
-  
+
+  getQuietHoursStart: (userId: number): string => {
+    const key = 'QUIET_HOURS_START';
+    const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
+      .get(userId, key) as { value: string } | undefined;
+    if (!row || !row.value) return '23:00';
+    return row.value;
+  },
+
+  getQuietHoursEnd: (userId: number): string => {
+    const key = 'QUIET_HOURS_END';
+    const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
+      .get(userId, key) as { value: string } | undefined;
+    if (!row || !row.value) return '08:00';
+    return row.value;
+  },
+
+  setQuietHoursRange: (userId: number, start: string, end: string): void => {
+    db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
+      .run(userId, 'QUIET_HOURS_START', start);
+    db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
+      .run(userId, 'QUIET_HOURS_END', end);
+  },
+
   // News source settings
   getNewsSource: (userId: number): 'ForexFactory' | 'Myfxbook' | 'Both' => {
     const sourceKey = 'news_source';

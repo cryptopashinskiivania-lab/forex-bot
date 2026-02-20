@@ -253,9 +253,19 @@ function formatTime24(event: CalendarEvent, timezone: string): string {
   return timeStr;
 }
 
+/** Parse "HH:mm" to minutes since midnight (0..1439). Returns -1 if invalid. */
+function parseTimeToMinutes(s: string): number {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(s.trim());
+  if (!m) return -1;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h < 0 || h > 23 || min < 0 || min > 59) return -1;
+  return h * 60 + min;
+}
+
 /**
- * Check if current time in user's timezone is within quiet hours (23:00 - 08:00)
- * Uses per-user timezone from settings (default Europe/Kyiv)
+ * Check if current time in user's timezone is within quiet hours (from settings).
+ * Uses per-user timezone and start/end time from database (default 23:00–08:00).
  */
 function isQuietHours(userId: number): boolean {
   if (!database.isQuietHoursEnabled(userId)) {
@@ -264,8 +274,20 @@ function isQuietHours(userId: number): boolean {
   const userTz = database.getTimezone(userId);
   const now = new Date();
   const localTime = toZonedTime(now, userTz);
-  const hour = localTime.getHours();
-  return hour >= 23 || hour < 8;
+  const currentMinutes = localTime.getHours() * 60 + localTime.getMinutes();
+
+  const startStr = database.getQuietHoursStart(userId);
+  const endStr = database.getQuietHoursEnd(userId);
+  const startMin = parseTimeToMinutes(startStr);
+  const endMin = parseTimeToMinutes(endStr);
+  if (startMin < 0 || endMin < 0) {
+    return currentMinutes >= 23 * 60 || currentMinutes < 8 * 60;
+  }
+
+  if (startMin > endMin) {
+    return currentMinutes >= startMin || currentMinutes < endMin;
+  }
+  return currentMinutes >= startMin && currentMinutes < endMin;
 }
 
 export class SchedulerService {

@@ -16,8 +16,14 @@ import { buildDailyMessage, buildDailyKeyboard } from './utils/dailyMessage';
 import { stripRedundantCountryPrefix } from './utils/eventTitleFormat';
 import type { EventGroup } from './utils/eventGrouping';
 
+// Fail fast if database was loaded without quiet hours API (e.g. stale ts-node cache). One restart loads fresh code for all users.
+if (typeof database.getQuietHoursStart !== 'function' || typeof database.getQuietHoursEnd !== 'function' || typeof database.setQuietHoursRange !== 'function') {
+  console.error('[Bot] FATAL: database missing getQuietHoursStart/getQuietHoursEnd/setQuietHoursRange. Restart the process (e.g. pm2 restart forex-bot) to load current code.');
+  process.exit(1);
+}
+
 // User states for conversation flow (with TTL 30 min by last activity to limit memory)
-type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | null;
+type UserState = 'WAITING_FOR_QUESTION' | 'WAITING_TIMEZONE' | 'WAITING_QUIET_HOURS' | null;
 const USER_STATE_TTL_MS = 30 * 60 * 1000;
 const USER_STATE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -72,6 +78,12 @@ function timezoneToCallbackData(index: number): string {
 }
 
 function getTimezoneDisplayName(iana: string): string {
+  const etcGmt = /^Etc\/GMT([+-])(\d+)$/.exec(iana);
+  if (etcGmt) {
+    const sign = etcGmt[1] === '+' ? '-' : '+';
+    const hours = etcGmt[2];
+    return `UTC${sign}${hours}`;
+  }
   return TIMEZONE_DISPLAY_NAMES[iana] ?? iana;
 }
 
@@ -84,43 +96,22 @@ function isValidIANATimezone(iana: string): boolean {
   }
 }
 
-const CITY_TO_IANA: Record<string, string> = {
-  'киев': 'Europe/Kyiv',
-  'kiev': 'Europe/Kyiv',
-  'kyiv': 'Europe/Kyiv',
-  'москва': 'Europe/Moscow',
-  'moscow': 'Europe/Moscow',
-  'лондон': 'Europe/London',
-  'london': 'Europe/London',
-  'берлин': 'Europe/Berlin',
-  'berlin': 'Europe/Berlin',
-  'нью-йорк': 'America/New_York',
-  'new york': 'America/New_York',
-  'newyork': 'America/New_York',
-  'лос-анджелес': 'America/Los_Angeles',
-  'los angeles': 'America/Los_Angeles',
-  'токио': 'Asia/Tokyo',
-  'tokyo': 'Asia/Tokyo',
-  'дубай': 'Asia/Dubai',
-  'dubai': 'Asia/Dubai',
-  'сингапур': 'Asia/Singapore',
-  'singapore': 'Asia/Singapore',
-};
-
-function resolveTimezoneInput(input: string): string | null {
+/**
+ * Parse UTC offset from manual input (e.g. +3, -5, UTC+2, GMT-4).
+ * Returns IANA fixed-offset (Etc/GMT±N) or null. Only integer hours supported.
+ */
+function resolveUtcOffsetInput(input: string): string | null {
   const trimmed = input.trim();
-  if (!trimmed) return null;
-  const key = trimmed.toLowerCase().replace(/\s+/g, ' ');
-  if (CITY_TO_IANA[key]) {
-    return CITY_TO_IANA[key];
-  }
-  if (trimmed.includes('/') && isValidIANATimezone(trimmed)) {
-    return trimmed;
-  }
-  if (isValidIANATimezone(trimmed)) {
-    return trimmed;
-  }
-  return null;
+  const match = /^(?:UTC|GMT)?\s*([+-]?)(\d{1,2})(?::(?:00)?)?\s*$/i.exec(trimmed);
+  if (!match) return null;
+  const sign = match[1] === '-' ? '-' : '+';
+  const hours = parseInt(match[2], 10);
+  if (hours > 14) return null;
+  const totalMinutes = (sign === '-' ? -hours : hours) * 60;
+  const ianaSign = totalMinutes >= 0 ? '-' : '+';
+  const ianaHours = Math.abs(hours);
+  const iana = `Etc/GMT${ianaSign}${ianaHours}`;
+  return isValidIANATimezone(iana) ? iana : null;
 }
 
 // Create a bot instance
@@ -302,6 +293,7 @@ const defaultCommands = [
   { command: 'daily', description: '📊 Сводка за сегодня' },
   { command: 'tomorrow', description: '📅 События завтра' },
   { command: 'settings', description: '⚙️ Настройки' },
+  { command: 'ask', description: '❓ Вопрос эксперту' },
   { command: 'help', description: 'ℹ️ Помощь' },
 ];
 
@@ -1168,7 +1160,7 @@ function buildSettingsMessage(userId: number): string {
   return `⚙️ **Настройки**
 
 **Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
+**Тихий режим:** ${isQuietHoursEnabled ? `✅ Включен (${database.getQuietHoursStart(userId)}–${database.getQuietHoursEnd(userId)})` : '❌ Выключен'}
 **Источник новостей:** ${sourceName}
 **Фильтр важности:** ${impactName}
 **Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
@@ -1197,10 +1189,12 @@ function buildSettingsKeyboard(userId: number): InlineKeyboard {
   const rssStatus = isRssEnabled ? '✅' : '❌';
   keyboard.row({ text: `📡 Внешние источники: ${rssStatus}`, callback_data: 'settings_toggle_rss' });
   
-  // Add Quiet Hours toggle button
+  // Add Quiet Hours button (opens submenu)
   const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
   const quietHoursStatus = isQuietHoursEnabled ? '✅' : '❌';
-  keyboard.row({ text: `🌙 Тихий режим (23:00-08:00): ${quietHoursStatus}`, callback_data: 'settings_toggle_quiet_hours' });
+  const quietStart = database.getQuietHoursStart(userId);
+  const quietEnd = database.getQuietHoursEnd(userId);
+  keyboard.row({ text: `🌙 Тихий режим: ${quietHoursStatus} ${quietStart}–${quietEnd}`, callback_data: 'settings_quiet_hours' });
   
   // Add News Source selection button
   const newsSource = database.getNewsSource(userId);
@@ -1323,34 +1317,169 @@ bot.callbackQuery('settings_toggle_rss', async (ctx) => {
   }
 });
 
-// Handle Quiet Hours toggle button
-bot.callbackQuery('settings_toggle_quiet_hours', async (ctx) => {
+// Presets for quiet hours: [start, end] as "HH:mm"
+const QUIET_HOURS_PRESETS: [string, string][] = [
+  ['22:00', '07:00'],
+  ['23:00', '08:00'],
+  ['00:00', '09:00'],
+];
+
+function buildQuietHoursSubmenuKeyboard(userId: number): InlineKeyboard {
+  const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+  const keyboard = new InlineKeyboard();
+  keyboard.row({
+    text: isQuietHoursEnabled ? '✅ Тихий режим: Вкл' : '❌ Тихий режим: Выкл',
+    callback_data: 'quiet_toggle'
+  });
+  keyboard.row({ text: '🕐 Изменить время', callback_data: 'quiet_time' });
+  keyboard.row({ text: '◀️ Назад', callback_data: 'quiet_back' });
+  return keyboard;
+}
+
+function buildQuietHoursSubmenuMessage(userId: number): string {
+  const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+  const start = database.getQuietHoursStart(userId);
+  const end = database.getQuietHoursEnd(userId);
+  const status = isQuietHoursEnabled ? 'Включен' : 'Выключен';
+  return `🌙 **Тихий режим**\n\nСостояние: ${isQuietHoursEnabled ? '✅' : '❌'} ${status}\nИнтервал: ${start}–${end}\n\nВ тихие часы уведомления не отправляются. Время в вашем часовом поясе.`;
+}
+
+function buildQuietHoursTimeKeyboard(userId: number): InlineKeyboard {
+  const start = database.getQuietHoursStart(userId);
+  const end = database.getQuietHoursEnd(userId);
+  const keyboard = new InlineKeyboard();
+  QUIET_HOURS_PRESETS.forEach(([s, e], i) => {
+    const label = `${s}–${e}`;
+    const isCurrent = start === s && end === e;
+    keyboard.row({
+      text: isCurrent ? `✅ ${label}` : label,
+      callback_data: `quiet_range_${i}`
+    });
+  });
+  keyboard.row({ text: '✏️ Ввести вручную', callback_data: 'quiet_manual' });
+  keyboard.row({ text: '◀️ Назад', callback_data: 'quiet_back' });
+  return keyboard;
+}
+
+// Open Quiet Hours submenu
+bot.callbackQuery('settings_quiet_hours', async (ctx) => {
   try {
     if (!ctx.from) {
       await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
       return;
     }
-    
     const userId = ctx.from.id;
-    
-    // Toggle Quiet Hours setting
-    const isNowEnabled = database.toggleQuietHours(userId);
-    const status = isNowEnabled ? 'включен' : 'выключен';
-    
-    // Update the message with new keyboard
-    const keyboard = buildSettingsKeyboard(userId);
-    await ctx.editMessageText(buildSettingsMessage(userId), {
+    const keyboard = buildQuietHoursSubmenuKeyboard(userId);
+    await ctx.editMessageText(buildQuietHoursSubmenuMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
-    
-    await ctx.answerCallbackQuery({ 
-      text: `🌙 Тихий режим ${status}`, 
-      show_alert: false 
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error opening quiet hours submenu:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при открытии меню', show_alert: false });
+  }
+});
+
+// In submenu: toggle on/off, then refresh submenu
+bot.callbackQuery('quiet_toggle', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const isNowEnabled = database.toggleQuietHours(userId);
+    const status = isNowEnabled ? 'включен' : 'выключен';
+    const keyboard = buildQuietHoursSubmenuKeyboard(userId);
+    await ctx.editMessageText(buildQuietHoursSubmenuMessage(userId), {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
     });
+    await ctx.answerCallbackQuery({ text: `🌙 Тихий режим ${status}`, show_alert: false });
   } catch (error) {
     console.error('Error toggling Quiet Hours:', error);
     await ctx.answerCallbackQuery({ text: '❌ Ошибка при обновлении', show_alert: false });
+  }
+});
+
+// In submenu: "Назад" -> main settings
+bot.callbackQuery('quiet_back', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const keyboard = buildSettingsKeyboard(userId);
+    await ctx.editMessageText(buildSettingsMessage(userId), { parse_mode: 'Markdown', reply_markup: keyboard });
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error going back from quiet hours:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка', show_alert: false });
+  }
+});
+
+// In submenu: "Изменить время" -> show presets + manual
+bot.callbackQuery('quiet_time', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const keyboard = buildQuietHoursTimeKeyboard(userId);
+    await ctx.editMessageText(
+      '🕐 **Время тихого режима**\n\nВыберите интервал (начало–конец) или введите вручную в формате **HH:mm–HH:mm** (например 23:00–08:00).',
+      { parse_mode: 'Markdown', reply_markup: keyboard }
+    );
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error opening quiet time menu:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при открытии меню', show_alert: false });
+  }
+});
+
+// Preset selected: quiet_range_0, quiet_range_1, quiet_range_2
+bot.callbackQuery(/^quiet_range_(\d+)$/, async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const index = parseInt(ctx.match[1], 10);
+    const preset = QUIET_HOURS_PRESETS[index];
+    if (!preset) {
+      await ctx.answerCallbackQuery({ text: '❌ Неизвестный вариант', show_alert: false });
+      return;
+    }
+    database.setQuietHoursRange(userId, preset[0], preset[1]);
+    const keyboard = buildQuietHoursSubmenuKeyboard(userId);
+    await ctx.editMessageText(buildQuietHoursSubmenuMessage(userId), {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+    await ctx.answerCallbackQuery({ text: `🕐 Время: ${preset[0]}–${preset[1]}`, show_alert: false });
+  } catch (error) {
+    console.error('Error setting quiet hours range:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при сохранении', show_alert: false });
+  }
+});
+
+// Manual time input: set state and ask for text
+bot.callbackQuery('quiet_manual', async (ctx) => {
+  try {
+    if (!ctx.from || !ctx.chat) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка', show_alert: false });
+      return;
+    }
+    setUserState(ctx.chat.id, 'WAITING_QUIET_HOURS');
+    await ctx.editMessageText('✏️ Введите интервал в формате **HH:mm–HH:mm** (например 23:00–08:00):');
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error starting manual quiet hours input:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка', show_alert: false });
   }
 });
 
@@ -1429,7 +1558,7 @@ bot.callbackQuery('settings_timezone', async (ctx) => {
     keyboard.row({ text: '✏️ Ввести вручную', callback_data: 'tz_manual' });
     keyboard.row({ text: '◀️ Назад', callback_data: 'settings_back' });
     await ctx.editMessageText(
-      '🕐 **Часовой пояс**\n\nВыберите город или нажмите «Ввести вручную» и отправьте название города (Москва, Киев) или IANA (Europe/Moscow).\n\nТихий режим (23:00–08:00) считается в выбранном поясе.',
+      '🕐 **Часовой пояс**\n\nВыберите город или нажмите «Ввести вручную» и отправьте смещение UTC (например: +3, -5, UTC+2).\n\nТихий режим считается в выбранном поясе по вашему интервалу из настроек.',
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
     await ctx.answerCallbackQuery();
@@ -1447,7 +1576,7 @@ bot.callbackQuery('tz_manual', async (ctx) => {
       return;
     }
     setUserState(ctx.chat.id, 'WAITING_TIMEZONE');
-    await ctx.editMessageText('✏️ Введите название города (например: Москва, Киев) или IANA (например: Europe/Moscow):');
+    await ctx.editMessageText('✏️ Введите смещение UTC (например: +3, -5, UTC+2 или GMT-4):');
     await ctx.answerCallbackQuery();
   } catch (error) {
     console.error('Error starting manual timezone input:', error);
@@ -1606,17 +1735,45 @@ bot.on('message:text', async (ctx) => {
 
   // If it's a command, reset state and let command handlers process it
   if (ctx.message.text?.startsWith('/')) {
-    if (state === 'WAITING_FOR_QUESTION' || state === 'WAITING_TIMEZONE') {
+    if (state === 'WAITING_FOR_QUESTION' || state === 'WAITING_TIMEZONE' || state === 'WAITING_QUIET_HOURS') {
       deleteUserState(chatId);
     }
     return;
   }
 
-  // Handle manual timezone input
+  // Handle manual quiet hours input (HH:mm–HH:mm)
+  if (state === 'WAITING_QUIET_HOURS') {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const text = (ctx.message.text ?? '').trim();
+    deleteUserState(chatId);
+    const match = /^(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})$/.exec(text);
+    if (!match) {
+      await ctx.reply('❌ Неверный формат. Введите интервал, например: 23:00–08:00');
+      return;
+    }
+    const start = `${match[1].padStart(2, '0')}:${match[2]}`;
+    const end = `${match[3].padStart(2, '0')}:${match[4]}`;
+    const h1 = parseInt(match[1], 10);
+    const m1 = parseInt(match[2], 10);
+    const h2 = parseInt(match[3], 10);
+    const m2 = parseInt(match[4], 10);
+    if (h1 < 0 || h1 > 23 || m1 < 0 || m1 > 59 || h2 < 0 || h2 > 23 || m2 < 0 || m2 > 59) {
+      await ctx.reply('❌ Часы (0–23) и минуты (0–59) должны быть в допустимых пределах.');
+      return;
+    }
+    database.setQuietHoursRange(userId, start, end);
+    const keyboard = buildSettingsKeyboard(userId);
+    const message = `✅ Время тихого режима: **${start}–${end}**\n\n${buildSettingsMessage(userId)}`;
+    await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard });
+    return;
+  }
+
+  // Handle manual timezone input (UTC offset only)
   if (state === 'WAITING_TIMEZONE') {
     const userId = ctx.from?.id;
     if (!userId) return;
-    const iana = resolveTimezoneInput(ctx.message.text ?? '');
+    const iana = resolveUtcOffsetInput(ctx.message.text ?? '');
     deleteUserState(chatId);
     if (iana) {
       database.setTimezone(userId, iana);
@@ -1625,7 +1782,7 @@ bot.on('message:text', async (ctx) => {
       const message = `✅ Часовой пояс сохранён: **${label}**\n\n${buildSettingsMessage(userId)}`;
       await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard });
     } else {
-      await ctx.reply('❌ Не удалось определить часовой пояс. Введите город (Москва, Киев) или IANA (Europe/Moscow).');
+      await ctx.reply('❌ Неверный формат. Введите смещение UTC, например: +3, -5, UTC+2.');
     }
     return;
   }
