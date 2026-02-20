@@ -355,6 +355,26 @@ export const database = {
       .run(userId, sourceKey, source);
   },
 
+  getNewsImpactFilter: (userId: number): 'high' | 'medium' | 'both' => {
+    const key = 'news_impact_filter';
+    const row = db.prepare('SELECT value FROM user_settings WHERE user_id = ? AND key = ?')
+      .get(userId, key) as { value: string } | undefined;
+    if (!row || !row.value) {
+      return 'high';
+    }
+    const normalized = String(row.value).trim().toLowerCase();
+    if (normalized === 'high' || normalized === 'medium' || normalized === 'both') {
+      return normalized;
+    }
+    return 'high';
+  },
+
+  setNewsImpactFilter: (userId: number, filter: 'high' | 'medium' | 'both'): void => {
+    const key = 'news_impact_filter';
+    db.prepare('INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)')
+      .run(userId, key, filter);
+  },
+
   // User timezone (IANA, e.g. Europe/Kyiv). Used for quiet hours and time display.
   getTimezone: (userId: number): string => {
     const tzKey = 'user_timezone';
