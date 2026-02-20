@@ -1036,10 +1036,14 @@ function formatFeatureLabel(name: string): string {
     settings_toggle_rss: 'RSS',
     settings_toggle_quiet_hours: 'Тихий режим',
     settings_news_source: 'Источник новостей',
+    settings_news_impact: 'Фильтр важности',
     settings_timezone: 'Часовой пояс',
     source_forexfactory: 'Источник: ForexFactory',
     source_myfxbook: 'Источник: Myfxbook',
     source_both: 'Источник: оба',
+    impact_both: 'Фильтр: Оба',
+    impact_high: 'Фильтр: Красные',
+    impact_medium: 'Фильтр: Жёлтые',
     settings_back: 'Назад в настройки',
     settings_close: 'Закрыть настройки',
   };
@@ -1143,6 +1147,25 @@ const ASSET_FLAGS: Record<string, string> = {
 // Available assets for monitoring
 const AVAILABLE_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'NZD', 'CHF', 'XAU', 'BTC', 'OIL'];
 
+// Helper to build settings message text (single source of truth for settings summary)
+function buildSettingsMessage(userId: number): string {
+  const monitoredAssets = database.getMonitoredAssets(userId);
+  const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
+  const newsSource = database.getNewsSource(userId);
+  const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : newsSource === 'Myfxbook' ? 'Myfxbook' : 'Оба источника';
+  const impactFilter = database.getNewsImpactFilter(userId);
+  const impactName = impactFilter === 'high_only' ? 'Красные' : impactFilter === 'medium_only' ? 'Жёлтые' : 'Оба';
+  return `⚙️ **Настройки**
+
+**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
+**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
+**Источник новостей:** ${sourceName}
+**Фильтр важности:** ${impactName}
+**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
+
+Нажмите на кнопку, чтобы изменить настройку:`;
+}
+
 // Helper function to build settings keyboard
 function buildSettingsKeyboard(userId: number): InlineKeyboard {
   const monitoredAssets = database.getMonitoredAssets(userId);
@@ -1176,6 +1199,13 @@ function buildSettingsKeyboard(userId: number): InlineKeyboard {
                      '🔄 Оба источника';
   keyboard.row({ text: `📡 Источник новостей: ${sourceText}`, callback_data: 'settings_news_source' });
 
+  // Add News Impact filter button (red / yellow / both)
+  const impactFilter = database.getNewsImpactFilter(userId);
+  const impactText = impactFilter === 'high_only' ? '🔴 Красные' : 
+                     impactFilter === 'medium_only' ? '🟡 Жёлтые' : 
+                     '🔴🟡 Оба';
+  keyboard.row({ text: `📌 Фильтр важности: ${impactText}`, callback_data: 'settings_news_impact' });
+
   // Add Timezone selection button
   const userTz = database.getTimezone(userId);
   const tzLabel = getTimezoneDisplayName(userTz);
@@ -1201,22 +1231,8 @@ bot.command('settings', async (ctx) => {
     }
     
     const userId = ctx.from.id;
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
-    const newsSource = database.getNewsSource(userId);
-    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
-                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
-                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
-    
-    const message = `⚙️ **Настройки**
-
-**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
-**Источник новостей:** ${sourceName}
-**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
-
-Нажмите на кнопку, чтобы изменить настройку:`;
+    const message = buildSettingsMessage(userId);
     
     await ctx.reply(message, { 
       parse_mode: 'Markdown',
@@ -1250,24 +1266,8 @@ bot.callbackQuery(/^toggle_(.+)$/, async (ctx) => {
     const flag = ASSET_FLAGS[asset] || '';
     
     // Update the message with new keyboard
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
-    const newsSource = database.getNewsSource(userId);
-    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
-                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
-                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
-    
-    const message = `⚙️ **Настройки**
-
-**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
-**Источник новостей:** ${sourceName}
-**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
-
-Нажмите на кнопку, чтобы изменить настройку:`;
-    
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1297,24 +1297,8 @@ bot.callbackQuery('settings_toggle_rss', async (ctx) => {
     const status = isNowEnabled ? 'включены' : 'выключены';
     
     // Update the message with new keyboard
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
-    const newsSource = database.getNewsSource(userId);
-    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
-                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
-                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
-    
-    const message = `⚙️ **Настройки**
-
-**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
-**Источник новостей:** ${sourceName}
-**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
-
-Нажмите на кнопку, чтобы изменить настройку:`;
-    
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1344,23 +1328,8 @@ bot.callbackQuery('settings_toggle_quiet_hours', async (ctx) => {
     const status = isNowEnabled ? 'включен' : 'выключен';
     
     // Update the message with new keyboard
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const newsSource = database.getNewsSource(userId);
-    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
-                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
-                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
-    
-    const message = `⚙️ **Настройки**
-
-**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isNowEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
-**Источник новостей:** ${sourceName}
-**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
-
-Нажмите на кнопку, чтобы изменить настройку:`;
-    
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1401,6 +1370,31 @@ bot.callbackQuery('settings_news_source', async (ctx) => {
     await ctx.answerCallbackQuery();
   } catch (error) {
     console.error('Error showing news source menu:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при открытии меню', show_alert: false });
+  }
+});
+
+// Handle News Impact filter button – show submenu (Оба, Красные, Жёлтые)
+bot.callbackQuery('settings_news_impact', async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const currentFilter = database.getNewsImpactFilter(userId);
+    const keyboard = new InlineKeyboard();
+    keyboard.row({ text: currentFilter === 'both' ? '✅ 🔴🟡 Оба' : '🔴🟡 Оба', callback_data: 'impact_both' });
+    keyboard.row({ text: currentFilter === 'high_only' ? '✅ 🔴 Красные' : '🔴 Красные', callback_data: 'impact_high' });
+    keyboard.row({ text: currentFilter === 'medium_only' ? '✅ 🟡 Жёлтые' : '🟡 Жёлтые', callback_data: 'impact_medium' });
+    keyboard.row({ text: '◀️ Назад', callback_data: 'settings_back' });
+    await ctx.editMessageText(
+      '📌 **Фильтр важности новостей**\n\nПоказывать только события выбранной важности (для обоих источников — ForexFactory и Myfxbook).\n\n🔴 **Красные** — высокий impact\n🟡 **Жёлтые** — средний impact\n🔴🟡 **Оба** — красные и жёлтые',
+      { parse_mode: 'Markdown', reply_markup: keyboard }
+    );
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error('Error showing news impact menu:', error);
     await ctx.answerCallbackQuery({ text: '❌ Ошибка при открытии меню', show_alert: false });
   }
 });
@@ -1469,20 +1463,8 @@ bot.callbackQuery(/^tz_\d+$/, async (ctx) => {
     database.setTimezone(userId, iana);
     const label = getTimezoneDisplayName(iana);
     await ctx.answerCallbackQuery({ text: `Часовой пояс: ${label}`, show_alert: false });
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
-    const newsSource = database.getNewsSource(userId);
-    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : newsSource === 'Myfxbook' ? 'Myfxbook' : 'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
-    const message = `⚙️ **Настройки**
-
-**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
-**Источник новостей:** ${sourceName}
-**Часовой пояс:** ${label}
-
-Нажмите на кнопку, чтобы изменить настройку:`;
-    await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard });
+    await ctx.editMessageText(buildSettingsMessage(userId), { parse_mode: 'Markdown', reply_markup: keyboard });
   } catch (error) {
     console.error('Error setting timezone:', error);
     await ctx.answerCallbackQuery({ text: '❌ Ошибка при сохранении', show_alert: false });
@@ -1518,20 +1500,8 @@ bot.callbackQuery(/^source_(forexfactory|myfxbook|both)$/, async (ctx) => {
     await ctx.answerCallbackQuery({ text: `Источник: ${sourceName}`, show_alert: false });
     
     // Return to settings menu
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
     const keyboard = buildSettingsKeyboard(userId);
-    
-    const message = `⚙️ **Настройки**
-
-**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
-**Источник новостей:** ${sourceName}
-**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
-
-Нажмите на кнопку, чтобы изменить настройку:`;
-    
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -1541,37 +1511,44 @@ bot.callbackQuery(/^source_(forexfactory|myfxbook|both)$/, async (ctx) => {
   }
 });
 
-// Handle back button from news source menu
+// Handle impact filter selection (impact_both, impact_high, impact_medium)
+bot.callbackQuery(/^impact_(both|high|medium)$/, async (ctx) => {
+  try {
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
+      return;
+    }
+    const userId = ctx.from.id;
+    const impact = ctx.match[1];
+    const filterValue: 'high_only' | 'medium_only' | 'both' =
+      impact === 'high' ? 'high_only' : impact === 'medium' ? 'medium_only' : 'both';
+    const impactName = filterValue === 'high_only' ? 'Красные' : filterValue === 'medium_only' ? 'Жёлтые' : 'Оба';
+    database.setNewsImpactFilter(userId, filterValue);
+    await ctx.answerCallbackQuery({ text: `Фильтр важности: ${impactName}`, show_alert: false });
+    const keyboard = buildSettingsKeyboard(userId);
+    await ctx.editMessageText(buildSettingsMessage(userId), {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+  } catch (error) {
+    console.error('Error handling impact filter selection:', error);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка при обновлении', show_alert: false });
+  }
+});
+
+// Handle back button from news source / impact / timezone menu
 bot.callbackQuery('settings_back', async (ctx) => {
   try {
     if (!ctx.from) {
       await ctx.answerCallbackQuery({ text: '❌ Ошибка: не удалось определить пользователя', show_alert: false });
       return;
     }
-    
     const userId = ctx.from.id;
-    const monitoredAssets = database.getMonitoredAssets(userId);
-    const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
-    const newsSource = database.getNewsSource(userId);
-    const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : 
-                       newsSource === 'Myfxbook' ? 'Myfxbook' : 
-                       'Оба источника';
     const keyboard = buildSettingsKeyboard(userId);
-    
-    const message = `⚙️ **Настройки**
-
-**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
-**Источник новостей:** ${sourceName}
-**Часовой пояс:** ${getTimezoneDisplayName(database.getTimezone(userId))}
-
-Нажмите на кнопку, чтобы изменить настройку:`;
-    
-    await ctx.editMessageText(message, {
+    await ctx.editMessageText(buildSettingsMessage(userId), {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
-    
     await ctx.answerCallbackQuery();
   } catch (error) {
     console.error('Error returning to settings:', error);
@@ -1634,21 +1611,8 @@ bot.on('message:text', async (ctx) => {
     if (iana) {
       database.setTimezone(userId, iana);
       const label = getTimezoneDisplayName(iana);
-      const monitoredAssets = database.getMonitoredAssets(userId);
-      const isQuietHoursEnabled = database.isQuietHoursEnabled(userId);
-      const newsSource = database.getNewsSource(userId);
-      const sourceName = newsSource === 'ForexFactory' ? 'ForexFactory' : newsSource === 'Myfxbook' ? 'Myfxbook' : 'Оба источника';
       const keyboard = buildSettingsKeyboard(userId);
-      const message = `✅ Часовой пояс сохранён: **${label}**
-
-⚙️ **Настройки**
-
-**Отслеживаемые активы:** ${monitoredAssets.map(a => `${ASSET_FLAGS[a] || ''} ${a}`).join(', ') || 'Нет'}
-**Тихий режим:** ${isQuietHoursEnabled ? '✅ Включен (23:00-08:00)' : '❌ Выключен'}
-**Источник новостей:** ${sourceName}
-**Часовой пояс:** ${label}
-
-Нажмите на кнопку, чтобы изменить настройку:`;
+      const message = `✅ Часовой пояс сохранён: **${label}**\n\n${buildSettingsMessage(userId)}`;
       await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard });
     } else {
       await ctx.reply('❌ Не удалось определить часовой пояс. Введите город (Москва, Киев) или IANA (Europe/Moscow).');

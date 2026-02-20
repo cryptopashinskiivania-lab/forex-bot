@@ -56,6 +56,16 @@ export interface SharedCalendarToday {
   myfxbook: CalendarEvent[];
 }
 
+/** User impact filter: high_only = red, medium_only = yellow, both = red + yellow. */
+function filterEventsByImpact(
+  events: CalendarEvent[],
+  filter: 'high_only' | 'medium_only' | 'both'
+): CalendarEvent[] {
+  if (filter === 'both') return events;
+  if (filter === 'high_only') return events.filter((e) => e.impact === 'High');
+  return events.filter((e) => e.impact === 'Medium');
+}
+
 /**
  * Filter events to those that fall on "today" or "tomorrow" in the given timezone.
  */
@@ -149,7 +159,9 @@ export function getEventsForUserFromShared(
       }
     }
   }
-  return Array.from(deduplicationMap.values());
+  const events = Array.from(deduplicationMap.values());
+  const impactFilter = database.getNewsImpactFilter(userId);
+  return filterEventsByImpact(events, impactFilter);
 }
 
 /**
@@ -307,6 +319,10 @@ export async function aggregateCoreEvents(
     if (process.env.LOG_LEVEL === 'debug') {
       console.log(`[EventAggregation] ${userInfo}Total events: ${deduplicatedEvents.length}`);
     }
+
+    // Apply user impact filter (red only / yellow only / both)
+    const impactFilter = database.getNewsImpactFilter(userId);
+    deduplicatedEvents = filterEventsByImpact(deduplicatedEvents, impactFilter);
 
     // Check for cross-source conflicts (if both sources are active)
     if (forexFactoryEvents.length > 0 && myfxbookEvents.length > 0) {
