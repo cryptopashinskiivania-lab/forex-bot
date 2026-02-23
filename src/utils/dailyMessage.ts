@@ -173,7 +173,7 @@ export function buildDailyMessage(
 
 const MAX_CALLBACK_DATA_BYTES = 64;
 
-/** Строит клавиатуру для /daily: кнопки групп + AI Forecast при наличии любых групп событий */
+/** Строит клавиатуру для /daily: кнопки групп (если есть) + AI Forecast / AI Results при наличии любых событий дня */
 export function buildDailyKeyboard(
   grouped: Array<EventGroup | CalendarEvent>
 ): InlineKeyboard {
@@ -186,8 +186,8 @@ export function buildDailyKeyboard(
       keyboard.row({ text: label, callback_data: data });
     }
   }
-  // Обе кнопки при наличии событий: разные задачи (актуальные vs уже вышедшие)
-  if (groups.length > 0) {
+  // Обе кнопки при наличии любых событий дня (не только при наличии групп)
+  if (grouped.length > 0) {
     keyboard.row({ text: '🧠 AI Forecast', callback_data: 'daily_ai_forecast' });
     keyboard.row({ text: '📊 AI Results', callback_data: 'daily_ai_results' });
   }

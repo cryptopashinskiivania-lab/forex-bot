@@ -264,6 +264,17 @@ function parseTimeToMinutes(s: string): number {
 }
 
 /**
+ * Parse timeISO as UTC moment. Sources (ForexFactory/Myfxbook) emit UTC ISO with "Z".
+ * If the string has no timezone, treat as UTC to avoid local TZ skew on reminder/result windows.
+ */
+function parseTimeISOAsUTC(iso: string): Date {
+  const s = (iso || '').trim();
+  if (!s) return new Date(0);
+  if (s.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(s)) return parseISO(s);
+  return parseISO(s.replace(/\.\d{3}$/, '') + 'Z');
+}
+
+/**
  * Check if current time in user's timezone is within quiet hours (from settings).
  * Uses per-user timezone and start/end time from database (default 23:00–08:00).
  */
@@ -422,8 +433,7 @@ export class SchedulerService {
               const userId = user.user_id;
               const quiet = isQuietHours(userId);
               if (quiet) {
-                console.log(`[Scheduler] User ${userId}: skipped (quiet hours)`);
-                return;
+                console.log(`[Scheduler] User ${userId}: quiet hours — skipping events/rss/daily, reminder/result still allowed`);
               }
               const monitoredAssets = database.getMonitoredAssets(userId);
               const isRssEnabled = database.isRssEnabled(userId);
@@ -442,7 +452,6 @@ export class SchedulerService {
               });
 
               const eventsWithoutTime = userEvents.filter((e) => !e.timeISO);
-              const now = new Date();
               const userTz = database.getTimezone(userId);
 
               let eventsSent = 0;
@@ -456,60 +465,64 @@ export class SchedulerService {
                 );
               }
 
-              // События без времени — по одному (группировка не применяется)
-              for (const event of userEvents) {
-                if (event.timeISO) continue;
-                const time = event.timeISO || event.time;
-                const id = itemId(event.title, time);
-                const eventId = `event_${userId}_${id}`;
-                if (database.hasSent(eventId)) continue;
-                try {
-                  const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
-                  let result = database.getCachedAnalysis(eventKey);
-                  if (!result) {
-                    console.log(`[AI] Cache MISS: ${event.title}`);
-                    const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
-                    result = await this.analysisService.analyzeNews(
-                      text,
-                      event.source || 'ForexFactory'
+              // События без времени — по одному (группировка не применяется); не в тихие часы
+              if (!quiet) {
+                for (const event of userEvents) {
+                  if (event.timeISO) continue;
+                  const time = event.timeISO || event.time;
+                  const id = itemId(event.title, time);
+                  const eventId = `event_${userId}_${id}`;
+                  if (database.hasSent(eventId)) continue;
+                  try {
+                    const eventKey = md5(`${event.title}|${event.actual}|${event.forecast}|${event.previous}`);
+                    let result = database.getCachedAnalysis(eventKey);
+                    if (!result) {
+                      console.log(`[AI] Cache MISS: ${event.title}`);
+                      const text = `Event: ${event.title}, Currency: ${event.currency}, Actual: ${event.actual}, Forecast: ${event.forecast}, Previous: ${event.previous}`;
+                      result = await this.analysisService.analyzeNews(
+                        text,
+                        event.source || 'ForexFactory'
+                      );
+                      database.setCachedAnalysis(eventKey, result);
+                    } else {
+                      console.log(`[AI] Cache HIT: ${event.title}`);
+                    }
+                    const emoji = scoreEmoji(result.score);
+                    const header = this.getHeader(false);
+                    const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
+                    const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
+                    const msg = this.formatMessage(
+                      header,
+                      flag,
+                      event.currency,
+                      displayTitle,
+                      event.source || 'ForexFactory',
+                      result.score,
+                      emoji,
+                      event.actual,
+                      event.forecast,
+                      result
                     );
-                    database.setCachedAnalysis(eventKey, result);
-                  } else {
-                    console.log(`[AI] Cache HIT: ${event.title}`);
+                    await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
+                    database.markAsSent(eventId);
+                    eventsSent++;
+                    singleCount++;
+                    console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
+                  } catch (err) {
+                    logNotificationSendError('event', userId, eventId, err, {
+                      title: event.title,
+                      currency: event.currency,
+                    });
                   }
-                  const emoji = scoreEmoji(result.score);
-                  const header = this.getHeader(false);
-                  const flag = CURRENCY_FLAGS[event.currency] ?? '📌';
-                  const displayTitle = stripRedundantCountryPrefix(event.currency, event.title);
-                  const msg = this.formatMessage(
-                    header,
-                    flag,
-                    event.currency,
-                    displayTitle,
-                    event.source || 'ForexFactory',
-                    result.score,
-                    emoji,
-                    event.actual,
-                    event.forecast,
-                    result
-                  );
-                  await bot.api.sendMessage(userId, msg, { parse_mode: undefined });
-                  database.markAsSent(eventId);
-                  eventsSent++;
-                  singleCount++;
-                  console.log(`[Scheduler] Event sent to user ${userId}: ${event.title}`);
-                } catch (err) {
-                  logNotificationSendError('event', userId, eventId, err, {
-                    title: event.title,
-                    currency: event.currency,
-                  });
                 }
               }
 
+              // Актуальное время проверки — прямо перед окнами напоминания и результата, чтобы не промахнуться из‑за долгой обработки выше
+              const now = new Date();
               // Напоминания (15 мин до): окно 10 мин (от 15 до 5 мин до события), чтобы не пропустить при проверке каждые 2 мин
               const reminderList = userEvents.filter((event) => {
                 if (!event.timeISO) return false;
-                const eventTime = parseISO(event.timeISO);
+                const eventTime = parseTimeISOAsUTC(event.timeISO);
                 const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
                 const reminderWindowEnd = subMinutes(eventTime, REMINDER_MINUTES_BEFORE - REMINDER_WINDOW_MINUTES);
                 if (now < reminderFrom || now >= reminderWindowEnd) return false;
@@ -599,7 +612,7 @@ export class SchedulerService {
               // Результаты (после публикации): группируем и отправляем группами или по одному
               const resultList = userEvents.filter((event) => {
                 if (!event.timeISO || !hasRealActual(event.actual)) return false;
-                const eventTime = parseISO(event.timeISO);
+                const eventTime = parseTimeISOAsUTC(event.timeISO);
                 const resultFrom = addMinutes(eventTime, RESULT_MINUTES_AFTER);
                 const resultWindowEnd = addMinutes(eventTime, RESULT_WINDOW_DURATION);
                 if (now < resultFrom || now >= resultWindowEnd) return false;
@@ -691,7 +704,7 @@ export class SchedulerService {
                 );
               }
 
-              if (isRssEnabled) {
+              if (isRssEnabled && !quiet) {
                 const rssItems = await this.rssService.getLatestNews().catch(() => []);
 
                 for (const item of rssItems) {
@@ -759,6 +772,7 @@ export class SchedulerService {
               const todayDateStr = format(nowInUserTz, 'yyyy-MM-dd');
               const dailySummaryId = `daily8_${userId}_${todayDateStr}`;
               if (
+                !quiet &&
                 nowInUserTz.getHours() === DAILY_SUMMARY_HOUR &&
                 nowInUserTz.getMinutes() < 10 &&
                 !database.hasSent(dailySummaryId)
@@ -893,7 +907,7 @@ export class SchedulerService {
         const withTime = userEvents.filter((e) => e.timeISO);
         let inWindow = 0;
         for (const e of withTime) {
-          const eventTime = parseISO(e.timeISO!);
+          const eventTime = parseTimeISOAsUTC(e.timeISO!);
           const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
           const reminderWindowEnd = subMinutes(eventTime, REMINDER_MINUTES_BEFORE - REMINDER_WINDOW_MINUTES);
           if (nowUtc >= reminderFrom && nowUtc < reminderWindowEnd && !database.hasSent(`reminder_${userId}_${itemId(e.title, e.timeISO || e.time)}`)) {
@@ -904,7 +918,7 @@ export class SchedulerService {
         // Группы, по которым напоминание ещё не пришло (в окне, но не отправлено)
         const reminderListDiag = userEvents.filter((e) => {
           if (!e.timeISO) return false;
-          const eventTime = parseISO(e.timeISO);
+          const eventTime = parseTimeISOAsUTC(e.timeISO);
           const reminderFrom = subMinutes(eventTime, REMINDER_MINUTES_BEFORE);
           const reminderWindowEnd = subMinutes(eventTime, REMINDER_MINUTES_BEFORE - REMINDER_WINDOW_MINUTES);
           return nowUtc >= reminderFrom && nowUtc < reminderWindowEnd && !database.hasSent(`reminder_${userId}_${itemId(e.title, e.timeISO || e.time)}`);
